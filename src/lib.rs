@@ -8,20 +8,24 @@
 //! EdgeTAK's own design decisions where no authoritative spec exists.
 
 pub mod cot;
+pub mod pki;
 pub mod transport;
 
 // Planned modules, not yet implemented (see docs/TEST-PLAN.md for the test
 // cases each will need to satisfy before being considered done):
 //
-// - `pki`: certificate authority, issuance, and enrollment (Marti
-//   /Marti/api/tls/* contract) -- see docs/TEST-PLAN.md §4.
 // - `users`: user/device (EUD) identity, groups, and profile management,
 //   bound to issued certificates -- see docs/TEST-PLAN.md §3 TC-TLS-04.
+//   `pki::SignedCertificate::common_name` is the hook this will consume.
 // - `marti`: Marti-compatible REST API (missions/DataSync, groups, device
-//   profiles) -- see docs/TEST-PLAN.md §5.
+//   profiles, and the HTTP `/Marti/api/tls/*` enrollment contract on top of
+//   `pki::CertificateAuthority`) -- see docs/TEST-PLAN.md §4-5.
 // - `mesh`: cross-instance island sync over Reticulum/LXMF, spanning
 //   MeshCore, packet radio, and Starlink/IP transports -- see
 //   docs/TEST-PLAN.md §9.
 //
 // `transport` currently implements only the plain-TCP CoT relay (no TLS);
-// see `transport`'s own module docs.
+// mTLS wiring on top of `pki::CertificateAuthority` is next -- see
+// `transport`'s own module docs.
+// `pki` implements CA generation and CSR signing only; no persistence, no
+// revocation, no HTTP enrollment endpoint yet.
