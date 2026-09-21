@@ -3,12 +3,17 @@
 //! Same framing/relay behavior as [`super::tcp`] (built on the same
 //! [`super::codec::StreamDecoder`] and broadcast-based relay), but requires
 //! a valid client certificate signed by the configured CA before any CoT is
-//! accepted (`docs/TEST-PLAN.md` §3, TC-TLS-01/02/03).
+//! accepted (`docs/TEST-PLAN.md` §3, TC-TLS-01/02/03), and enforces
+//! [`DeviceRegistry`] identity binding (TC-TLS-04) plus revocation
+//! (TC-TLS-05, connect-time only — no continuous re-check of an
+//! already-open session, matching the interim policy documented in
+//! `docs/TEST-PLAN.md`).
 //!
-//! **Not yet implemented**: binding the authenticated cert's Common Name to
-//! the CoT event's own `uid` (TC-TLS-04) — that depends on a device
-//! registry (the planned `users` module, not yet built; see `src/lib.rs`).
-//! This module only extracts and logs the peer CN today.
+//! A connection whose cert has no extractable Common Name, or whose CN is
+//! revoked, is disconnected immediately after the handshake. A connection
+//! whose CoT claims a `uid` already bound to a *different* device is
+//! disconnected as soon as that event is decoded — see
+//! [`DeviceRegistry::bind_uid`] for the exact binding policy.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,6 +29,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use super::codec::{DecodedItem, StreamDecoder};
+use crate::registry::DeviceRegistry;
 
 const BROADCAST_CAPACITY: usize = 1024;
 
@@ -74,16 +80,22 @@ pub struct TlsRelay {
     listener: TcpListener,
     acceptor: TlsAcceptor,
     tx: broadcast::Sender<Outbound>,
+    registry: Arc<DeviceRegistry>,
 }
 
 impl TlsRelay {
-    pub async fn bind(addr: SocketAddr, config: Arc<ServerConfig>) -> std::io::Result<Self> {
+    pub async fn bind(
+        addr: SocketAddr,
+        config: Arc<ServerConfig>,
+        registry: Arc<DeviceRegistry>,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Self {
             listener,
             acceptor: TlsAcceptor::from(config),
             tx,
+            registry,
         })
     }
 
@@ -93,25 +105,42 @@ impl TlsRelay {
 
     /// Accept connections forever, spawning a task per client. Only returns
     /// on a fatal `accept()` error (the listener socket itself is broken).
-    /// A failed TLS handshake (untrusted client cert, no cert presented,
-    /// etc.) disconnects that one client and does not affect the listener.
+    /// A failed TLS handshake, a cert with no extractable CN, or a revoked
+    /// CN disconnects that one client and does not affect the listener.
     pub async fn run(self) -> std::io::Result<()> {
         loop {
             let (stream, peer) = self.listener.accept().await?;
             let acceptor = self.acceptor.clone();
             let tx = self.tx.clone();
             let rx = self.tx.subscribe();
+            let registry = Arc::clone(&self.registry);
             tokio::spawn(async move {
-                match acceptor.accept(stream).await {
-                    Ok(tls_stream) => {
-                        let cn = peer_common_name(&tls_stream);
-                        info!(%peer, cn = cn.as_deref().unwrap_or("<none>"), "mTLS client connected");
-                        handle_client(tls_stream, peer, tx, rx).await;
-                    }
+                let mut tls_stream = match acceptor.accept(stream).await {
+                    Ok(stream) => stream,
                     Err(error) => {
                         warn!(%peer, %error, "TLS handshake failed, rejecting client");
+                        return;
                     }
+                };
+
+                let Some(cn) = peer_common_name(&tls_stream) else {
+                    warn!(%peer, "client cert has no extractable Common Name, disconnecting");
+                    // Send a proper TLS close_notify rather than an abrupt
+                    // drop, so the client observes a prompt, unambiguous
+                    // rejection instead of waiting on a read that may never
+                    // resolve.
+                    let _ = tls_stream.shutdown().await;
+                    return;
+                };
+
+                if registry.is_revoked(&cn) {
+                    warn!(%peer, cn, "rejecting connection from revoked device");
+                    let _ = tls_stream.shutdown().await;
+                    return;
                 }
+
+                info!(%peer, cn, "mTLS client connected");
+                handle_client(tls_stream, peer, cn, tx, rx, registry).await;
             });
         }
     }
@@ -134,8 +163,10 @@ fn peer_common_name(stream: &TlsStream<TcpStream>) -> Option<String> {
 async fn handle_client(
     stream: TlsStream<TcpStream>,
     peer: SocketAddr,
+    cn: String,
     tx: broadcast::Sender<Outbound>,
     mut rx: broadcast::Receiver<Outbound>,
+    registry: Arc<DeviceRegistry>,
 ) {
     let mut decoder = StreamDecoder::new();
     let mut read_buf = [0u8; 4096];
@@ -146,12 +177,12 @@ async fn handle_client(
             read_result = reader.read(&mut read_buf) => {
                 let n = match read_result {
                     Ok(0) => {
-                        info!(%peer, "mTLS client disconnected");
+                        info!(%peer, cn, "mTLS client disconnected");
                         return;
                     }
                     Ok(n) => n,
                     Err(error) => {
-                        warn!(%peer, %error, "read error, disconnecting client");
+                        warn!(%peer, cn, %error, "read error, disconnecting client");
                         return;
                     }
                 };
@@ -160,22 +191,33 @@ async fn handle_client(
                     Ok(items) => {
                         for item in items {
                             match item {
-                                DecodedItem::Event(event) => match event.to_xml() {
-                                    Ok(xml) => {
-                                        let _ = tx.send(Outbound { sender: peer, xml: xml.into() });
+                                DecodedItem::Event(event) => {
+                                    // TC-TLS-04: this connection's authenticated
+                                    // identity (cn) must own the uid it's
+                                    // asserting.
+                                    if let Err(error) = registry.bind_uid(&cn, &event.uid) {
+                                        warn!(%peer, cn, uid = %event.uid, %error, "uid binding violation, disconnecting client");
+                                        let _ = writer.shutdown().await;
+                                        return;
                                     }
-                                    Err(error) => {
-                                        warn!(%peer, %error, "failed to re-serialize decoded event, dropping");
+                                    match event.to_xml() {
+                                        Ok(xml) => {
+                                            let _ = tx.send(Outbound { sender: peer, xml: xml.into() });
+                                        }
+                                        Err(error) => {
+                                            warn!(%peer, cn, %error, "failed to re-serialize decoded event, dropping");
+                                        }
                                     }
                                 },
                                 DecodedItem::Skipped { error, .. } => {
-                                    debug!(%peer, %error, "skipped semantically-invalid CoT event");
+                                    debug!(%peer, cn, %error, "skipped semantically-invalid CoT event");
                                 }
                             }
                         }
                     }
                     Err(error) => {
-                        warn!(%peer, %error, "stream error, disconnecting client");
+                        warn!(%peer, cn, %error, "stream error, disconnecting client");
+                        let _ = writer.shutdown().await;
                         return;
                     }
                 }
@@ -228,11 +270,14 @@ mod tests {
         (cert.der().clone(), PrivateKeyDer::from(key))
     }
 
-    /// Shared test fixture: a CA, a server cert issued by it, and the
-    /// rustls server config built from both.
+    /// Shared test fixture: a CA, a server cert issued by it, the rustls
+    /// server config built from both, and the device registry every client
+    /// cert gets enrolled into (mirroring what the real enrollment HTTP
+    /// endpoint would have done before a device ever connects).
     struct Fixture {
         ca: CertificateAuthority,
         server_config: Arc<ServerConfig>,
+        registry: Arc<DeviceRegistry>,
     }
 
     /// Unlike a device client CSR (CN only -- client-cert verification
@@ -266,6 +311,7 @@ mod tests {
         Fixture {
             ca,
             server_config: Arc::new(config),
+            registry: Arc::new(DeviceRegistry::in_memory()),
         }
     }
 
@@ -274,11 +320,19 @@ mod tests {
         CertificateDer::from(parsed.contents().to_vec())
     }
 
-    fn client_tls_connector(ca: &CertificateAuthority, client_cn: &str) -> TlsConnector {
+    /// Sign a client cert for `client_cn` and enroll it in the fixture's
+    /// registry -- mirroring the real enrollment flow (HTTP endpoint signs
+    /// + records) that a raw `ca.sign_csr` call alone wouldn't do.
+    fn client_tls_connector(fixture: &Fixture, client_cn: &str) -> TlsConnector {
         let (csr, key) = build_csr(client_cn).unwrap();
-        let signed = ca.sign_csr(&csr, Duration::days(365)).unwrap();
+        let signed = fixture.ca.sign_csr(&csr, Duration::days(365)).unwrap();
+        fixture
+            .registry
+            .enroll(client_cn, &signed.cert_pem, 0)
+            .unwrap();
+
         let cert_der = pem_to_der(&signed.cert_pem);
-        let ca_der = pem_to_der(&ca.ca_cert_pem());
+        let ca_der = pem_to_der(&fixture.ca.ca_cert_pem());
 
         let mut roots = RootCertStore::empty();
         roots.add(ca_der).unwrap();
@@ -291,9 +345,22 @@ mod tests {
         TlsConnector::from(Arc::new(client_config))
     }
 
-    fn untrusted_client_tls_connector(ca: &CertificateAuthority) -> TlsConnector {
+    async fn connect_client(
+        addr: SocketAddr,
+        fixture: &Fixture,
+        cn: &str,
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
+        let connector = client_tls_connector(fixture, cn);
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        connector
+            .connect(ServerName::try_from("edgetak-server").unwrap(), tcp)
+            .await
+            .unwrap_or_else(|e| panic!("handshake for {cn} should succeed against the trusted CA: {e}"))
+    }
+
+    fn untrusted_client_tls_connector(fixture: &Fixture) -> TlsConnector {
         let (leaf_der, leaf_key) = self_signed_leaf("untrusted-device");
-        let ca_der = pem_to_der(&ca.ca_cert_pem());
+        let ca_der = pem_to_der(&fixture.ca.ca_cert_pem());
 
         let mut roots = RootCertStore::empty();
         roots.add(ca_der).unwrap();
@@ -313,26 +380,18 @@ mod tests {
     #[tokio::test]
     async fn tc_tls_01_accepts_valid_ca_signed_client_cert_and_relays() {
         let fixture = build_fixture();
-        let relay = TlsRelay::bind("127.0.0.1:0".parse().unwrap(), fixture.server_config)
-            .await
-            .unwrap();
+        let relay = TlsRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.server_config.clone(),
+            fixture.registry.clone(),
+        )
+        .await
+        .unwrap();
         let addr = relay.local_addr().unwrap();
         tokio::spawn(relay.run());
 
-        let connector_a = client_tls_connector(&fixture.ca, "device-a");
-        let connector_b = client_tls_connector(&fixture.ca, "device-b");
-
-        let tcp_a = TcpStream::connect(addr).await.unwrap();
-        let mut tls_a = connector_a
-            .connect(ServerName::try_from("edgetak-server").unwrap(), tcp_a)
-            .await
-            .expect("client A handshake should succeed against the trusted CA");
-
-        let tcp_b = TcpStream::connect(addr).await.unwrap();
-        let mut tls_b = connector_b
-            .connect(ServerName::try_from("edgetak-server").unwrap(), tcp_b)
-            .await
-            .expect("client B handshake should succeed against the trusted CA");
+        let mut tls_a = connect_client(addr, &fixture, "device-a").await;
+        let mut tls_b = connect_client(addr, &fixture, "device-b").await;
 
         tokio::time::sleep(StdDuration::from_millis(50)).await;
 
@@ -359,13 +418,17 @@ mod tests {
     #[tokio::test]
     async fn tc_tls_02_rejects_client_cert_not_signed_by_ca() {
         let fixture = build_fixture();
-        let relay = TlsRelay::bind("127.0.0.1:0".parse().unwrap(), fixture.server_config)
-            .await
-            .unwrap();
+        let relay = TlsRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.server_config.clone(),
+            fixture.registry.clone(),
+        )
+        .await
+        .unwrap();
         let addr = relay.local_addr().unwrap();
         tokio::spawn(relay.run());
 
-        let connector = untrusted_client_tls_connector(&fixture.ca);
+        let connector = untrusted_client_tls_connector(&fixture);
         let tcp = TcpStream::connect(addr).await.unwrap();
         let connect_result = connector
             .connect(ServerName::try_from("edgetak-server").unwrap(), tcp)
@@ -386,5 +449,116 @@ mod tests {
             rejected,
             "server must reject an untrusted client cert (write error, read error, or EOF expected); got write={write_result:?} read={read_result:?}"
         );
+    }
+
+    /// TC-TLS-05 (connect-time revocation check): a device revoked in the
+    /// registry is disconnected immediately after a handshake that would
+    /// otherwise succeed (its cert is still validly signed by the CA --
+    /// revocation is enforced by EdgeTAK's own registry, not the TLS layer).
+    #[tokio::test]
+    async fn tc_tls_05_disconnects_revoked_device_at_connect_time() {
+        let fixture = build_fixture();
+        let relay = TlsRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.server_config.clone(),
+            fixture.registry.clone(),
+        )
+        .await
+        .unwrap();
+        let addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+
+        let stream = connect_client(addr, &fixture, "device-revoked").await;
+        fixture.registry.revoke("device-revoked").unwrap();
+
+        // The already-open connection isn't force-closed mid-session (see
+        // module docs: revocation is connect-time only), but a *new*
+        // connection attempt for the same CN must be rejected.
+        drop(stream);
+
+        let connector = client_tls_connector(&fixture, "device-revoked");
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut new_stream = connector
+            .connect(ServerName::try_from("edgetak-server").unwrap(), tcp)
+            .await
+            .expect("TLS handshake itself still succeeds -- the cert is validly signed");
+
+        let write_result = new_stream
+            .write_all(event_xml("SHOULD-BE-REJECTED").as_bytes())
+            .await;
+        let mut buf = [0u8; 16];
+        let read_result = timeout(StdDuration::from_secs(2), new_stream.read(&mut buf)).await;
+        let rejected = write_result.is_err() || matches!(read_result, Ok(Ok(0)) | Ok(Err(_)));
+        assert!(
+            rejected,
+            "a revoked device's new connection must be rejected post-handshake; write={write_result:?} read={read_result:?}"
+        );
+    }
+
+    /// TC-TLS-04: a second device (different cert, different authenticated
+    /// CN) trying to assert a uid already bound to a first device is
+    /// disconnected -- the cross-device spoofing case this binding exists
+    /// to prevent.
+    #[tokio::test]
+    async fn tc_tls_04_disconnects_on_cross_device_uid_spoofing() {
+        let fixture = build_fixture();
+        let relay = TlsRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.server_config.clone(),
+            fixture.registry.clone(),
+        )
+        .await
+        .unwrap();
+        let addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+
+        let mut tls_a = connect_client(addr, &fixture, "device-a").await;
+        let mut tls_spoofer = connect_client(addr, &fixture, "device-spoofer").await;
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+
+        // device-a legitimately claims SHARED-UID first.
+        tls_a
+            .write_all(event_xml("SHARED-UID").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        assert_eq!(
+            fixture.registry.find("device-a").unwrap().uid.as_deref(),
+            Some("SHARED-UID")
+        );
+
+        // device-spoofer, as a legitimate *other* connected client, is
+        // entitled to receive device-a's just-broadcast event -- drain that
+        // expected traffic before looking for a rejection signal, so it
+        // isn't mistaken for one.
+        let mut drain_buf = vec![0u8; 4096];
+        let drained = timeout(StdDuration::from_secs(2), tls_spoofer.read(&mut drain_buf))
+            .await
+            .expect("timed out waiting for device-a's relayed event")
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&drain_buf[..drained]).contains("SHARED-UID"),
+            "expected to first drain device-a's legitimately relayed event"
+        );
+
+        // device-spoofer, a different authenticated identity, then tries to
+        // claim the same uid -- must be disconnected.
+        let write_result = tls_spoofer
+            .write_all(event_xml("SHARED-UID").as_bytes())
+            .await;
+        let mut buf = [0u8; 16];
+        let read_result = timeout(StdDuration::from_secs(2), tls_spoofer.read(&mut buf)).await;
+        let rejected = write_result.is_err() || matches!(read_result, Ok(Ok(0)) | Ok(Err(_)));
+        assert!(
+            rejected,
+            "a device asserting another device's uid must be disconnected; write={write_result:?} read={read_result:?}"
+        );
+
+        // The uid must still belong to device-a, not have been overwritten.
+        assert_eq!(
+            fixture.registry.find("device-a").unwrap().uid.as_deref(),
+            Some("SHARED-UID")
+        );
+        assert_eq!(fixture.registry.find("device-spoofer").unwrap().uid, None);
     }
 }
