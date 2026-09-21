@@ -52,7 +52,7 @@ The single most important interoperability risk identified during research.
 
 ## 3. TLS / mTLS & Certificate Identity
 
-**Implemented** (`src/transport/tls.rs`): TC-TLS-01 and TC-TLS-02, each as a real `rustls`/`tokio-rustls` mTLS handshake over an actual TCP socket, using certs issued by `src/pki.rs`. TC-TLS-02 accounts for a TLS 1.3 subtlety: a client can consider its handshake "done" locally before the server's rejection alert for an untrusted cert arrives, so the test treats either a failed handshake or a failed first read/write as a pass. TC-TLS-03 is implemented as "require a client cert" only (not the "or allow anonymous" branch). TC-TLS-04 through 07 are not yet implemented — TC-TLS-04 (identity binding) is explicitly deferred to the planned device-registry module.
+**Implemented** (`src/transport/tls.rs` + `src/registry.rs`): TC-TLS-01, TC-TLS-02, TC-TLS-04, and TC-TLS-05 (connect-time only), each as a real `rustls`/`tokio-rustls` mTLS handshake over an actual TCP socket, using certs issued by `src/pki.rs` and identities tracked in the device registry. TC-TLS-02/04/05's rejection tests all account for the same TLS 1.3 subtlety: a client can consider its handshake/read "succeeded" locally before the server's rejection (a TLS close_notify, sent explicitly on every disconnect path) actually arrives, so each test treats a failed handshake, a failed write, or a failed/EOF read as a pass. TC-TLS-03 is implemented as "require a client cert" only (not the "or allow anonymous" branch). TC-TLS-06/07 are not yet implemented.
 
 | ID | Case | Type |
 |---|---|---|
@@ -66,7 +66,7 @@ The single most important interoperability risk identified during research.
 
 ## 4. Certificate Enrollment / Marti PKI API
 
-**Implemented** (`src/pki.rs`): CA generation and CSR signing, covering TC-ENROLL-06 (malformed CSR rejected with a typed error). A cryptographic round-trip test verifies a signed leaf certificate's signature against the issuing CA's public key using `x509-parser`, not just "no error was thrown," and a CA survives a PEM round-trip (serialize, reload, still able to sign). **Not yet implemented**: the HTTP `/Marti/api/tls/*` contract itself (TC-ENROLL-01/02/03/05/07) and re-enrollment policy (TC-ENROLL-04) — this module is the signing primitive only.
+**Implemented** (`src/pki.rs` + `src/marti/enrollment.rs` + `src/registry.rs`): CA generation and CSR signing (`pki.rs`), the HTTP `/Marti/api/tls/config` and `/Marti/api/tls/signClient/v2` endpoints (`marti/enrollment.rs`), and device recording on successful enrollment (`registry.rs`). Covers TC-ENROLL-01, 02, 03, 06, and 07 — each as a real HTTP integration test against a bound `axum` server using `reqwest`, including one that cryptographically re-verifies the returned certificate against the CA. TC-ENROLL-04 (re-enrollment policy) has a partial, tested answer: re-enrolling preserves both the `uid` binding and revocation status rather than resetting either — but no endpoint-level test of *re-enrollment via HTTP* exists yet, only at the registry level. `v1` (`signClient/` with no suffix) is deliberately not implemented (see the module's doc comment for why). TC-ENROLL-05 (enrollment Data Package / "quick connect") is not yet implemented.
 
 | ID | Case | Type |
 |---|---|---|
@@ -159,6 +159,14 @@ This entire section is speculative and will change once Reticulum/LXMF prototypi
 ## 11. WebSocket / live-update payloads (deferred, not in current scope)
 
 If EdgeTAK ever implements Socket.IO/WebSocket-compatible live updates for browser-based clients, the following event names/payload/gating conventions are confirmed from a real deployed reference server and worth matching for client compatibility: `"point"` (gated on the CoT having a `<takv>`, `<__video>`, or `<contact>` element — a bare position update with none of these never reaches a live map), `"alert"`, `"casevac"`, `"marker"` (gated on CoT `type` matching known atom/marker prefixes), `"rb_line"`, and `"eud"` (emitted specifically on the `t-x-d-d` disconnect convention from TC-ROUTE-03). All confirmed emitted under a **named** Socket.IO namespace, not the default root namespace.
+
+## 12. Device Registry (new module, not part of the original catalog)
+
+Added alongside the enrollment endpoint (§4) — tracks enrolled devices by certificate Common Name, implements TC-TLS-04's binding policy, and tracks revocation. Not part of the original research-derived catalog above (there's no external reference implementation to compare against here — this is EdgeTAK's own design), so tracked with plain descriptions rather than TC-IDs.
+
+**Implemented** (`src/registry.rs`), each with a passing unit test: enroll and find a device; re-enrollment (cert rotation) preserves an existing `uid` binding; re-enrollment preserves an existing revocation (does **not** silently un-revoke — a real bug caught by the mTLS integration tests during development, see TC-TLS-05 above); bind a `uid` on first use; idempotent re-assertion of an already-owned `uid`; reject binding a `uid` already owned by a different device; reject a device rebinding to a *different* `uid` than the one it already owns; revoke a device; revoking an unknown device errors; the registry persists across a reload from its JSON file; loading a nonexistent path starts empty rather than erroring.
+
+**Not yet implemented**: an explicit `unrevoke` action (revocation is currently one-way); any capacity/pagination concerns (irrelevant at this project's target scale, see `docs/ARCHITECTURE.md`).
 
 ## Pending research
 

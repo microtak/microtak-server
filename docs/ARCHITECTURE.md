@@ -24,7 +24,7 @@ This is a from-scratch implementation, not a fork. Research on the official TAK 
 6. **Backup**: periodic backup-to-disk (interval configurable), plus optional S3/SCP/rsync offsite backup when internet access is available. Not meaningful to implement until there's persistent state (CA/keys, device records, config) worth backing up.
 7. **Deployment packaging**: container image (Docker/Podman-compatible), a Helm chart, and install instructions. The Helm chart is deferred until the config surface (TLS certs, persistence, mesh-sync settings) is stable enough to be worth expressing as chart values.
 
-**Deferred to a later phase:** a full TAK web client — live map, video feed playback, geolocated images, a live event stream, chat, and team status visualization. A large, separate frontend project depending on EdgeTAK having a stable Marti API and live-update channel to consume. Not started.
+**Deferred to a later phase, and possibly unneeded:** a full TAK web client — live map, video feed playback, geolocated images, a live event stream, chat, and team status visualization. Put on the backburner in favor of a full end-to-end test suite first; an existing web TAK client (CloudTAK) may be reused instead of building a bespoke one, once the Marti API surface is compatible enough. Not started.
 
 **Explicitly out of scope for now:**
 
