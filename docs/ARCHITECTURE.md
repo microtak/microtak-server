@@ -20,6 +20,12 @@ This is a from-scratch implementation, not a fork. Research on the official TAK 
 3. Certificate enrollment (CSR submission + signing), matching the real Marti `/Marti/api/tls/*` contract closely enough for stock clients to work unmodified.
 4. **Mesh sync**: EdgeTAK-to-EdgeTAK synchronization of CoT state across islanded deployments (see below).
 
+5. **User/device (EUD) management**: identity, groups, and profiles, bound to issued certificates. Depends on PKI existing first.
+6. **Backup**: periodic backup-to-disk (interval configurable), plus optional S3/SCP/rsync offsite backup when internet access is available. Not meaningful to implement until there's persistent state (CA/keys, device records, config) worth backing up.
+7. **Deployment packaging**: container image (Docker/Podman-compatible), a Helm chart, and install instructions. The Helm chart is deferred until the config surface (TLS certs, persistence, mesh-sync settings) is stable enough to be worth expressing as chart values.
+
+**Deferred to a later phase:** a full TAK web client — live map, video feed playback, geolocated images, a live event stream, chat, and team status visualization. A large, separate frontend project depending on EdgeTAK having a stable Marti API and live-update channel to consume. Not started.
+
 **Explicitly out of scope for now:**
 
 - Official-TAK-Server-style federation (gRPC-over-HTTP/2 on a dedicated port) — insufficiently documented from authoritative public sources to build a compatible peer, and not the sync model this project actually needs.
