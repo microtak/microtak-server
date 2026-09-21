@@ -34,6 +34,8 @@ Each test case is tagged with why it exists:
 
 The single most important interoperability risk identified during research.
 
+**Implemented** (`src/transport/codec.rs`, `src/transport/tcp.rs`): TC-STREAM-01 through 05, plus TC-ROUTE-01 (baseline broadcast relay) — TC-STREAM-01/02/03/05 as fast unit tests directly against `StreamDecoder`, TC-STREAM-04/05/TC-ROUTE-01 as real socket-level integration tests against an actual `TcpListener`. TC-STREAM-06 through 11 (TAK Protocol binary framing, TLS handshake timeout, idle-client tolerance, startup timeout) are not yet implemented.
+
 | ID | Case | Type |
 |---|---|---|
 | TC-STREAM-01 | Correctly parse a persistent TCP stream where **every** CoT event carries its own leading `<?xml version="1.0" ...?>` declaration (confirmed real ATAK behavior) | [COMPAT] |
@@ -50,6 +52,8 @@ The single most important interoperability risk identified during research.
 
 ## 3. TLS / mTLS & Certificate Identity
 
+**Implemented** (`src/transport/tls.rs`): TC-TLS-01 and TC-TLS-02, each as a real `rustls`/`tokio-rustls` mTLS handshake over an actual TCP socket, using certs issued by `src/pki.rs`. TC-TLS-02 accounts for a TLS 1.3 subtlety: a client can consider its handshake "done" locally before the server's rejection alert for an untrusted cert arrives, so the test treats either a failed handshake or a failed first read/write as a pass. TC-TLS-03 is implemented as "require a client cert" only (not the "or allow anonymous" branch). TC-TLS-04 through 07 are not yet implemented — TC-TLS-04 (identity binding) is explicitly deferred to the planned device-registry module.
+
 | ID | Case | Type |
 |---|---|---|
 | TC-TLS-01 | Accept a valid client cert signed by EdgeTAK's own CA over the mTLS CoT port | [COMPAT] |
@@ -61,6 +65,8 @@ The single most important interoperability risk identified during research.
 | TC-TLS-07 | Client cert bundle format (PKCS12) is importable by a real ATAK/WinTAK client, not just OpenSSL-verifiable — test against a live client, not just cryptographic correctness (real ATAK-specific import failures have been reported against at least one reference implementation's bundles, root cause unconfirmed) | [COMPAT] |
 
 ## 4. Certificate Enrollment / Marti PKI API
+
+**Implemented** (`src/pki.rs`): CA generation and CSR signing, covering TC-ENROLL-06 (malformed CSR rejected with a typed error). A cryptographic round-trip test verifies a signed leaf certificate's signature against the issuing CA's public key using `x509-parser`, not just "no error was thrown," and a CA survives a PEM round-trip (serialize, reload, still able to sign). **Not yet implemented**: the HTTP `/Marti/api/tls/*` contract itself (TC-ENROLL-01/02/03/05/07) and re-enrollment policy (TC-ENROLL-04) — this module is the signing primitive only.
 
 | ID | Case | Type |
 |---|---|---|
