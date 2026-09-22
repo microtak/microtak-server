@@ -14,6 +14,9 @@
 //! whose CoT claims a `uid` already bound to a *different* device is
 //! disconnected as soon as that event is decoded — see
 //! [`DeviceRegistry::bind_uid`] for the exact binding policy.
+//!
+//! Shares a [`RelayHub`] with [`super::tcp::TcpRelay`] — a CoT event
+//! ingested here is relayed to plain-TCP clients too, and vice versa.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,15 +32,8 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use super::codec::{DecodedItem, StreamDecoder};
+use super::hub::{Outbound, RelayHub};
 use crate::registry::DeviceRegistry;
-
-const BROADCAST_CAPACITY: usize = 1024;
-
-#[derive(Clone)]
-struct Outbound {
-    sender: SocketAddr,
-    xml: Arc<str>,
-}
 
 /// Build a server TLS config that requires a client certificate signed by
 /// `ca_cert_der`, presenting `server_cert_chain`/`server_key` as this
@@ -79,7 +75,7 @@ pub enum TlsSetupError {
 pub struct TlsRelay {
     listener: TcpListener,
     acceptor: TlsAcceptor,
-    tx: broadcast::Sender<Outbound>,
+    hub: RelayHub,
     registry: Arc<DeviceRegistry>,
 }
 
@@ -87,14 +83,14 @@ impl TlsRelay {
     pub async fn bind(
         addr: SocketAddr,
         config: Arc<ServerConfig>,
+        hub: RelayHub,
         registry: Arc<DeviceRegistry>,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
-        let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Self {
             listener,
             acceptor: TlsAcceptor::from(config),
-            tx,
+            hub,
             registry,
         })
     }
@@ -111,8 +107,8 @@ impl TlsRelay {
         loop {
             let (stream, peer) = self.listener.accept().await?;
             let acceptor = self.acceptor.clone();
-            let tx = self.tx.clone();
-            let rx = self.tx.subscribe();
+            let tx = self.hub.sender();
+            let rx = self.hub.subscribe();
             let registry = Arc::clone(&self.registry);
             tokio::spawn(async move {
                 let mut tls_stream = match acceptor.accept(stream).await {
@@ -383,6 +379,7 @@ mod tests {
         let relay = TlsRelay::bind(
             "127.0.0.1:0".parse().unwrap(),
             fixture.server_config.clone(),
+            RelayHub::new(),
             fixture.registry.clone(),
         )
         .await
@@ -421,6 +418,7 @@ mod tests {
         let relay = TlsRelay::bind(
             "127.0.0.1:0".parse().unwrap(),
             fixture.server_config.clone(),
+            RelayHub::new(),
             fixture.registry.clone(),
         )
         .await
@@ -461,6 +459,7 @@ mod tests {
         let relay = TlsRelay::bind(
             "127.0.0.1:0".parse().unwrap(),
             fixture.server_config.clone(),
+            RelayHub::new(),
             fixture.registry.clone(),
         )
         .await
@@ -505,6 +504,7 @@ mod tests {
         let relay = TlsRelay::bind(
             "127.0.0.1:0".parse().unwrap(),
             fixture.server_config.clone(),
+            RelayHub::new(),
             fixture.registry.clone(),
         )
         .await
