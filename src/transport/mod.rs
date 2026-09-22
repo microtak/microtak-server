@@ -4,6 +4,9 @@
 //! - [`hub`]: the shared broadcast bus [`tcp`] and [`tls`] both relay
 //!   through, so a CoT event is delivered across transports, not just to
 //!   other clients on the same one.
+//! - [`connections`]: the shared live connected-client registry [`tcp`]
+//!   and [`tls`] both register/unregister with, backing `clientEndPoints`
+//!   (TC-MARTI-09).
 //! - [`tcp`]: plain-TCP relay listener built on the decoder (no auth).
 //! - [`tls`]: mTLS-authenticated relay built on the same decoder, requiring
 //!   a client cert signed by a configured CA (`docs/TEST-PLAN.md` §3).
@@ -12,6 +15,7 @@
 //! TC-STREAM-06..08).
 
 pub mod codec;
+pub mod connections;
 pub mod hub;
 pub mod tcp;
 pub mod tls;

@@ -20,6 +20,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
@@ -32,6 +33,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use super::codec::{DecodedItem, StreamDecoder};
+use super::connections::{ClientEndpoint, ConnectedClients, Transport, UnregisterOnDrop};
 use super::hub::{Outbound, RelayHub};
 use crate::registry::DeviceRegistry;
 
@@ -77,6 +79,7 @@ pub struct TlsRelay {
     acceptor: TlsAcceptor,
     hub: RelayHub,
     registry: Arc<DeviceRegistry>,
+    clients: ConnectedClients,
 }
 
 impl TlsRelay {
@@ -85,6 +88,7 @@ impl TlsRelay {
         config: Arc<ServerConfig>,
         hub: RelayHub,
         registry: Arc<DeviceRegistry>,
+        clients: ConnectedClients,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
@@ -92,6 +96,7 @@ impl TlsRelay {
             acceptor: TlsAcceptor::from(config),
             hub,
             registry,
+            clients,
         })
     }
 
@@ -110,6 +115,7 @@ impl TlsRelay {
             let tx = self.hub.sender();
             let rx = self.hub.subscribe();
             let registry = Arc::clone(&self.registry);
+            let clients = self.clients.clone();
             tokio::spawn(async move {
                 let mut tls_stream = match acceptor.accept(stream).await {
                     Ok(stream) => stream,
@@ -136,7 +142,7 @@ impl TlsRelay {
                 }
 
                 info!(%peer, cn, "mTLS client connected");
-                handle_client(tls_stream, peer, cn, tx, rx, registry).await;
+                handle_client(tls_stream, peer, cn, tx, rx, registry, clients).await;
             });
         }
     }
@@ -156,7 +162,22 @@ async fn handle_client(
     tx: broadcast::Sender<Outbound>,
     mut rx: broadcast::Receiver<Outbound>,
     registry: Arc<DeviceRegistry>,
+    clients: ConnectedClients,
 ) {
+    clients.register(ClientEndpoint {
+        remote_addr: peer,
+        transport: Transport::Tls,
+        common_name: Some(cn.clone()),
+        uid: None,
+        connected_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    });
+    let _guard = UnregisterOnDrop {
+        clients: &clients,
+        peer,
+    };
     let mut decoder = StreamDecoder::new();
     let mut read_buf = [0u8; 4096];
     let (mut reader, mut writer) = split(stream);
@@ -189,6 +210,7 @@ async fn handle_client(
                                         let _ = writer.shutdown().await;
                                         return;
                                     }
+                                    clients.set_uid(peer, event.uid.clone());
                                     let dest_uids = event
                                         .addressed_uids()
                                         .map(|uids| uids.into_iter().map(String::from).collect::<Vec<_>>().into());
@@ -385,6 +407,7 @@ mod tests {
             fixture.server_config.clone(),
             RelayHub::new(),
             fixture.registry.clone(),
+            ConnectedClients::new(),
         )
         .await
         .unwrap();
@@ -424,6 +447,7 @@ mod tests {
             fixture.server_config.clone(),
             RelayHub::new(),
             fixture.registry.clone(),
+            ConnectedClients::new(),
         )
         .await
         .unwrap();
@@ -465,6 +489,7 @@ mod tests {
             fixture.server_config.clone(),
             RelayHub::new(),
             fixture.registry.clone(),
+            ConnectedClients::new(),
         )
         .await
         .unwrap();
@@ -510,6 +535,7 @@ mod tests {
             fixture.server_config.clone(),
             RelayHub::new(),
             fixture.registry.clone(),
+            ConnectedClients::new(),
         )
         .await
         .unwrap();
@@ -609,6 +635,7 @@ mod tests {
             fixture.server_config.clone(),
             RelayHub::new(),
             fixture.registry.clone(),
+            ConnectedClients::new(),
         )
         .await
         .unwrap();
@@ -661,6 +688,7 @@ mod tests {
             fixture.server_config.clone(),
             RelayHub::new(),
             fixture.registry.clone(),
+            ConnectedClients::new(),
         )
         .await
         .unwrap();

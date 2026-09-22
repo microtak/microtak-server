@@ -430,6 +430,93 @@ async fn e2e_fanout_to_multiple_clients_across_mixed_transports() {
     }
 }
 
+/// TC-MARTI-09, end-to-end: `GET /Marti/api/clientEndPoints` reflects real
+/// connections against the fully-assembled server -- a plain-TCP client (no
+/// identity) and an mTLS client (real cert CN) both show up while connected,
+/// and the mTLS one drops off the list once it disconnects. This is the
+/// integration-level companion to `marti::client_endpoints`'s own unit test,
+/// which only exercises the registry+router in isolation.
+#[tokio::test]
+async fn e2e_client_endpoints_reflects_real_connections() {
+    let app = App::bind(test_config()).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let mtls_addr = app.mtls_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let plain_addr = app.plain_tcp_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    tokio::spawn(app.run());
+
+    let base_url = format!("http://{enrollment_addr}");
+    let (cert, key) = enroll(&base_url, "endpoints-client").await;
+    let (viewer_cert, viewer_key) = enroll(&base_url, "endpoints-viewer").await;
+
+    let client = mtls_reqwest_client(&ca_cert_pem, &viewer_cert, viewer_key, marti_api_addr);
+    let list_url = format!("https://{SERVER_NAME}:{}/Marti/api/clientEndPoints", marti_api_addr.port());
+
+    let before: Vec<serde_json::Value> = client
+        .get(&list_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(before.is_empty(), "no clients connected yet: {before:?}");
+
+    let plain_client = TcpStream::connect(plain_addr).await.unwrap();
+    let mtls_stream = connect_mtls(mtls_addr, &ca_cert_pem, &cert, key)
+        .await
+        .unwrap();
+    // Bind the mTLS connection's uid so the endpoint's `uid` field is
+    // populated too, not just `common_name`.
+    let (mtls_reader, mut mtls_writer) = tokio::io::split(mtls_stream);
+    mtls_writer
+        .write_all(event_xml("ENDPOINTS-UID").as_bytes())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let during: Vec<serde_json::Value> = client
+        .get(&list_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(during.len(), 2, "expected both live connections: {during:?}");
+    assert!(
+        during
+            .iter()
+            .any(|c| c["transport"] == "tcp" && c["common_name"].is_null()),
+        "expected an unauthenticated plain-TCP entry: {during:?}"
+    );
+    assert!(
+        during.iter().any(|c| c["transport"] == "tls"
+            && c["common_name"] == "endpoints-client"
+            && c["uid"] == "ENDPOINTS-UID"),
+        "expected the mTLS entry with its bound cn and uid: {during:?}"
+    );
+
+    drop(plain_client);
+    drop(mtls_reader);
+    drop(mtls_writer);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let after: Vec<serde_json::Value> = client
+        .get(&list_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        after.is_empty(),
+        "both connections disconnected, list should be empty again: {after:?}"
+    );
+}
+
 /// Cross-device uid spoofing, exercised through the full enroll-then-connect
 /// chain (unlike `transport::tls`'s own unit test, which enrolls directly
 /// into a bespoke registry rather than via HTTP).

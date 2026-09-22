@@ -5,9 +5,11 @@
 //! - [`missions`]: mission metadata CRUD, change log, and subscriptions
 //!   (`/Marti/api/missions/*`), served mTLS-authenticated via
 //!   [`MtlsHttpServer`] — TC-MARTI-10.
+//! - [`client_endpoints`]: `GET /Marti/api/clientEndPoints` (TC-MARTI-09),
+//!   backed by the live [`crate::transport::connections::ConnectedClients`]
+//!   registry rather than a static list.
 //!
-//! Not yet implemented: `clientEndPoints` reflecting live connections
-//! (TC-MARTI-09), groups, device profiles.
+//! Not yet implemented: groups, device profiles.
 //!
 //! [`MtlsHttpServer`] injects the connecting cert's Common Name into every
 //! request as a [`PeerIdentity`] extension — [`missions`] uses this to
@@ -30,6 +32,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::warn;
 
+pub mod client_endpoints;
 pub mod enrollment;
 pub mod missions;
 

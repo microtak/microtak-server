@@ -17,10 +17,13 @@ use rustls::ServerConfig;
 use time::Duration;
 
 use crate::marti::enrollment::EnrollmentState;
-use crate::marti::{enrollment, missions as missions_api, MtlsHttpServer, PlainHttpServer};
+use crate::marti::{
+    client_endpoints, enrollment, missions as missions_api, MtlsHttpServer, PlainHttpServer,
+};
 use crate::missions::{MissionError, MissionStore};
 use crate::pki::{self, CertificateAuthority, PkiError};
 use crate::registry::{DeviceRegistry, RegistryError};
+use crate::transport::connections::ConnectedClients;
 use crate::transport::hub::RelayHub;
 use crate::transport::tcp::TcpRelay;
 use crate::transport::tls::{self, TlsRelay, TlsSetupError};
@@ -120,6 +123,7 @@ impl App {
             config.data_dir.join("missions.log"),
         )?);
         let hub = RelayHub::new();
+        let clients = ConnectedClients::new();
 
         // The mTLS listener's own server identity, issued by the same CA a
         // client would enroll against.
@@ -152,18 +156,18 @@ impl App {
             enrollment::router(enrollment_state),
         )
         .await?;
-        let marti_api = MtlsHttpServer::bind(
-            config.marti_api_addr,
-            Arc::clone(&tls_server_config),
-            missions_api::router(Arc::clone(&missions)),
-        )
-        .await?;
-        let tcp = TcpRelay::bind(config.plain_tcp_addr, hub.clone()).await?;
+        let marti_router = missions_api::router(Arc::clone(&missions))
+            .merge(client_endpoints::router(clients.clone()));
+        let marti_api =
+            MtlsHttpServer::bind(config.marti_api_addr, Arc::clone(&tls_server_config), marti_router)
+                .await?;
+        let tcp = TcpRelay::bind(config.plain_tcp_addr, hub.clone(), clients.clone()).await?;
         let tls = TlsRelay::bind(
             config.mtls_addr,
             tls_server_config,
             hub,
             Arc::clone(&registry),
+            clients,
         )
         .await?;
 

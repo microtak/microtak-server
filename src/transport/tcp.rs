@@ -11,6 +11,7 @@
 //! ingested here is relayed to mTLS clients too, and vice versa.
 
 use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -18,17 +19,27 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use super::codec::{DecodedItem, StreamDecoder};
+use super::connections::{ClientEndpoint, ConnectedClients, Transport, UnregisterOnDrop};
 use super::hub::{Outbound, RelayHub};
 
 pub struct TcpRelay {
     listener: TcpListener,
     hub: RelayHub,
+    clients: ConnectedClients,
 }
 
 impl TcpRelay {
-    pub async fn bind(addr: SocketAddr, hub: RelayHub) -> std::io::Result<Self> {
+    pub async fn bind(
+        addr: SocketAddr,
+        hub: RelayHub,
+        clients: ConnectedClients,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
-        Ok(Self { listener, hub })
+        Ok(Self {
+            listener,
+            hub,
+            clients,
+        })
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -42,8 +53,9 @@ impl TcpRelay {
             let (stream, peer) = self.listener.accept().await?;
             let tx = self.hub.sender();
             let rx = self.hub.subscribe();
+            let clients = self.clients.clone();
             tokio::spawn(async move {
-                handle_client(stream, peer, tx, rx).await;
+                handle_client(stream, peer, tx, rx, clients).await;
             });
         }
     }
@@ -54,8 +66,23 @@ async fn handle_client(
     peer: SocketAddr,
     tx: broadcast::Sender<Outbound>,
     mut rx: broadcast::Receiver<Outbound>,
+    clients: ConnectedClients,
 ) {
     info!(%peer, "client connected");
+    clients.register(ClientEndpoint {
+        remote_addr: peer,
+        transport: Transport::Tcp,
+        common_name: None,
+        uid: None,
+        connected_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    });
+    let _guard = UnregisterOnDrop {
+        clients: &clients,
+        peer,
+    };
     let mut decoder = StreamDecoder::new();
     let mut read_buf = [0u8; 4096];
     let (mut reader, mut writer) = stream.split();
@@ -155,7 +182,11 @@ mod tests {
     /// transport.
     #[tokio::test]
     async fn tc_route_01_relays_event_to_other_client_but_not_back_to_sender() {
-        let relay = TcpRelay::bind("127.0.0.1:0".parse().unwrap(), RelayHub::new())
+        let relay = TcpRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            RelayHub::new(),
+            ConnectedClients::new(),
+        )
             .await
             .unwrap();
         let addr = relay.local_addr().unwrap();
@@ -194,7 +225,11 @@ mod tests {
     /// TC-STREAM-04: a stream-level syntax error disconnects the client.
     #[tokio::test]
     async fn tc_stream_04_disconnects_client_on_garbage_input() {
-        let relay = TcpRelay::bind("127.0.0.1:0".parse().unwrap(), RelayHub::new())
+        let relay = TcpRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            RelayHub::new(),
+            ConnectedClients::new(),
+        )
             .await
             .unwrap();
         let addr = relay.local_addr().unwrap();
@@ -218,7 +253,11 @@ mod tests {
     /// connection -- a later, valid event on the same socket still relays.
     #[tokio::test]
     async fn tc_stream_05_keeps_connection_open_after_skipped_event() {
-        let relay = TcpRelay::bind("127.0.0.1:0".parse().unwrap(), RelayHub::new())
+        let relay = TcpRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            RelayHub::new(),
+            ConnectedClients::new(),
+        )
             .await
             .unwrap();
         let addr = relay.local_addr().unwrap();
