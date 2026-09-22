@@ -34,12 +34,25 @@ use tokio_rustls::TlsConnector;
 
 const SERVER_NAME: &str = "edgetak-server";
 
+static TEST_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A fresh, uniquely-named temp directory per call -- required because
+/// `cargo test` runs test functions concurrently within one process, and
+/// `App::bind` now persists state to `data_dir` (a shared fixed directory
+/// would race: two tests' `App`s would read/write the same CA/registry/
+/// mission files at once).
+fn unique_temp_dir() -> std::path::PathBuf {
+    let n = TEST_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("edgetak-e2e-{}-{n}", std::process::id()))
+}
+
 fn test_config() -> AppConfig {
     AppConfig {
         enrollment_addr: "127.0.0.1:0".parse().unwrap(),
         marti_api_addr: "127.0.0.1:0".parse().unwrap(),
         plain_tcp_addr: "127.0.0.1:0".parse().unwrap(),
         mtls_addr: "127.0.0.1:0".parse().unwrap(),
+        data_dir: unique_temp_dir(),
         ..AppConfig::default()
     }
 }
