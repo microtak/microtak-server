@@ -12,6 +12,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
     DnType, DnValue, Issuer, IsCa, KeyPair, KeyUsagePurpose,
 };
+use rustls::pki_types::CertificateDer;
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 
@@ -31,6 +32,8 @@ pub enum PkiError {
     MissingCommonName,
     #[error("failed to sign certificate: {0}")]
     Signing(rcgen::Error),
+    #[error("failed to parse PEM: {0}")]
+    Pem(#[from] pem::PemError),
 }
 
 /// A self-signed certificate authority: holds its own key pair and can sign
@@ -137,13 +140,31 @@ fn common_name_of(dn: &DistinguishedName) -> Option<String> {
     }
 }
 
+/// Decode a PEM-encoded certificate (CA or leaf) to DER, for handing to
+/// `rustls`.
+pub fn cert_pem_to_der(pem_str: &str) -> Result<CertificateDer<'static>, PkiError> {
+    let parsed = pem::parse(pem_str)?;
+    Ok(CertificateDer::from(parsed.contents().to_vec()))
+}
+
 /// Build a PEM-encoded CSR for the given Common Name, for use in tests and
 /// as a reference client-side implementation.
 pub fn build_csr(common_name: &str) -> Result<(String, KeyPair), PkiError> {
+    build_csr_with_san(common_name, Vec::new())
+}
+
+/// Like [`build_csr`], but also requesting the given DNS Subject
+/// Alternative Names — needed for a *server* cert, since TLS clients verify
+/// server identity against SAN, not CN (RFC 6125). A client-auth cert
+/// doesn't need this (client-cert verification doesn't check hostname).
+pub fn build_csr_with_san(
+    common_name: &str,
+    dns_names: Vec<String>,
+) -> Result<(String, KeyPair), PkiError> {
     let key = KeyPair::generate().map_err(PkiError::KeyGeneration)?;
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, common_name);
-    let mut params = CertificateParams::new(Vec::<String>::new()).map_err(PkiError::Params)?;
+    let mut params = CertificateParams::new(dns_names).map_err(PkiError::Params)?;
     params.distinguished_name = dn;
     let csr = params.serialize_request(&key).map_err(PkiError::Signing)?;
     let pem = csr.pem().map_err(PkiError::Signing)?;

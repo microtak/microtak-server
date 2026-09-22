@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.7"
+pem = "4"
 quick-xml = { version = "0.36", features = ["serialize"] }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -29,5 +30,4 @@ tracing-subscriber = "0.3"
 x509-parser = "0.18"
 
 [dev-dependencies]
-pem = "4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -38,7 +38,7 @@ use crate::registry::DeviceRegistry;
 
 pub struct EnrollmentState {
     pub ca: CertificateAuthority,
-    pub registry: DeviceRegistry,
+    pub registry: Arc<DeviceRegistry>,
     pub cert_validity: Duration,
 }
 
@@ -49,11 +49,31 @@ pub fn router(state: Arc<EnrollmentState>) -> Router {
         .with_state(state)
 }
 
-/// Bind a real TCP listener and serve the enrollment API on it until the
-/// process exits or the listener errors.
-pub async fn serve(addr: SocketAddr, state: Arc<EnrollmentState>) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router(state)).await
+/// The enrollment HTTP listener, following the same
+/// bind-then-`local_addr`-then-`run` shape as [`crate::transport::tcp::TcpRelay`]
+/// and [`crate::transport::tls::TlsRelay`] — lets a caller (or a test) learn
+/// the actual bound port before starting to serve, which matters when
+/// binding an ephemeral port (`:0`).
+pub struct EnrollmentServer {
+    listener: tokio::net::TcpListener,
+    state: Arc<EnrollmentState>,
+}
+
+impl EnrollmentServer {
+    pub async fn bind(addr: SocketAddr, state: Arc<EnrollmentState>) -> std::io::Result<Self> {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        Ok(Self { listener, state })
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// Serve the enrollment API until the process exits or the listener
+    /// errors.
+    pub async fn run(self) -> std::io::Result<()> {
+        axum::serve(self.listener, router(self.state)).await
+    }
 }
 
 /// TC-ENROLL-01: reachable with no client cert / no auth of any kind,
@@ -196,17 +216,17 @@ mod tests {
     fn test_state() -> Arc<EnrollmentState> {
         Arc::new(EnrollmentState {
             ca: CertificateAuthority::generate("EdgeTAK Test CA").unwrap(),
-            registry: DeviceRegistry::in_memory(),
+            registry: Arc::new(DeviceRegistry::in_memory()),
             cert_validity: Duration::days(365),
         })
     }
 
     async fn spawn_server(state: Arc<EnrollmentState>) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, router(state)).await.unwrap();
-        });
+        let server = EnrollmentServer::bind("127.0.0.1:0".parse().unwrap(), state)
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.run());
         format!("http://{addr}")
     }
 
