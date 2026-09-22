@@ -255,4 +255,84 @@ mod tests {
         assert!(!is_valid_hash(&"a".repeat(63)));
         assert!(!is_valid_hash("../escape"));
     }
+
+    /// TC-MARTI-08: `put`'s temp file is cleaned up by the rename -- no
+    /// `.tmp-*` artifact is left behind in the store directory once a
+    /// write completes.
+    #[test]
+    fn put_leaves_no_temp_file_behind() {
+        let dir = temp_dir("no-tmp-leftover");
+        let store = ContentStore::open(dir.clone()).unwrap();
+
+        store.put(b"clean up after yourself", None).unwrap();
+
+        let leftover_tmp_files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".tmp-"))
+            .collect();
+        assert!(
+            leftover_tmp_files.is_empty(),
+            "expected no leftover temp files, found: {leftover_tmp_files:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TC-MARTI-08's core atomicity claim, tested directly rather than by
+    /// inspection: a reader racing a writer must never observe a partially
+    /// written file at the final, content-addressed path -- it either sees
+    /// nothing (the rename hasn't happened yet) or the complete, correct
+    /// content (the rename already happened), never a truncated read. A
+    /// naive `put` that wrote straight to the final path (skipping the
+    /// temp-file + rename step this module claims to use) would fail this
+    /// test under load, since a concurrent reader could open the file
+    /// mid-write and read a short prefix.
+    #[test]
+    fn concurrent_reader_never_observes_a_partially_written_file() {
+        let dir = temp_dir("atomicity-race");
+        let store = std::sync::Arc::new(ContentStore::open(dir.clone()).unwrap());
+
+        // Large enough that a naive non-atomic write is very likely to be
+        // observable mid-flight by a concurrent reader on any real filesystem.
+        let payload: Vec<u8> = (0..8_000_000).map(|i| (i % 251) as u8).collect();
+        let expected_hash = hex_sha256(&payload);
+
+        let reader_store = std::sync::Arc::clone(&store);
+        let reader_hash = expected_hash.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = std::sync::Arc::clone(&stop);
+        let reader_payload_len = payload.len();
+        let reader = std::thread::spawn(move || {
+            let mut observations = 0usize;
+            while !reader_stop.load(Ordering::Relaxed) {
+                if let Ok(Some(bytes)) = reader_store.get(&reader_hash) {
+                    assert_eq!(
+                        bytes.len(),
+                        reader_payload_len,
+                        "observed a partially written file: {} of {} bytes",
+                        bytes.len(),
+                        reader_payload_len
+                    );
+                    observations += 1;
+                }
+            }
+            observations
+        });
+
+        let final_path = dir.join(&expected_hash);
+        for _ in 0..20 {
+            // `put` dedups once the destination exists, so the temp-file +
+            // rename dance only actually happens if the destination is
+            // removed first -- forcing it to run repeatedly gives the
+            // reader many real chances to race the writer within the
+            // test's short lifetime.
+            std::fs::remove_file(&final_path).ok();
+            store.put(&payload, None).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

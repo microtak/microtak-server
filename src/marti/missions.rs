@@ -432,6 +432,122 @@ mod tests {
         assert_eq!(response.status(), Status::FORBIDDEN);
     }
 
+    /// A device can't add content claiming a `creatorUid` other than its own
+    /// authenticated identity -- the same policy `create_mission` and
+    /// `subscribe` already have tests for, but `add_content` didn't (a real
+    /// gap found by this project's own red-team review of its test suite:
+    /// removing this check from `add_content` alone left every other test
+    /// green).
+    #[tokio::test]
+    async fn rejects_add_content_claim_not_matching_authenticated_identity() {
+        let mut app = app();
+        json_request_as(
+            &mut app,
+            "user-1",
+            "PUT",
+            "/Marti/api/missions/m",
+            serde_json::json!({"creatorUid": "user-1"}),
+        )
+        .await;
+
+        let (status, _) = json_request_as(
+            &mut app,
+            "real-device",
+            "PUT",
+            "/Marti/api/missions/m/contents",
+            serde_json::json!({"hash": "abc123", "filename": "f.kml", "creatorUid": "someone-else"}),
+        )
+        .await;
+        assert_eq!(status, Status::FORBIDDEN);
+
+        // The rejected request must not have added anything.
+        let response = get_as(&mut app, "user-1", "/Marti/api/missions/m").await;
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mission: Mission = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(mission.contents.is_empty());
+    }
+
+    /// A device can't update a mission claiming an `actorUid` other than its
+    /// own authenticated identity -- another real gap found by the same
+    /// red-team review (removing this check from `update_mission` alone
+    /// left every other test green).
+    #[tokio::test]
+    async fn rejects_update_actoruid_not_matching_authenticated_identity() {
+        let mut app = app();
+        json_request_as(
+            &mut app,
+            "user-1",
+            "PUT",
+            "/Marti/api/missions/m",
+            serde_json::json!({"creatorUid": "user-1", "description": "original"}),
+        )
+        .await;
+
+        let (status, _) = json_request_as(
+            &mut app,
+            "real-device",
+            "PATCH",
+            "/Marti/api/missions/m",
+            serde_json::json!({"description": "tampered", "actorUid": "someone-else"}),
+        )
+        .await;
+        assert_eq!(status, Status::FORBIDDEN);
+
+        // The rejected request must not have changed anything.
+        let response = get_as(&mut app, "user-1", "/Marti/api/missions/m").await;
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mission: Mission = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(mission.description.as_deref(), Some("original"));
+    }
+
+    /// A device can't unsubscribe claiming to be a *different* uid than its
+    /// own authenticated identity -- another real gap found by the same
+    /// red-team review (removing this check from `unsubscribe` alone left
+    /// every other test green, including `subscribes_and_unsubscribes_via_
+    /// query_param`, since that test only ever unsubscribes as itself).
+    #[tokio::test]
+    async fn rejects_unsubscribe_as_a_different_uid() {
+        let mut app = app();
+        json_request_as(
+            &mut app,
+            "user-1",
+            "PUT",
+            "/Marti/api/missions/m",
+            serde_json::json!({"creatorUid": "user-1"}),
+        )
+        .await;
+        let subscribe_request = Request::builder()
+            .method("PUT")
+            .uri("/Marti/api/missions/m/subscription?uid=device-1")
+            .extension(PeerIdentity("device-1".to_string()))
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(subscribe_request).await.unwrap();
+
+        // device-2 tries to unsubscribe device-1 by simply naming its uid in
+        // the query param.
+        let unsubscribe_request = Request::builder()
+            .method("DELETE")
+            .uri("/Marti/api/missions/m/subscription?uid=device-1")
+            .extension(PeerIdentity("device-2".to_string()))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(unsubscribe_request).await.unwrap();
+        assert_eq!(response.status(), Status::FORBIDDEN);
+
+        // device-1 must still be subscribed.
+        let response = get_as(&mut app, "user-1", "/Marti/api/missions/m").await;
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mission: Mission = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(mission.subscribers, vec!["device-1"]);
+    }
+
     /// TC-MARTI-05.
     #[tokio::test]
     async fn changes_endpoint_reflects_history() {

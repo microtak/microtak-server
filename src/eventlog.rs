@@ -18,6 +18,11 @@
 //! successful append (see `registry.rs`/`missions.rs`), so nothing becomes
 //! visible to a reader until it's already durable — there's no window
 //! where an operation looks like it succeeded but isn't actually persisted.
+//! **Test-coverage caveat**: this suite verifies the ordering (append,
+//! then apply) and that a clean close/reopen round-trips correctly, but the
+//! `fsync` call's actual survive-a-hard-crash guarantee is trusted OS/
+//! filesystem behavior, not something exercised end-to-end here — doing so
+//! would require actually killing the process mid-write.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -229,8 +234,19 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// **What this does and doesn't prove**: confirms an appended record
+    /// survives a clean close and a fresh open/replay -- it does *not*
+    /// exercise the module doc comment's crash-consistency claim (that an
+    /// `fsync`'d append survives a hard crash/power loss), since that would
+    /// require actually killing the process mid-write, which a unit test
+    /// can't do. Found by this project's own red-team review of its test
+    /// suite: removing `EventLog::append`'s `sync_data()` call entirely
+    /// left this test (and every other one in the suite) passing, because a
+    /// plain `write` is already visible to a normal reopen without an
+    /// `fsync` -- the fsync call is trusted OS/filesystem behavior here,
+    /// not something this suite verifies end-to-end.
     #[test]
-    fn append_is_durable_across_a_fresh_open() {
+    fn append_is_visible_after_a_clean_close_and_reopen() {
         let path = unique_temp_path("durable");
         std::fs::remove_file(&path).ok();
 
@@ -242,6 +258,10 @@ mod tests {
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents.lines().count(), 1);
+
+        let mut state = 0i64;
+        let _log = EventLog::open_and_replay(&path, &mut state, apply).unwrap();
+        assert_eq!(state, 7, "a fresh replay should reconstruct the appended state");
 
         std::fs::remove_file(&path).ok();
     }
