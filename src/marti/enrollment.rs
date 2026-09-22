@@ -20,7 +20,6 @@
 //! deployments should front this with TLS (reverse proxy, or a future
 //! direct TLS listener here) until that gap is closed.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -42,38 +41,12 @@ pub struct EnrollmentState {
     pub cert_validity: Duration,
 }
 
+/// Build the enrollment router. Bind it with [`super::PlainHttpServer`].
 pub fn router(state: Arc<EnrollmentState>) -> Router {
     Router::new()
         .route("/Marti/api/tls/config", get(get_config))
         .route("/Marti/api/tls/signClient/v2", post(sign_client_v2))
         .with_state(state)
-}
-
-/// The enrollment HTTP listener, following the same
-/// bind-then-`local_addr`-then-`run` shape as [`crate::transport::tcp::TcpRelay`]
-/// and [`crate::transport::tls::TlsRelay`] — lets a caller (or a test) learn
-/// the actual bound port before starting to serve, which matters when
-/// binding an ephemeral port (`:0`).
-pub struct EnrollmentServer {
-    listener: tokio::net::TcpListener,
-    state: Arc<EnrollmentState>,
-}
-
-impl EnrollmentServer {
-    pub async fn bind(addr: SocketAddr, state: Arc<EnrollmentState>) -> std::io::Result<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        Ok(Self { listener, state })
-    }
-
-    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.listener.local_addr()
-    }
-
-    /// Serve the enrollment API until the process exits or the listener
-    /// errors.
-    pub async fn run(self) -> std::io::Result<()> {
-        axum::serve(self.listener, router(self.state)).await
-    }
 }
 
 /// TC-ENROLL-01: reachable with no client cert / no auth of any kind,
@@ -222,7 +195,7 @@ mod tests {
     }
 
     async fn spawn_server(state: Arc<EnrollmentState>) -> String {
-        let server = EnrollmentServer::bind("127.0.0.1:0".parse().unwrap(), state)
+        let server = super::super::PlainHttpServer::bind("127.0.0.1:0".parse().unwrap(), router(state))
             .await
             .unwrap();
         let addr = server.local_addr().unwrap();
