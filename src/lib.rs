@@ -9,6 +9,7 @@
 
 pub mod app;
 pub mod config;
+pub mod content_store;
 pub mod cot;
 pub mod eventlog;
 pub mod marti;
@@ -45,12 +46,18 @@ pub mod transport;
 //   to CoT `uid` (TC-TLS-04) and tracks revocation. Re-enrolling a revoked
 //   device does not clear its revocation (no separate `unrevoke` exists).
 // - `missions`: event-log-backed mission (Data Sync) metadata store --
-//   create/update/delete, change log, subscriptions. No DataSync file
-//   *content* storage yet (TC-MARTI-07/08) -- see its own doc comment.
-// - `marti::enrollment` + `marti::missions`: the HTTP `/Marti/api/*`
-//   contract on top of `pki`/`registry`/`missions`. No groups/device
-//   profiles yet. Enrollment is deliberately plain HTTP (unauthenticated by
-//   design); missions is mTLS-authenticated via `marti::MtlsHttpServer`
-//   (TC-MARTI-10) -- request handlers don't yet cross-check a claimed
-//   creatorUid/actorUid against the connecting cert's identity, though; see
+//   create/update/delete, change log, subscriptions. Tracks content
+//   *references* only (hash + filename) -- see `content_store` for the
+//   actual bytes.
+// - `content_store`: hash-addressed DataSync file content storage
+//   (TC-MARTI-07/08) -- atomic upload (temp file + fsync + rename),
+//   caller-claimed hashes always re-verified against the real SHA-256, and
+//   a validated-hex-hash guard against path traversal on lookup.
+// - `marti::enrollment` + `marti::missions` + `marti::client_endpoints` +
+//   `marti::content`: the HTTP `/Marti/api/*` contract on top of
+//   `pki`/`registry`/`missions`/`content_store`. No groups/device profiles
+//   yet. Enrollment is deliberately plain HTTP (unauthenticated by design);
+//   everything else is mTLS-authenticated via `marti::MtlsHttpServer`
+//   (TC-MARTI-10), and `missions` additionally cross-checks a claimed
+//   creatorUid/actorUid/uid against the connecting cert's identity -- see
 //   `marti`'s own doc comment.

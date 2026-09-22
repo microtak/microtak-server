@@ -16,9 +16,11 @@ use rustls::pki_types::PrivateKeyDer;
 use rustls::ServerConfig;
 use time::Duration;
 
+use crate::content_store::ContentStore;
 use crate::marti::enrollment::EnrollmentState;
 use crate::marti::{
-    client_endpoints, enrollment, missions as missions_api, MtlsHttpServer, PlainHttpServer,
+    client_endpoints, content as content_api, enrollment, missions as missions_api,
+    MtlsHttpServer, PlainHttpServer,
 };
 use crate::missions::{MissionError, MissionStore};
 use crate::pki::{self, CertificateAuthority, PkiError};
@@ -104,6 +106,7 @@ pub struct App {
     pub ca_cert_pem: String,
     pub registry: Arc<DeviceRegistry>,
     pub missions: Arc<MissionStore>,
+    pub content_store: Arc<ContentStore>,
     enrollment: PlainHttpServer,
     marti_api: MtlsHttpServer,
     tcp: TcpRelay,
@@ -122,6 +125,7 @@ impl App {
         let missions = Arc::new(MissionStore::load_or_create(
             config.data_dir.join("missions.log"),
         )?);
+        let content_store = Arc::new(ContentStore::open(config.data_dir.join("content"))?);
         let hub = RelayHub::new();
         let clients = ConnectedClients::new();
 
@@ -157,7 +161,8 @@ impl App {
         )
         .await?;
         let marti_router = missions_api::router(Arc::clone(&missions))
-            .merge(client_endpoints::router(clients.clone()));
+            .merge(client_endpoints::router(clients.clone()))
+            .merge(content_api::router(Arc::clone(&content_store)));
         let marti_api =
             MtlsHttpServer::bind(config.marti_api_addr, Arc::clone(&tls_server_config), marti_router)
                 .await?;
@@ -175,6 +180,7 @@ impl App {
             ca_cert_pem,
             registry,
             missions,
+            content_store,
             enrollment,
             marti_api,
             tcp,
@@ -283,6 +289,7 @@ mod tests {
             .missions
             .create("m", None, "user-1", vec![], 1_000)
             .unwrap();
+        let content_hash = first.content_store.put(b"persisted content", None).unwrap();
         drop(first); // never `.run()`, so nothing is actually listening to tear down
 
         let second = App::bind(ephemeral_config(data_dir.clone())).await.unwrap();
@@ -292,6 +299,10 @@ mod tests {
         );
         assert!(second.registry.find("device-a").is_some());
         assert!(second.missions.get("m").is_some());
+        assert_eq!(
+            second.content_store.get(&content_hash).unwrap().as_deref(),
+            Some(&b"persisted content"[..])
+        );
 
         std::fs::remove_dir_all(&data_dir).ok();
     }

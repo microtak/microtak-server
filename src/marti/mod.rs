@@ -8,6 +8,9 @@
 //! - [`client_endpoints`]: `GET /Marti/api/clientEndPoints` (TC-MARTI-09),
 //!   backed by the live [`crate::transport::connections::ConnectedClients`]
 //!   registry rather than a static list.
+//! - [`content`]: DataSync file content upload/download by hash
+//!   (`/Marti/api/sync/*`, TC-MARTI-07/08), on top of
+//!   [`crate::content_store::ContentStore`].
 //!
 //! Not yet implemented: groups, device profiles.
 //!
@@ -33,6 +36,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::warn;
 
 pub mod client_endpoints;
+pub mod content;
 pub mod enrollment;
 pub mod missions;
 

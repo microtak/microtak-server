@@ -314,6 +314,100 @@ async fn e2e_missions_api_full_lifecycle() {
     assert_eq!(get_after_delete.status(), 404);
 }
 
+/// TC-MARTI-07/08, end-to-end: upload real file bytes through the running
+/// server, get back the server's own computed hash, reference that hash in
+/// a mission's content list, then download it back and confirm the bytes
+/// are byte-for-byte identical -- the full DataSync content round trip a
+/// real ATAK client depends on, not just the content store in isolation.
+#[tokio::test]
+async fn e2e_datasync_content_upload_download_round_trip() {
+    let app = App::bind(test_config()).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    tokio::spawn(app.run());
+
+    let enrollment_base_url = format!("http://{enrollment_addr}");
+    let (cert, key) = enroll(&enrollment_base_url, "content-client").await;
+    let client = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
+    let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
+
+    let file_bytes = b"this is a real KML file's worth of bytes";
+    let upload_response = client
+        .post(format!("{base_url}/Marti/api/sync/missionupload"))
+        .body(file_bytes.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload_response.status(), 200);
+    let upload_body: serde_json::Value = upload_response.json().await.unwrap();
+    let hash = upload_body["hash"].as_str().unwrap().to_string();
+    assert_eq!(hash.len(), 64, "expected a SHA-256 hex hash: {hash}");
+
+    // TC-MARTI-07: re-uploading with a deliberately wrong claimed hash is
+    // rejected, proving the server checks the real content, not the claim.
+    let bad_upload = client
+        .post(format!(
+            "{base_url}/Marti/api/sync/missionupload?hash={}",
+            "0".repeat(64)
+        ))
+        .body(file_bytes.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_upload.status(), 400);
+
+    // Reference the real hash from a mission's content list.
+    let create_response = client
+        .put(format!("{base_url}/Marti/api/missions/Content%20Test"))
+        .json(&serde_json::json!({"creatorUid": "content-client"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 201);
+
+    let content_response = client
+        .put(format!(
+            "{base_url}/Marti/api/missions/Content%20Test/contents"
+        ))
+        .json(&serde_json::json!({"hash": hash, "filename": "recon.kml", "creatorUid": "content-client"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(content_response.status(), 200);
+
+    let mission: serde_json::Value = client
+        .get(format!("{base_url}/Marti/api/missions/Content%20Test"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(mission["contents"][0]["hash"], hash);
+
+    // Download the exact bytes back by that same hash.
+    let download_response = client
+        .get(format!("{base_url}/Marti/api/sync/content?hash={hash}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(download_response.status(), 200);
+    let downloaded = download_response.bytes().await.unwrap();
+    assert_eq!(&downloaded[..], &file_bytes[..]);
+
+    // A hash nothing was ever uploaded under is a clean 404.
+    let missing_response = client
+        .get(format!(
+            "{base_url}/Marti/api/sync/content?hash={}",
+            "f".repeat(64)
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_response.status(), 404);
+}
+
 /// TC-MARTI-10's residual gap, closed and verified end-to-end: a real,
 /// validly mTLS-authenticated caller still gets rejected if the
 /// `creatorUid` it claims doesn't match its own cert's CN.
