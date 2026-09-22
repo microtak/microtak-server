@@ -197,6 +197,19 @@ Added once the mission-content and clientEndPoints work left EdgeTAK with real p
 
 **Not yet implemented**: backup retention/pruning (a local mirror only ever grows, matching the append-only source it mirrors — there is currently no policy for reclaiming space on the *offsite* target, which is left entirely to whatever tool/policy the operator's `offsite_command` implies, e.g. `aws s3` lifecycle rules); restore tooling (replaying a backed-up event log back into a fresh `data_dir` is currently a manual file-copy, not a dedicated command).
 
+## 15. Test-suite red-team review
+
+A dedicated adversarial pass over every test suite (§1-14), done twice: once requested and then interrupted by the user before it ran, redone in full 2026-09-22 once the "fully functional TAK server + backups" scope above was closed. Methodology: mutation testing, not read-and-judge — for each test claiming to guard a specific behavior, actually introduce that exact bug in the implementation, confirm the specific test fails, then revert, rather than trusting the assertion looks plausible.
+
+**Confirmed solid** (mutated, still caught): cross-device uid spoofing (`registry.rs`, `transport/tls.rs`, e2e, independently at each layer); connect-time revocation bypass; the content store's hash-trust bypass (the exact taky-style bug TC-MARTI-07 exists to avoid); GeoChat directed-routing bypass (`is_deliverable_to`); the backup runner's incremental-copy claim; `tc_marti_06`'s concurrent-update serialization (the write lock genuinely holds across the full critical section, not decorative).
+
+**Real gaps found and fixed** (see the commit that closed each, same date):
+- `marti/missions.rs`: `add_content`, `update_mission`, and `unsubscribe` had *no* test proving their identity-claim rejection (403) actually works, despite the module's own doc comment claiming every such handler enforces it — removing the check from any of the three individually left the whole suite green. One test added per handler, each verified against its own removed-check mutation.
+- `content_store.rs`: TC-MARTI-08's atomic-write mechanism (temp file + fsync + rename) had no test proving it's atomic — writing straight to the final path instead of through the temp file left every test green. Added a concurrent-reader-races-writer test (fails reliably under that mutation) plus a leftover-temp-file check.
+- `eventlog.rs`: `append_is_durable_across_a_fresh_open` only proved survival of a clean close, not the crash-durability the module doc comment claims `fsync` buys — removing `sync_data()` entirely didn't fail it. Renamed to `append_is_visible_after_a_clean_close_and_reopen` and both doc comments now say plainly that real crash-kill durability isn't (and can't practically be) exercised by this suite.
+
+**Overall verdict**: the suite is a trustworthy regression safety net for the auth/identity/atomicity-critical paths that were checked hardest, not merely decorative — but it was not perfect, and the three gaps above are proof the review methodology (actually breaking things, not just reading assertions) finds real holes that inspection alone would miss. Worth repeating after future auth- or persistence-adjacent feature work, not treated as a one-time audit.
+
 ## Pending research
 
 - MeshCore throughput figures — needed to finalize TC-MESH-03/05's concrete bandwidth budget.
