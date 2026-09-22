@@ -208,6 +208,72 @@ async fn e2e_enroll_then_connect_via_mtls_and_relay_across_transports() {
     assert!(String::from_utf8_lossy(&buf[..n]).contains("FROM-PLAIN-TCP"));
 }
 
+/// Periodic backup, end-to-end against the real assembled server: enroll a
+/// device and upload real DataSync content, let a real (short-interval)
+/// backup pass run, then confirm the backup directory actually contains
+/// that data -- not just that `BackupRunner` works in isolation (its own
+/// module tests already cover that), but that `App::bind` actually wires it
+/// up and runs it against real, live-growing files.
+#[tokio::test]
+async fn e2e_backup_mirrors_live_server_state_to_disk() {
+    use edgetak::app::BackupConfig;
+
+    let backup_dir = unique_temp_dir();
+    let mut config = test_config();
+    let data_dir = config.data_dir.clone();
+    config.backup = BackupConfig {
+        enabled: true,
+        interval: Duration::from_millis(50),
+        backup_dir: backup_dir.clone(),
+        offsite_command: Vec::new(),
+    };
+
+    let app = App::bind(config).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    tokio::spawn(app.run());
+
+    let base_url = format!("http://{enrollment_addr}");
+    let (cert, key) = enroll(&base_url, "backup-client").await;
+    let client = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
+    let upload_url = format!(
+        "https://{SERVER_NAME}:{}/Marti/api/sync/missionupload",
+        marti_api_addr.port()
+    );
+    client
+        .post(&upload_url)
+        .body("backed up bytes")
+        .send()
+        .await
+        .unwrap();
+
+    // Give a couple of the 50ms backup ticks time to run.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let backed_up_devices_log = std::fs::read_to_string(backup_dir.join("devices.log")).unwrap();
+    assert!(
+        backed_up_devices_log.contains("backup-client"),
+        "expected the enrolled device to appear in the backed-up devices.log: {backed_up_devices_log}"
+    );
+    let content_dir = backup_dir.join("content");
+    let backed_up_hashes: Vec<_> = std::fs::read_dir(&content_dir)
+        .unwrap_or_else(|e| panic!("expected {content_dir:?} to exist: {e}"))
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        backed_up_hashes.len(),
+        1,
+        "expected exactly the one uploaded content blob to be backed up"
+    );
+    let backed_up_bytes =
+        std::fs::read(content_dir.join(&backed_up_hashes[0])).unwrap();
+    assert_eq!(backed_up_bytes, b"backed up bytes");
+
+    std::fs::remove_dir_all(&data_dir).ok();
+    std::fs::remove_dir_all(&backup_dir).ok();
+}
+
 /// Missions API full lifecycle against the real, running, mTLS-authenticated
 /// Marti HTTP endpoint (TC-MARTI-10): enroll a device via real HTTP first
 /// (the same chain the core mTLS test exercises), then use its cert to

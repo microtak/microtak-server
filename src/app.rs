@@ -16,6 +16,7 @@ use rustls::pki_types::PrivateKeyDer;
 use rustls::ServerConfig;
 use time::Duration;
 
+use crate::backup::{BackupRunner, OffsiteTarget};
 use crate::content_store::ContentStore;
 use crate::marti::enrollment::EnrollmentState;
 use crate::marti::{
@@ -58,6 +59,41 @@ pub struct AppConfig {
     /// which matters because regenerating the CA invalidates every
     /// previously-issued client certificate.
     pub data_dir: PathBuf,
+    /// Periodic backup of `data_dir` -- disabled by default. See
+    /// `src/backup.rs` for the local-mirror + optional-offsite-command
+    /// design.
+    pub backup: BackupConfig,
+}
+
+/// See `src/backup.rs`'s doc comment for the design this configures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupConfig {
+    pub enabled: bool,
+    /// A plain [`std::time::Duration`], not [`time::Duration`] like
+    /// [`AppConfig::cert_validity`] -- this is what
+    /// [`crate::backup::BackupRunner::run_periodic`] actually takes, and
+    /// keeping it in that unit end-to-end avoids a lossy
+    /// seconds-truncating conversion at the one call site that used to
+    /// silently floor any sub-second interval up to a full second.
+    pub interval: std::time::Duration,
+    /// Where the local mirror is written. Relative paths are resolved
+    /// against the current working directory, same as `data_dir`.
+    pub backup_dir: PathBuf,
+    /// An external command shipping `backup_dir` elsewhere, e.g.
+    /// `["rsync", "-a", "{src}/", "user@host:/backups/edgetak/"]`. Empty
+    /// means offsite shipping is disabled -- local-only backup.
+    pub offsite_command: Vec<String>,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: std::time::Duration::from_secs(3600),
+            backup_dir: PathBuf::from("./backup"),
+            offsite_command: Vec::new(),
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -70,6 +106,7 @@ impl Default for AppConfig {
             ca_common_name: "EdgeTAK CA".to_string(),
             server_common_name: "edgetak-server".to_string(),
             cert_validity: Duration::days(365),
+            backup: BackupConfig::default(),
             data_dir: PathBuf::from("./data"),
         }
     }
@@ -175,6 +212,12 @@ impl App {
             clients,
         )
         .await?;
+
+        if config.backup.enabled {
+            let offsite = OffsiteTarget::new(config.backup.offsite_command.clone());
+            let runner = BackupRunner::new(config.data_dir.clone(), config.backup.backup_dir.clone(), offsite);
+            tokio::spawn(runner.run_periodic(config.backup.interval));
+        }
 
         Ok(Self {
             ca_cert_pem,

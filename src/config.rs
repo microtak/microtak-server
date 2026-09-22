@@ -16,7 +16,7 @@ use serde::Deserialize;
 use time::Duration;
 use thiserror::Error;
 
-use crate::app::AppConfig;
+use crate::app::{AppConfig, BackupConfig};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -30,6 +30,15 @@ pub struct Config {
     pub server_common_name: String,
     pub cert_validity_days: i64,
     pub data_dir: PathBuf,
+    /// Whether periodic backup of `data_dir` runs at all -- disabled by
+    /// default. See `src/backup.rs`.
+    pub backup_enabled: bool,
+    pub backup_interval_seconds: u64,
+    pub backup_dir: PathBuf,
+    /// An external command shipping the local backup elsewhere, e.g.
+    /// `["rsync", "-a", "{src}/", "user@host:/backups/edgetak/"]`. Empty
+    /// means local-only backup, no offsite shipping.
+    pub backup_offsite_command: Vec<String>,
 }
 
 impl Default for Config {
@@ -45,6 +54,10 @@ impl Default for Config {
             server_common_name: defaults.server_common_name,
             cert_validity_days: defaults.cert_validity.whole_days(),
             data_dir: defaults.data_dir,
+            backup_enabled: defaults.backup.enabled,
+            backup_interval_seconds: defaults.backup.interval.as_secs().max(1),
+            backup_dir: defaults.backup.backup_dir,
+            backup_offsite_command: defaults.backup.offsite_command,
         }
     }
 }
@@ -117,6 +130,12 @@ impl Config {
             server_common_name: self.server_common_name.clone(),
             cert_validity: Duration::days(self.cert_validity_days),
             data_dir: self.data_dir.clone(),
+            backup: BackupConfig {
+                enabled: self.backup_enabled,
+                interval: std::time::Duration::from_secs(self.backup_interval_seconds.max(1)),
+                backup_dir: self.backup_dir.clone(),
+                offsite_command: self.backup_offsite_command.clone(),
+            },
         })
     }
 }
@@ -221,5 +240,41 @@ mod tests {
         let app_config = config.to_app_config().unwrap();
         assert_eq!(app_config.enrollment_addr.port(), 8446);
         assert_eq!(app_config.cert_validity, Duration::days(365));
+        assert!(!app_config.backup.enabled, "backup is off by default");
+    }
+
+    #[test]
+    fn backup_settings_round_trip_from_toml() {
+        let dir = std::env::temp_dir().join(format!(
+            "edgetak-config-test-backup-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("edgetak.toml");
+        std::fs::write(
+            &path,
+            r#"
+            backup_enabled = true
+            backup_interval_seconds = 900
+            backup_dir = "/var/backups/edgetak"
+            backup_offsite_command = ["rsync", "-a", "{src}/", "user@host:/backups/"]
+            "#,
+        )
+        .unwrap();
+
+        let config = Config::load_or_default(&path).unwrap();
+        let app_config = config.to_app_config().unwrap();
+        assert!(app_config.backup.enabled);
+        assert_eq!(app_config.backup.interval, std::time::Duration::from_secs(900));
+        assert_eq!(
+            app_config.backup.backup_dir,
+            PathBuf::from("/var/backups/edgetak")
+        );
+        assert_eq!(
+            app_config.backup.offsite_command,
+            vec!["rsync", "-a", "{src}/", "user@host:/backups/"]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

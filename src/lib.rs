@@ -8,6 +8,7 @@
 //! EdgeTAK's own design decisions where no authoritative spec exists.
 
 pub mod app;
+pub mod backup;
 pub mod config;
 pub mod content_store;
 pub mod cot;
@@ -53,6 +54,11 @@ pub mod transport;
 //   (TC-MARTI-07/08) -- atomic upload (temp file + fsync + rename),
 //   caller-claimed hashes always re-verified against the real SHA-256, and
 //   a validated-hex-hash guard against path traversal on lookup.
+// - `backup`: periodic local mirror of `AppConfig::data_dir` plus an
+//   optional offsite shipping command (rsync/scp/aws s3 sync/...), built on
+//   the append-only event-log design so a pass only copies newly-appended
+//   bytes, not the whole directory every time. Off by default
+//   (`AppConfig::backup`).
 // - `marti::enrollment` + `marti::missions` + `marti::client_endpoints` +
 //   `marti::content`: the HTTP `/Marti/api/*` contract on top of
 //   `pki`/`registry`/`missions`/`content_store`. No groups/device profiles
