@@ -80,12 +80,15 @@ async fn handle_client(
                         for item in items {
                             match item {
                                 DecodedItem::Event(event) => {
+                                    let dest_uids = event
+                                        .addressed_uids()
+                                        .map(|uids| uids.into_iter().map(String::from).collect::<Vec<_>>().into());
                                     match event.to_xml() {
                                         Ok(xml) => {
                                             // A closed broadcast channel (no
                                             // subscribers at all) is not an
                                             // error for the sender.
-                                            let _ = tx.send(Outbound { sender: peer, xml: xml.into() });
+                                            let _ = tx.send(Outbound { sender: peer, xml: xml.into(), dest_uids });
                                         }
                                         Err(error) => {
                                             warn!(%peer, %error, "failed to re-serialize decoded event, dropping");
@@ -110,6 +113,14 @@ async fn handle_client(
                         // Echo suppression: don't relay a client's own event back to it.
                     }
                     Ok(msg) => {
+                        // Plain-TCP connections have no registry-bound
+                        // identity (see transport::tls for the mTLS side,
+                        // which does) -- a directed GeoChat message is
+                        // never deliverable here, only broadcasts. A
+                        // documented scope cut, not a silent one.
+                        if !msg.is_deliverable_to(None) {
+                            continue;
+                        }
                         if let Err(error) = writer.write_all(msg.xml.as_bytes()).await {
                             warn!(%peer, %error, "write error, disconnecting client");
                             return;

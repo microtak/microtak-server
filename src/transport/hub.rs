@@ -29,6 +29,31 @@ pub struct Outbound {
     /// can skip re-delivering an event back to its own sender.
     pub sender: SocketAddr,
     pub xml: Arc<str>,
+    /// `None` — broadcast to every other connection (the default, e.g. an
+    /// ordinary PLI/position report). `Some(uids)` — GeoChat individual
+    /// (`<marti><dest uid=.../></marti>`) or team (`chatgrp`) addressing
+    /// (see `cot::Event::addressed_uids`): deliver only to a connection
+    /// whose own identity is in this list, per
+    /// `docs/TEST-PLAN.md` §7 (TC-CHAT-01/02).
+    ///
+    /// **Scope note**: only mTLS connections have a registry-bound identity
+    /// to match against (see `transport::tls`) — plain-TCP connections have
+    /// no reliable identity, so they never receive a directed message,
+    /// only broadcasts. Documented, not silent: see `transport::tcp`'s
+    /// delivery loop.
+    pub dest_uids: Option<Arc<[String]>>,
+}
+
+impl Outbound {
+    /// Whether a connection whose own identity is `my_uid` should receive
+    /// this message: always true for a broadcast, otherwise only if
+    /// `my_uid` is one of the addressed recipients.
+    pub fn is_deliverable_to(&self, my_uid: Option<&str>) -> bool {
+        match &self.dest_uids {
+            None => true,
+            Some(uids) => my_uid.is_some_and(|uid| uids.iter().any(|u| u == uid)),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -58,5 +83,40 @@ impl RelayHub {
 impl Default for RelayHub {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outbound(dest_uids: Option<Vec<&str>>) -> Outbound {
+        Outbound {
+            sender: "127.0.0.1:1".parse().unwrap(),
+            xml: "<event/>".into(),
+            dest_uids: dest_uids
+                .map(|uids| uids.into_iter().map(String::from).collect::<Vec<_>>().into()),
+        }
+    }
+
+    #[test]
+    fn broadcast_is_deliverable_to_anyone() {
+        let msg = outbound(None);
+        assert!(msg.is_deliverable_to(Some("UID-A")));
+        assert!(msg.is_deliverable_to(None)); // even a connection with no known identity
+    }
+
+    #[test]
+    fn directed_message_only_deliverable_to_addressed_uid() {
+        let msg = outbound(Some(vec!["UID-A", "UID-B"]));
+        assert!(msg.is_deliverable_to(Some("UID-A")));
+        assert!(msg.is_deliverable_to(Some("UID-B")));
+        assert!(!msg.is_deliverable_to(Some("UID-C")));
+    }
+
+    #[test]
+    fn directed_message_never_deliverable_to_unknown_identity() {
+        let msg = outbound(Some(vec!["UID-A"]));
+        assert!(!msg.is_deliverable_to(None));
     }
 }

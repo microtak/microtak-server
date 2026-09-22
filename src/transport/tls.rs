@@ -189,9 +189,12 @@ async fn handle_client(
                                         let _ = writer.shutdown().await;
                                         return;
                                     }
+                                    let dest_uids = event
+                                        .addressed_uids()
+                                        .map(|uids| uids.into_iter().map(String::from).collect::<Vec<_>>().into());
                                     match event.to_xml() {
                                         Ok(xml) => {
-                                            let _ = tx.send(Outbound { sender: peer, xml: xml.into() });
+                                            let _ = tx.send(Outbound { sender: peer, xml: xml.into(), dest_uids });
                                         }
                                         Err(error) => {
                                             warn!(%peer, cn, %error, "failed to re-serialize decoded event, dropping");
@@ -215,6 +218,14 @@ async fn handle_client(
                 match broadcast_result {
                     Ok(msg) if msg.sender == peer => {}
                     Ok(msg) => {
+                        // TC-CHAT-01/02: a directed (GeoChat individual or
+                        // team) message only goes to a connection whose own
+                        // registry-bound uid is addressed; an undirected
+                        // (broadcast) message goes to everyone, as before.
+                        let my_uid = registry.find(&cn).and_then(|d| d.uid);
+                        if !msg.is_deliverable_to(my_uid.as_deref()) {
+                            continue;
+                        }
                         if let Err(error) = writer.write_all(msg.xml.as_bytes()).await {
                             warn!(%peer, %error, "write error, disconnecting client");
                             return;
@@ -553,5 +564,141 @@ mod tests {
             Some("SHARED-UID")
         );
         assert_eq!(fixture.registry.find("device-spoofer").unwrap().uid, None);
+    }
+
+    fn individual_chat_xml(sender_uid: &str, dest_uid: &str, message: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><event version="2.0" uid="{sender_uid}" type="t-x-c-t" how="h-g-i-g-o" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><marti><dest uid="{dest_uid}"/></marti><__chat id="c1" chatroom="{dest_uid}"/><remarks>{message}</remarks></detail></event>"#
+        )
+    }
+
+    fn team_chat_xml(sender_uid: &str, member_uids: &[&str], message: &str) -> String {
+        let chatgrp_attrs: String = member_uids
+            .iter()
+            .enumerate()
+            .map(|(i, uid)| format!(r#" uid{i}="{uid}""#))
+            .collect();
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><event version="2.0" uid="{sender_uid}" type="t-x-c-t" how="h-g-i-g-o" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><__chat id="c1" chatroom="Team"><chatgrp id="c1"{chatgrp_attrs}/></__chat><remarks>{message}</remarks></detail></event>"#
+        )
+    }
+
+    /// Drains everything currently available on `stream`, waiting up to
+    /// 200ms per read for more before concluding there's nothing left --
+    /// used to clear expected broadcast traffic (e.g. from a uid-binding
+    /// phase) before asserting on a specific *subsequent* message, without
+    /// needing to know the exact byte count to expect.
+    async fn drain_all_available(stream: &mut tokio_rustls::client::TlsStream<TcpStream>) {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match timeout(StdDuration::from_millis(200), stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => continue,
+                _ => break,
+            }
+        }
+    }
+
+    /// TC-CHAT-01: an individually-addressed GeoChat event
+    /// (`<marti><dest uid=.../></marti>`) reaches only the addressed
+    /// recipient, not a third, uninvolved connected client.
+    #[tokio::test]
+    async fn tc_chat_01_individual_geochat_delivered_only_to_addressed_recipient() {
+        let fixture = build_fixture();
+        let relay = TlsRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.server_config.clone(),
+            RelayHub::new(),
+            fixture.registry.clone(),
+        )
+        .await
+        .unwrap();
+        let addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+
+        let mut tls_a = connect_client(addr, &fixture, "device-a").await;
+        let mut tls_b = connect_client(addr, &fixture, "device-b").await;
+        let mut tls_c = connect_client(addr, &fixture, "device-c").await;
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+
+        // Each device binds its own uid via an ordinary self-report first,
+        // the same way a real device establishes identity before chatting.
+        tls_a.write_all(event_xml("UID-A").as_bytes()).await.unwrap();
+        tls_b.write_all(event_xml("UID-B").as_bytes()).await.unwrap();
+        tls_c.write_all(event_xml("UID-C").as_bytes()).await.unwrap();
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        drain_all_available(&mut tls_a).await;
+        drain_all_available(&mut tls_b).await;
+        drain_all_available(&mut tls_c).await;
+
+        let chat = individual_chat_xml("UID-A", "UID-B", "hello B only");
+        tls_a.write_all(chat.as_bytes()).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = timeout(StdDuration::from_secs(2), tls_b.read(&mut buf))
+            .await
+            .expect("device-b should receive the individually addressed chat")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("hello B only"));
+
+        let not_received = timeout(StdDuration::from_millis(300), tls_c.read(&mut buf)).await;
+        assert!(
+            not_received.is_err(),
+            "device-c must not receive a chat addressed only to device-b"
+        );
+    }
+
+    /// TC-CHAT-02: a team-addressed GeoChat event (`chatgrp`'s `uidN`
+    /// attributes) reaches every addressed member and no one else --
+    /// tested with 4 clients (per this project's own testing philosophy:
+    /// fan-out bugs can be *partial*, so 2 members + 1 non-member + the
+    /// sender is the minimum that actually distinguishes "delivered to
+    /// everyone" from "delivered to the right subset").
+    #[tokio::test]
+    async fn tc_chat_02_team_geochat_delivered_to_members_not_outsiders() {
+        let fixture = build_fixture();
+        let relay = TlsRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.server_config.clone(),
+            RelayHub::new(),
+            fixture.registry.clone(),
+        )
+        .await
+        .unwrap();
+        let addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+
+        let mut tls_a = connect_client(addr, &fixture, "device-a").await; // sender
+        let mut tls_b = connect_client(addr, &fixture, "device-b").await; // team member
+        let mut tls_c = connect_client(addr, &fixture, "device-c").await; // team member
+        let mut tls_d = connect_client(addr, &fixture, "device-d").await; // outsider
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+
+        tls_a.write_all(event_xml("UID-A").as_bytes()).await.unwrap();
+        tls_b.write_all(event_xml("UID-B").as_bytes()).await.unwrap();
+        tls_c.write_all(event_xml("UID-C").as_bytes()).await.unwrap();
+        tls_d.write_all(event_xml("UID-D").as_bytes()).await.unwrap();
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        drain_all_available(&mut tls_a).await;
+        drain_all_available(&mut tls_b).await;
+        drain_all_available(&mut tls_c).await;
+        drain_all_available(&mut tls_d).await;
+
+        let chat = team_chat_xml("UID-A", &["UID-B", "UID-C"], "team message");
+        tls_a.write_all(chat.as_bytes()).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        for (name, stream) in [("device-b", &mut tls_b), ("device-c", &mut tls_c)] {
+            let n = timeout(StdDuration::from_secs(2), stream.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{name} should receive the team chat"))
+                .unwrap();
+            assert!(String::from_utf8_lossy(&buf[..n]).contains("team message"));
+        }
+
+        let not_received = timeout(StdDuration::from_millis(300), tls_d.read(&mut buf)).await;
+        assert!(
+            not_received.is_err(),
+            "device-d (not a team member) must not receive the team chat"
+        );
     }
 }
