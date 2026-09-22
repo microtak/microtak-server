@@ -184,8 +184,18 @@ Every test above (§1-12) exercises one module in isolation, each building its o
 - A revoked device's new connection is rejected (revocation applied via `App::registry`, the same escape hatch an eventual admin API would use internally — no HTTP revocation endpoint exists yet).
 - A plain-TCP client sending garbage is disconnected inside the fully assembled server, not just the isolated `TcpRelay`.
 - A client cert signed by a foreign CA is rejected by this server's mTLS listener.
+- The missions API full lifecycle (create/duplicate-reject/subscribe/add-content/patch/changes-log/delete), DataSync content upload→reference→download round trip (including a rejected mismatched-hash upload and a 404 on an unknown hash), `clientEndPoints` reflecting real plain-TCP and mTLS connections (and going empty again after they disconnect), and per-request identity-claim enforcement — all against the real, running, mTLS-authenticated Marti API.
+- A real backup pass against the fully-assembled server: enroll a device and upload real content, let a short-interval `BackupRunner` run, and confirm the backup directory actually contains the live server's state.
 
-**Not yet covered**: TAK Protocol binary framing, GeoChat/team routing (no detail-element modeling yet, see TC-COT-10), mesh sync (not implemented), and anything requiring a config file (none exists yet).
+**Not yet covered**: TAK Protocol binary framing and mesh sync (not implemented).
+
+## 14. Backup (new module, not part of the original catalog)
+
+Added once the mission-content and clientEndPoints work left EdgeTAK with real persistent state worth protecting — not part of the original research-derived catalog (no external reference implementation to compare against; this monorepo's own `opentakserver/backup.sh` is the closest precedent, for the same "shell out to a real tool" approach), so tracked with plain descriptions rather than TC-IDs.
+
+**Implemented** (`src/backup.rs`), each with a passing unit or end-to-end test: a fresh backup pass copies every file in `data_dir` (including nested directories) into the configured backup directory; a second pass with no source growth copies nothing; a pass after an append-only log grows copies only the newly-appended tail, not the whole file again — the concrete payoff of the event-log persistence redesign; a backup destination somehow larger than its source (stale/corrupt) is discarded and fully re-copied rather than left mismatched; in-progress `content_store` upload temp files (`.tmp-*`) are skipped; a configured offsite command (e.g. `rsync`/`scp`/`aws s3 sync`) runs against the *backup* directory with `{src}` substituted, and a non-zero exit status surfaces as a real, reported error rather than being silently swallowed; `BackupRunner::run_periodic` performs real, repeated backup passes on its own schedule (verified with a short interval and real file-growth in between two checks), not just once at construction. Wired into `App::bind` behind `AppConfig::backup` (off by default) and into the TOML config surface (`backup_enabled`/`backup_interval_seconds`/`backup_dir`/`backup_offsite_command`); verified end-to-end against the real assembled server in `tests/e2e.rs`.
+
+**Not yet implemented**: backup retention/pruning (a local mirror only ever grows, matching the append-only source it mirrors — there is currently no policy for reclaiming space on the *offsite* target, which is left entirely to whatever tool/policy the operator's `offsite_command` implies, e.g. `aws s3` lifecycle rules); restore tooling (replaying a backed-up event log back into a fresh `data_dir` is currently a manual file-copy, not a dedicated command).
 
 ## Pending research
 

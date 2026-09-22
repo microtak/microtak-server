@@ -10,12 +10,16 @@ reappears.
 
 **Status: early but functional.** `edgetakd` runs a real server today: CoT
 parsing, a plain-TCP and an mTLS CoT relay sharing one cross-transport
-broadcast bus, a certificate authority with CSR signing, a device registry
-with identity binding and revocation, a certificate enrollment HTTP
-endpoint, an mTLS-authenticated mission (Data Sync) metadata API — CRUD,
-change log, subscriptions — an optional TOML config file, and persistence
-(CA, device registry, and mission store all survive a restart). No DataSync
-file content storage and no mesh-sync layer yet — see
+broadcast bus and one live connected-client registry, a certificate
+authority with CSR signing, a device registry with identity binding and
+revocation, a certificate enrollment HTTP endpoint, an mTLS-authenticated
+mission (Data Sync) metadata API — CRUD, change log, subscriptions,
+per-request identity-claim enforcement — hash-addressed DataSync file
+content storage with server-verified hashes and atomic writes, a
+`GET /Marti/api/clientEndPoints` endpoint backed by live connections, an
+optional TOML config file, persistence (CA, device registry, mission store,
+and uploaded content all survive a restart), and periodic local + optional
+offsite backup (off by default). No mesh-sync layer yet — see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for exactly what's built vs.
 still design-stage.
 
@@ -49,8 +53,13 @@ cargo run --bin edgetakd # starts a real server on the default ports
 
 Config is optional: `$EDGETAK_CONFIG`, or `./edgetak.toml` if unset (see
 [docs/TEST-PLAN.md](docs/TEST-PLAN.md) §10). A missing file falls back to
-defaults. CA, device registry, and mission store persist under `data_dir`
-(default `./data`) and reload on the next start.
+defaults. CA, device registry, mission store, and uploaded DataSync content
+persist under `data_dir` (default `./data`) and reload on the next start.
+Periodic backup is off by default; enable it with `backup_enabled = true`
+plus `backup_interval_seconds`, `backup_dir`, and an optional
+`backup_offsite_command` (e.g.
+`["rsync", "-a", "{src}/", "user@host:/backups/edgetak/"]`) — see
+[docs/TEST-PLAN.md](docs/TEST-PLAN.md) §14.
 
 ## Project layout
 
@@ -69,6 +78,7 @@ src/
   marti/client_endpoints.rs — GET /Marti/api/clientEndPoints, backed by live connections
   marti/content.rs        — DataSync file content upload/download by hash
   content_store.rs        — hash-addressed content-addressed file storage
+  backup.rs               — periodic local + optional offsite backup of data_dir
   transport/codec.rs     — incremental CoT XML stream decoder
   transport/hub.rs       — shared cross-transport broadcast bus
   transport/connections.rs — shared live connected-client registry
