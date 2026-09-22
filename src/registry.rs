@@ -1,12 +1,14 @@
 //! Device (EUD) registry: tracks enrolled devices by certificate Common
 //! Name, and binds each to the CoT `uid` it's authorized to assert.
 //!
-//! Simple JSON-file-backed store (load on startup, rewrite atomically on
-//! every mutation) rather than an embedded database — appropriate at the
-//! scale this project targets (a home/ham deployment, not thousands of
-//! concurrent devices), and keeps the dependency footprint and deployment
-//! model minimal (a single file, trivially covered by the planned backup
-//! strategy — see `docs/ARCHITECTURE.md`).
+//! Persisted as an append-only, replayable event log (see
+//! [`crate::eventlog`]) rather than a snapshot rewritten on every
+//! mutation — appropriate at the scale this project targets (a home/ham
+//! deployment, not thousands of concurrent devices), and it's what makes
+//! this store's file cheap to back up incrementally (only newly-appended
+//! events need shipping) and gives a full audit trail as a side effect of
+//! the durability mechanism, not a bolted-on feature — see
+//! `docs/ARCHITECTURE.md`'s backup section.
 //!
 //! Implements the enrollment side of `docs/TEST-PLAN.md` §4 (recording a
 //! signed device alongside its cert) and the identity-binding side of §3
@@ -14,11 +16,13 @@
 //! different, already-enrolled device).
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::eventlog::{EventLog, EventLogError};
 
 #[derive(Debug, Error)]
 pub enum RegistryError {
@@ -34,20 +38,8 @@ pub enum RegistryError {
         existing: String,
         claimed: String,
     },
-    #[error("failed to read device registry file {path}: {source}")]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to write device registry file {path}: {source}")]
-    Write {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to (de)serialize device registry: {0}")]
-    Serde(#[from] serde_json::Error),
+    #[error("event log error: {0}")]
+    EventLog(#[from] EventLogError),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,9 +54,29 @@ pub struct DeviceRecord {
     pub uid: Option<String>,
 }
 
+/// A durable, replayable record of one registry mutation. This is the
+/// actual source of truth on disk — [`DeviceRecord`]/the in-memory
+/// `HashMap` are a materialized view rebuilt by replaying these.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum RegistryEvent {
+    Enrolled {
+        common_name: String,
+        cert_pem: String,
+        at_unix: i64,
+    },
+    Revoked {
+        common_name: String,
+    },
+    UidBound {
+        common_name: String,
+        uid: String,
+    },
+}
+
 pub struct DeviceRegistry {
-    path: Option<PathBuf>,
     devices: RwLock<HashMap<String, DeviceRecord>>,
+    log: Option<EventLog<RegistryEvent>>,
 }
 
 impl DeviceRegistry {
@@ -72,26 +84,20 @@ impl DeviceRegistry {
     /// stateless run.
     pub fn in_memory() -> Self {
         Self {
-            path: None,
             devices: RwLock::new(HashMap::new()),
+            log: None,
         }
     }
 
-    /// Load an existing registry from `path`, or start empty if the file
-    /// doesn't exist yet. Every subsequent mutation persists back to this
-    /// same path.
+    /// Load an existing registry from `path` by replaying its event log,
+    /// or start empty if the file doesn't exist yet. Every subsequent
+    /// mutation appends to this same log.
     pub fn load_or_create(path: impl Into<PathBuf>) -> Result<Self, RegistryError> {
-        let path = path.into();
-        let devices = match std::fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(source) => {
-                return Err(RegistryError::Read { path, source });
-            }
-        };
+        let mut devices = HashMap::new();
+        let log = EventLog::open_and_replay(path, &mut devices, apply_event)?;
         Ok(Self {
-            path: Some(path),
             devices: RwLock::new(devices),
+            log: Some(log),
         })
     }
 
@@ -109,20 +115,16 @@ impl DeviceRegistry {
         now_unix: i64,
     ) -> Result<DeviceRecord, RegistryError> {
         let mut devices = self.devices.write().unwrap();
-        let existing = devices.get(common_name);
-        let existing_uid = existing.and_then(|d| d.uid.clone());
-        let was_revoked = existing.map(|d| d.revoked).unwrap_or(false);
-        let record = DeviceRecord {
+        let event = RegistryEvent::Enrolled {
             common_name: common_name.to_string(),
             cert_pem: cert_pem.to_string(),
-            enrolled_at_unix: now_unix,
-            revoked: was_revoked,
-            uid: existing_uid,
+            at_unix: now_unix,
         };
-        devices.insert(common_name.to_string(), record.clone());
-        drop(devices);
-        self.persist()?;
-        Ok(record)
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply_event(&mut devices, &event);
+        Ok(devices.get(common_name).unwrap().clone())
     }
 
     pub fn find(&self, common_name: &str) -> Option<DeviceRecord> {
@@ -139,14 +141,18 @@ impl DeviceRegistry {
     }
 
     pub fn revoke(&self, common_name: &str) -> Result<(), RegistryError> {
-        {
-            let mut devices = self.devices.write().unwrap();
-            let device = devices
-                .get_mut(common_name)
-                .ok_or_else(|| RegistryError::NotFound(common_name.to_string()))?;
-            device.revoked = true;
+        let mut devices = self.devices.write().unwrap();
+        if !devices.contains_key(common_name) {
+            return Err(RegistryError::NotFound(common_name.to_string()));
         }
-        self.persist()
+        let event = RegistryEvent::Revoked {
+            common_name: common_name.to_string(),
+        };
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply_event(&mut devices, &event);
+        Ok(())
     }
 
     /// Bind `uid` to `common_name`, enforcing TC-TLS-04: a `uid` already
@@ -154,38 +160,34 @@ impl DeviceRegistry {
     /// (cross-device spoofing defense). The same device re-asserting the
     /// same `uid` it already owns is a no-op success (the expected steady
     /// state, since a connected device re-sends its self-ID atom
-    /// periodically). A device that has already bound a different `uid`
-    /// attempting to bind yet another one is also rejected — EdgeTAK treats
-    /// a device's `uid` as fixed once bound, a deliberate simplification
-    /// (see `docs/ARCHITECTURE.md`) vs. real-world devices that might
-    /// legitimately change identity (e.g. app reinstall); revoking and
-    /// re-enrolling is the escape hatch for that case.
+    /// periodically) and does **not** append a new event — the log only
+    /// ever records genuine state transitions. A device that has already
+    /// bound a different `uid` attempting to bind yet another one is also
+    /// rejected — EdgeTAK treats a device's `uid` as fixed once bound, a
+    /// deliberate simplification (see `docs/ARCHITECTURE.md`) vs.
+    /// real-world devices that might legitimately change identity (e.g.
+    /// app reinstall); revoking and re-enrolling is the escape hatch for
+    /// that case.
     pub fn bind_uid(&self, common_name: &str, uid: &str) -> Result<(), RegistryError> {
+        let mut devices = self.devices.write().unwrap();
+
+        if let Some(owner) = devices
+            .values()
+            .find(|d| d.uid.as_deref() == Some(uid) && d.common_name != common_name)
         {
-            let devices = self.devices.read().unwrap();
-            if let Some(owner) = devices
-                .values()
-                .find(|d| d.uid.as_deref() == Some(uid) && d.common_name != common_name)
-            {
-                return Err(RegistryError::UidOwnedByOtherDevice {
-                    uid: uid.to_string(),
-                    owner: owner.common_name.clone(),
-                });
-            }
+            return Err(RegistryError::UidOwnedByOtherDevice {
+                uid: uid.to_string(),
+                owner: owner.common_name.clone(),
+            });
         }
 
-        let mut devices = self.devices.write().unwrap();
         let device = devices
-            .get_mut(common_name)
+            .get(common_name)
             .ok_or_else(|| RegistryError::NotFound(common_name.to_string()))?;
 
         match &device.uid {
-            None => {
-                device.uid = Some(uid.to_string());
-            }
-            Some(existing) if existing == uid => {
-                return Ok(()); // idempotent re-assertion, no persist needed
-            }
+            None => {}
+            Some(existing) if existing == uid => return Ok(()), // idempotent, no event
             Some(existing) => {
                 return Err(RegistryError::DeviceUidMismatch {
                     common_name: common_name.to_string(),
@@ -194,29 +196,54 @@ impl DeviceRegistry {
                 });
             }
         }
-        drop(devices);
-        self.persist()
-    }
 
-    fn persist(&self) -> Result<(), RegistryError> {
-        let Some(path) = &self.path else {
-            return Ok(()); // in-memory mode: nothing to write
+        let event = RegistryEvent::UidBound {
+            common_name: common_name.to_string(),
+            uid: uid.to_string(),
         };
-        let devices = self.devices.read().unwrap();
-        let json = serde_json::to_string_pretty(&*devices)?;
-        write_atomically(path, &json).map_err(|source| RegistryError::Write {
-            path: path.clone(),
-            source,
-        })
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply_event(&mut devices, &event);
+        Ok(())
     }
 }
 
-/// Write `contents` to `path` via a temp-file-then-rename, so a crash
-/// mid-write can never leave a truncated/corrupt registry file on disk.
-fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, contents)?;
-    std::fs::rename(&tmp_path, path)
+/// The reducer: apply one durable event to in-memory state. Used both for
+/// live mutations and for replaying the log on startup — one
+/// implementation of "what does this event mean," not two.
+fn apply_event(devices: &mut HashMap<String, DeviceRecord>, event: &RegistryEvent) {
+    match event {
+        RegistryEvent::Enrolled {
+            common_name,
+            cert_pem,
+            at_unix,
+        } => {
+            let existing = devices.get(common_name);
+            let existing_uid = existing.and_then(|d| d.uid.clone());
+            let was_revoked = existing.map(|d| d.revoked).unwrap_or(false);
+            devices.insert(
+                common_name.clone(),
+                DeviceRecord {
+                    common_name: common_name.clone(),
+                    cert_pem: cert_pem.clone(),
+                    enrolled_at_unix: *at_unix,
+                    revoked: was_revoked,
+                    uid: existing_uid,
+                },
+            );
+        }
+        RegistryEvent::Revoked { common_name } => {
+            if let Some(device) = devices.get_mut(common_name) {
+                device.revoked = true;
+            }
+        }
+        RegistryEvent::UidBound { common_name, uid } => {
+            if let Some(device) = devices.get_mut(common_name) {
+                device.uid = Some(uid.clone());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -326,7 +353,7 @@ mod tests {
     fn persists_across_reload() {
         let dir = std::env::temp_dir().join(format!("edgetak-registry-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("devices.json");
+        let path = dir.join("devices.log");
 
         {
             let registry = DeviceRegistry::load_or_create(&path).unwrap();
@@ -345,8 +372,39 @@ mod tests {
     #[test]
     fn loading_nonexistent_path_starts_empty() {
         let dir = std::env::temp_dir().join(format!("edgetak-registry-empty-{}", std::process::id()));
-        let path = dir.join("does-not-exist.json");
+        let path = dir.join("does-not-exist.log");
         let registry = DeviceRegistry::load_or_create(&path).unwrap();
         assert!(registry.find("anything").is_none());
+    }
+
+    /// The whole point: replaying the log reproduces identical state,
+    /// including a mutation (idempotent re-bind) that deliberately does
+    /// *not* append a new event, and a revoke that happens after the
+    /// device was re-enrolled -- exercises replay ordering, not just a
+    /// single write-then-read.
+    #[test]
+    fn replay_reconstructs_a_realistic_mutation_sequence_exactly() {
+        let dir = std::env::temp_dir().join(format!("edgetak-registry-replay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("devices.log");
+
+        {
+            let registry = DeviceRegistry::load_or_create(&path).unwrap();
+            registry.enroll("device-a", "cert-v1", 1_000).unwrap();
+            registry.enroll("device-b", "cert-b", 1_100).unwrap();
+            registry.bind_uid("device-a", "UID-A").unwrap();
+            registry.bind_uid("device-a", "UID-A").unwrap(); // idempotent, no event
+            registry.enroll("device-a", "cert-v2", 2_000).unwrap(); // rotation
+            registry.revoke("device-b").unwrap();
+        }
+
+        let replayed = DeviceRegistry::load_or_create(&path).unwrap();
+        let a = replayed.find("device-a").unwrap();
+        assert_eq!(a.cert_pem, "cert-v2");
+        assert_eq!(a.uid.as_deref(), Some("UID-A"));
+        assert!(!a.revoked);
+        assert!(replayed.is_revoked("device-b"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

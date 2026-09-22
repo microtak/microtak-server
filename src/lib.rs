@@ -10,6 +10,7 @@
 pub mod app;
 pub mod config;
 pub mod cot;
+pub mod eventlog;
 pub mod marti;
 pub mod missions;
 pub mod pki;
@@ -37,10 +38,13 @@ pub mod transport;
 //   connect-time revocation (TC-TLS-05) -- see `transport::tls`'s own doc
 //   comment for exactly what's and isn't covered.
 // - `pki`: CA generation and CSR signing.
-// - `registry`: JSON-file-backed device registry, binds cert Common Name
+// - `eventlog`: generic append-only, replayable event log -- the shared
+//   persistence/audit/backup engine both `registry` and `missions` are
+//   built on. See its own doc comment for the design rationale.
+// - `registry`: event-log-backed device registry, binds cert Common Name
 //   to CoT `uid` (TC-TLS-04) and tracks revocation. Re-enrolling a revoked
 //   device does not clear its revocation (no separate `unrevoke` exists).
-// - `missions`: JSON-file-backed mission (Data Sync) metadata store --
+// - `missions`: event-log-backed mission (Data Sync) metadata store --
 //   create/update/delete, change log, subscriptions. No DataSync file
 //   *content* storage yet (TC-MARTI-07/08) -- see its own doc comment.
 // - `marti::enrollment` + `marti::missions`: the HTTP `/Marti/api/*`

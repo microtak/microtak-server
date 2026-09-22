@@ -46,11 +46,12 @@ pub struct AppConfig {
     pub server_common_name: String,
     /// Validity period for certificates this CA issues.
     pub cert_validity: Duration,
-    /// Directory holding persistent state: `ca-cert.pem`/`ca-key.pem`,
-    /// `devices.json`, `missions.json`. Created if it doesn't exist. Reused
-    /// across restarts -- an existing CA here is loaded rather than
-    /// regenerated, which matters because regenerating the CA invalidates
-    /// every previously-issued client certificate.
+    /// Directory holding persistent state: `ca-cert.pem`/`ca-key.pem`, plus
+    /// the append-only event logs `devices.log`/`missions.log` (see
+    /// `src/eventlog.rs`). Created if it doesn't exist. Reused across
+    /// restarts -- an existing CA here is loaded rather than regenerated,
+    /// which matters because regenerating the CA invalidates every
+    /// previously-issued client certificate.
     pub data_dir: PathBuf,
 }
 
@@ -113,10 +114,10 @@ impl App {
         let ca = load_or_generate_ca(&config.data_dir, &config.ca_common_name)?;
         let ca_cert_pem = ca.ca_cert_pem();
         let registry = Arc::new(DeviceRegistry::load_or_create(
-            config.data_dir.join("devices.json"),
+            config.data_dir.join("devices.log"),
         )?);
         let missions = Arc::new(MissionStore::load_or_create(
-            config.data_dir.join("missions.json"),
+            config.data_dir.join("missions.log"),
         )?);
         let hub = RelayHub::new();
 

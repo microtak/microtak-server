@@ -7,17 +7,21 @@
 //! this module tracks content *references* (a hash + filename a client
 //! claims to have uploaded elsewhere), not the files themselves.
 //!
-//! Same JSON-file-backed design as [`crate::registry::DeviceRegistry`], for
-//! the same reasons (see that module's doc comment) — kept consistent
-//! rather than introducing a different persistence approach for a second
-//! piece of state at a similar scale.
+//! Persisted as an append-only, replayable event log (see
+//! [`crate::eventlog`]) — same design as
+//! [`crate::registry::DeviceRegistry`], for the same reasons (see that
+//! module's doc comment): cheap incremental backup, a full audit trail as
+//! a side effect of the durability mechanism, and replay reconstructs
+//! identical state rather than trusting a single snapshot file wasn't
+//! left mid-write.
 //!
 //! **Concurrency policy (TC-MARTI-06)**: all mutations take the same
-//! process-wide write lock, so concurrent requests are serialized, not
-//! interleaved — the second of two concurrent updates to the same mission
-//! simply applies after the first completes (last-writer-wins per field),
-//! never a torn/partially-applied write. No field-level conflict detection
-//! (e.g. optimistic locking via a version number) is implemented.
+//! process-wide write lock (held across the fsync'd log append), so
+//! concurrent requests are serialized, not interleaved — the second of two
+//! concurrent updates to the same mission simply applies (and durably logs)
+//! after the first completes (last-writer-wins per field), never a
+//! torn/partially-applied write. No field-level conflict detection (e.g.
+//! optimistic locking via a version number) is implemented.
 //!
 //! **Name handling (TC-MARTI-03/11)**: mission names are used verbatim as
 //! an opaque `HashMap` key — no sanitization (HTML-stripping or otherwise)
@@ -29,11 +33,13 @@
 //! interpreted here — they're just an identifier.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::eventlog::{EventLog, EventLogError};
 
 #[derive(Debug, Error)]
 pub enum MissionError {
@@ -41,20 +47,8 @@ pub enum MissionError {
     AlreadyExists(String),
     #[error("no mission found named '{0}'")]
     NotFound(String),
-    #[error("failed to read mission store file {path}: {source}")]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to write mission store file {path}: {source}")]
-    Write {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to (de)serialize mission store: {0}")]
-    Serde(#[from] serde_json::Error),
+    #[error("event log error: {0}")]
+    EventLog(#[from] EventLogError),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -116,29 +110,73 @@ pub struct MissionUpdate {
     pub keywords: Option<Vec<String>>,
 }
 
+/// A durable, replayable record of one mission-store mutation. This is the
+/// actual source of truth on disk — [`Mission`]/[`MissionChange`]/the
+/// in-memory `HashMap` are a materialized view rebuilt by replaying these.
+/// Deliberately mirrors the *inputs* to each public mutator method (not the
+/// derived [`MissionChange`] shape, which is lighter and omits payload
+/// `update`/`create` don't need replayed twice) — see [`apply_event`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum MissionEvent {
+    Created {
+        name: String,
+        description: Option<String>,
+        creator_uid: String,
+        keywords: Vec<String>,
+        at_unix: i64,
+    },
+    Updated {
+        name: String,
+        description: Option<String>,
+        keywords: Option<Vec<String>>,
+        actor_uid: String,
+        at_unix: i64,
+    },
+    Deleted {
+        name: String,
+    },
+    ContentAdded {
+        name: String,
+        hash: String,
+        filename: String,
+        creator_uid: String,
+        at_unix: i64,
+    },
+    Subscribed {
+        name: String,
+        uid: String,
+        at_unix: i64,
+    },
+    Unsubscribed {
+        name: String,
+        uid: String,
+        at_unix: i64,
+    },
+}
+
 pub struct MissionStore {
-    path: Option<PathBuf>,
     missions: RwLock<HashMap<String, MissionRecord>>,
+    log: Option<EventLog<MissionEvent>>,
 }
 
 impl MissionStore {
     pub fn in_memory() -> Self {
         Self {
-            path: None,
             missions: RwLock::new(HashMap::new()),
+            log: None,
         }
     }
 
+    /// Load an existing store from `path` by replaying its event log, or
+    /// start empty if the file doesn't exist yet. Every subsequent
+    /// mutation appends to this same log.
     pub fn load_or_create(path: impl Into<PathBuf>) -> Result<Self, MissionError> {
-        let path = path.into();
-        let missions = match std::fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(source) => return Err(MissionError::Read { path, source }),
-        };
+        let mut missions = HashMap::new();
+        let log = EventLog::open_and_replay(path, &mut missions, apply_event)?;
         Ok(Self {
-            path: Some(path),
             missions: RwLock::new(missions),
+            log: Some(log),
         })
     }
 
@@ -159,26 +197,18 @@ impl MissionStore {
             return Err(MissionError::AlreadyExists(name.to_string()));
         }
 
-        let mission = Mission {
+        let event = MissionEvent::Created {
             name: name.to_string(),
             description,
             creator_uid: creator_uid.to_string(),
-            created_at_unix: now_unix,
             keywords,
-            contents: Vec::new(),
-            subscribers: Vec::new(),
+            at_unix: now_unix,
         };
-        let record = missions.entry(name.to_string()).or_default();
-        record.mission = Some(mission.clone());
-        record.changes.push(MissionChange {
-            change_type: ChangeType::Create,
-            timestamp_unix: now_unix,
-            creator_uid: creator_uid.to_string(),
-            content_hash: None,
-        });
-        drop(missions);
-        self.persist()?;
-        Ok(mission)
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply_event(&mut missions, &event);
+        Ok(missions.get(name).unwrap().mission.clone().unwrap())
     }
 
     /// TC-MARTI-12: EdgeTAK's own answer — a partial update (only the
@@ -192,28 +222,25 @@ impl MissionStore {
         now_unix: i64,
     ) -> Result<Mission, MissionError> {
         let mut missions = self.missions.write().unwrap();
-        let record = missions
-            .get_mut(name)
-            .filter(|r| r.mission.is_some())
-            .ok_or_else(|| MissionError::NotFound(name.to_string()))?;
-        let mission = record.mission.as_mut().unwrap();
+        if missions
+            .get(name)
+            .is_none_or(|record| record.mission.is_none())
+        {
+            return Err(MissionError::NotFound(name.to_string()));
+        }
 
-        if let Some(description) = changes.description {
-            mission.description = Some(description);
+        let event = MissionEvent::Updated {
+            name: name.to_string(),
+            description: changes.description,
+            keywords: changes.keywords,
+            actor_uid: actor_uid.to_string(),
+            at_unix: now_unix,
+        };
+        if let Some(log) = &self.log {
+            log.append(&event)?;
         }
-        if let Some(keywords) = changes.keywords {
-            mission.keywords = keywords;
-        }
-        let updated = mission.clone();
-        record.changes.push(MissionChange {
-            change_type: ChangeType::Update,
-            timestamp_unix: now_unix,
-            creator_uid: actor_uid.to_string(),
-            content_hash: None,
-        });
-        drop(missions);
-        self.persist()?;
-        Ok(updated)
+        apply_event(&mut missions, &event);
+        Ok(missions.get(name).unwrap().mission.clone().unwrap())
     }
 
     pub fn get(&self, name: &str) -> Option<Mission> {
@@ -233,19 +260,28 @@ impl MissionStore {
             .collect()
     }
 
-    /// Deletes the mission itself but keeps its change log (with a final
-    /// entry appended would be the natural next step; not yet done here) --
-    /// simplest correct behavior for now: the mission becomes not-found for
-    /// `get`/`update`, while `changes` still returns its history.
+    /// Deletes the mission itself but keeps its change log queryable (see
+    /// `apply_event` — no change-log entry is added for a delete, matching
+    /// the pre-event-log behavior this preserves exactly): the mission
+    /// becomes not-found for `get`/`update`, while `changes` still returns
+    /// its history.
     pub fn delete(&self, name: &str) -> Result<(), MissionError> {
         let mut missions = self.missions.write().unwrap();
-        let record = missions
-            .get_mut(name)
-            .filter(|r| r.mission.is_some())
-            .ok_or_else(|| MissionError::NotFound(name.to_string()))?;
-        record.mission = None;
-        drop(missions);
-        self.persist()
+        if missions
+            .get(name)
+            .is_none_or(|record| record.mission.is_none())
+        {
+            return Err(MissionError::NotFound(name.to_string()));
+        }
+
+        let event = MissionEvent::Deleted {
+            name: name.to_string(),
+        };
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply_event(&mut missions, &event);
+        Ok(())
     }
 
     /// TC-MARTI-05.
@@ -265,84 +301,210 @@ impl MissionStore {
         now_unix: i64,
     ) -> Result<(), MissionError> {
         let mut missions = self.missions.write().unwrap();
-        let record = missions
-            .get_mut(name)
-            .filter(|r| r.mission.is_some())
-            .ok_or_else(|| MissionError::NotFound(name.to_string()))?;
-        let hash = content.hash.clone();
-        record.mission.as_mut().unwrap().contents.push(content);
-        record.changes.push(MissionChange {
-            change_type: ChangeType::AddContent,
-            timestamp_unix: now_unix,
-            creator_uid: record.mission.as_ref().unwrap().creator_uid.clone(),
-            content_hash: Some(hash),
-        });
-        drop(missions);
-        self.persist()
+        if missions
+            .get(name)
+            .is_none_or(|record| record.mission.is_none())
+        {
+            return Err(MissionError::NotFound(name.to_string()));
+        }
+
+        let event = MissionEvent::ContentAdded {
+            name: name.to_string(),
+            hash: content.hash,
+            filename: content.filename,
+            creator_uid: content.creator_uid,
+            at_unix: now_unix,
+        };
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply_event(&mut missions, &event);
+        Ok(())
     }
 
     /// TC-MARTI-04: idempotent -- subscribing an already-subscribed uid is
-    /// a no-op success, not an error.
+    /// a no-op success (and appends no event), not an error.
     pub fn subscribe(&self, name: &str, uid: &str, now_unix: i64) -> Result<(), MissionError> {
         let mut missions = self.missions.write().unwrap();
         let record = missions
-            .get_mut(name)
+            .get(name)
             .filter(|r| r.mission.is_some())
             .ok_or_else(|| MissionError::NotFound(name.to_string()))?;
-        let mission = record.mission.as_mut().unwrap();
-        if mission.subscribers.iter().any(|s| s == uid) {
+        if record
+            .mission
+            .as_ref()
+            .unwrap()
+            .subscribers
+            .iter()
+            .any(|s| s == uid)
+        {
             return Ok(());
         }
-        mission.subscribers.push(uid.to_string());
-        record.changes.push(MissionChange {
-            change_type: ChangeType::Subscribe,
-            timestamp_unix: now_unix,
-            creator_uid: uid.to_string(),
-            content_hash: None,
-        });
-        drop(missions);
-        self.persist()
+
+        let event = MissionEvent::Subscribed {
+            name: name.to_string(),
+            uid: uid.to_string(),
+            at_unix: now_unix,
+        };
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply_event(&mut missions, &event);
+        Ok(())
     }
 
     /// TC-MARTI-04. Idempotent in the same sense as `subscribe`.
     pub fn unsubscribe(&self, name: &str, uid: &str, now_unix: i64) -> Result<(), MissionError> {
         let mut missions = self.missions.write().unwrap();
         let record = missions
-            .get_mut(name)
+            .get(name)
             .filter(|r| r.mission.is_some())
             .ok_or_else(|| MissionError::NotFound(name.to_string()))?;
-        let mission = record.mission.as_mut().unwrap();
-        let before = mission.subscribers.len();
-        mission.subscribers.retain(|s| s != uid);
-        if mission.subscribers.len() != before {
-            record.changes.push(MissionChange {
-                change_type: ChangeType::Unsubscribe,
-                timestamp_unix: now_unix,
-                creator_uid: uid.to_string(),
-                content_hash: None,
-            });
-        }
-        drop(missions);
-        self.persist()
-    }
-
-    fn persist(&self) -> Result<(), MissionError> {
-        let Some(path) = &self.path else {
+        if !record
+            .mission
+            .as_ref()
+            .unwrap()
+            .subscribers
+            .iter()
+            .any(|s| s == uid)
+        {
             return Ok(());
+        }
+
+        let event = MissionEvent::Unsubscribed {
+            name: name.to_string(),
+            uid: uid.to_string(),
+            at_unix: now_unix,
         };
-        let missions = self.missions.read().unwrap();
-        let json = serde_json::to_string_pretty(&*missions)?;
-        write_atomically(path, &json).map_err(|source| MissionError::Write {
-            path: path.clone(),
-            source,
-        })
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply_event(&mut missions, &event);
+        Ok(())
     }
 }
 
-fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, contents)?;
-    std::fs::rename(&tmp_path, path)
+/// The reducer: apply one durable event to in-memory state. Used both for
+/// live mutations and for replaying the log on startup. Trusts its input —
+/// idempotency/existence checks happen in the public methods *before* an
+/// event is constructed and logged, so an event reaching here always
+/// represents a genuine, already-validated state transition.
+fn apply_event(missions: &mut HashMap<String, MissionRecord>, event: &MissionEvent) {
+    match event {
+        MissionEvent::Created {
+            name,
+            description,
+            creator_uid,
+            keywords,
+            at_unix,
+        } => {
+            let mission = Mission {
+                name: name.clone(),
+                description: description.clone(),
+                creator_uid: creator_uid.clone(),
+                created_at_unix: *at_unix,
+                keywords: keywords.clone(),
+                contents: Vec::new(),
+                subscribers: Vec::new(),
+            };
+            let record = missions.entry(name.clone()).or_default();
+            record.mission = Some(mission);
+            record.changes.push(MissionChange {
+                change_type: ChangeType::Create,
+                timestamp_unix: *at_unix,
+                creator_uid: creator_uid.clone(),
+                content_hash: None,
+            });
+        }
+        MissionEvent::Updated {
+            name,
+            description,
+            keywords,
+            actor_uid,
+            at_unix,
+        } => {
+            if let Some(record) = missions.get_mut(name) {
+                if let Some(mission) = record.mission.as_mut() {
+                    if let Some(description) = description {
+                        mission.description = Some(description.clone());
+                    }
+                    if let Some(keywords) = keywords {
+                        mission.keywords = keywords.clone();
+                    }
+                }
+                record.changes.push(MissionChange {
+                    change_type: ChangeType::Update,
+                    timestamp_unix: *at_unix,
+                    creator_uid: actor_uid.clone(),
+                    content_hash: None,
+                });
+            }
+        }
+        MissionEvent::Deleted { name } => {
+            if let Some(record) = missions.get_mut(name) {
+                record.mission = None;
+            }
+        }
+        MissionEvent::ContentAdded {
+            name,
+            hash,
+            filename,
+            creator_uid,
+            at_unix,
+        } => {
+            if let Some(record) = missions.get_mut(name) {
+                // Matches the pre-event-log behavior exactly: the change
+                // log entry's creator_uid is the *mission's* creator, not
+                // necessarily the uploader's -- preserved as-is rather than
+                // silently changed by this refactor.
+                let mission_creator_uid = record
+                    .mission
+                    .as_ref()
+                    .map(|m| m.creator_uid.clone())
+                    .unwrap_or_else(|| creator_uid.clone());
+                if let Some(mission) = record.mission.as_mut() {
+                    mission.contents.push(MissionContentRef {
+                        hash: hash.clone(),
+                        filename: filename.clone(),
+                        added_at_unix: *at_unix,
+                        creator_uid: creator_uid.clone(),
+                    });
+                }
+                record.changes.push(MissionChange {
+                    change_type: ChangeType::AddContent,
+                    timestamp_unix: *at_unix,
+                    creator_uid: mission_creator_uid,
+                    content_hash: Some(hash.clone()),
+                });
+            }
+        }
+        MissionEvent::Subscribed { name, uid, at_unix } => {
+            if let Some(record) = missions.get_mut(name) {
+                if let Some(mission) = record.mission.as_mut() {
+                    mission.subscribers.push(uid.clone());
+                }
+                record.changes.push(MissionChange {
+                    change_type: ChangeType::Subscribe,
+                    timestamp_unix: *at_unix,
+                    creator_uid: uid.clone(),
+                    content_hash: None,
+                });
+            }
+        }
+        MissionEvent::Unsubscribed { name, uid, at_unix } => {
+            if let Some(record) = missions.get_mut(name) {
+                if let Some(mission) = record.mission.as_mut() {
+                    mission.subscribers.retain(|s| s != uid);
+                }
+                record.changes.push(MissionChange {
+                    change_type: ChangeType::Unsubscribe,
+                    timestamp_unix: *at_unix,
+                    creator_uid: uid.clone(),
+                    content_hash: None,
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -513,7 +675,7 @@ mod tests {
     fn persists_across_reload() {
         let dir = std::env::temp_dir().join(format!("edgetak-missions-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("missions.json");
+        let path = dir.join("missions.log");
 
         {
             let store = MissionStore::load_or_create(&path).unwrap();
@@ -523,6 +685,46 @@ mod tests {
         let reloaded = MissionStore::load_or_create(&path).unwrap();
         let mission = reloaded.get("m").unwrap();
         assert_eq!(mission.description.as_deref(), Some("d"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole point: replaying the log reproduces identical state,
+    /// including a delete (no change-log entry, verified via `changes`
+    /// still returning history for a now-deleted mission) and idempotent
+    /// operations that deliberately appended no event.
+    #[test]
+    fn replay_reconstructs_a_realistic_mutation_sequence_exactly() {
+        let dir = std::env::temp_dir().join(format!("edgetak-missions-replay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("missions.log");
+
+        {
+            let store = MissionStore::load_or_create(&path).unwrap();
+            store.create("m1", None, "user-1", vec![], 1_000).unwrap();
+            store.create("m2", Some("keep".into()), "user-2", vec![], 1_100).unwrap();
+            store.subscribe("m1", "device-a", 1_200).unwrap();
+            store.subscribe("m1", "device-a", 1_300).unwrap(); // idempotent, no event
+            store
+                .update(
+                    "m2",
+                    MissionUpdate { description: Some("updated".into()), keywords: None },
+                    "user-2",
+                    1_400,
+                )
+                .unwrap();
+            store.delete("m1").unwrap();
+        }
+
+        let replayed = MissionStore::load_or_create(&path).unwrap();
+        assert!(replayed.get("m1").is_none(), "m1 was deleted");
+        assert_eq!(
+            replayed.changes("m1").unwrap().len(),
+            2,
+            "m1's history (create + subscribe) survives even though the mission itself is gone"
+        );
+        let m2 = replayed.get("m2").unwrap();
+        assert_eq!(m2.description.as_deref(), Some("updated"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
