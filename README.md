@@ -12,12 +12,11 @@ reappears.
 parsing, a plain-TCP and an mTLS CoT relay sharing one cross-transport
 broadcast bus, a certificate authority with CSR signing, a device registry
 with identity binding and revocation, a certificate enrollment HTTP
-endpoint, and a mission (Data Sync) metadata API — CRUD, change log,
-subscriptions (not yet mTLS-authenticated, see
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)). No config file, no
-persistence across restarts, no DataSync file content storage, and no
-mesh-sync layer yet — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for
-exactly what's built vs. still design-stage.
+endpoint, and an mTLS-authenticated mission (Data Sync) metadata API — CRUD,
+change log, subscriptions. No config file, no persistence across restarts,
+no DataSync file content storage, and no mesh-sync layer yet — see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for exactly what's built vs.
+still design-stage.
 
 This is a from-scratch implementation, not a fork of any existing TAK
 server. Its design draws on source-level research into the official TAK
@@ -57,9 +56,9 @@ src/
   pki.rs                — certificate authority: CA generation, CSR signing
   registry.rs            — device registry: cert CN <-> CoT uid binding, revocation
   missions.rs             — mission (Data Sync) metadata store: CRUD, change log, subscriptions
-  marti/mod.rs            — shared plain-HTTP server plumbing
-  marti/enrollment.rs    — Marti-compatible certificate enrollment HTTP endpoint
-  marti/missions.rs       — Marti missions HTTP API (not yet mTLS-authenticated)
+  marti/mod.rs            — shared plain-HTTP and mTLS HTTP server plumbing
+  marti/enrollment.rs    — Marti-compatible certificate enrollment HTTP endpoint (plain HTTP)
+  marti/missions.rs       — Marti missions HTTP API (mTLS-authenticated)
   transport/codec.rs     — incremental CoT XML stream decoder
   transport/hub.rs       — shared cross-transport broadcast bus
   transport/tcp.rs       — plain-TCP CoT relay
