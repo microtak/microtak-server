@@ -31,3 +31,4 @@ x509-parser = "0.18"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tower = { version = "0.5.3", default-features = false, features = ["util"] }

@@ -1,12 +1,12 @@
-//! Assembles every EdgeTAK component — CA, device registry, shared relay
-//! hub, enrollment HTTP endpoint, plain-TCP relay, and mTLS relay — into
-//! one runnable server. This is both `edgetakd`'s actual implementation
-//! (`src/main.rs`) and what `tests/e2e.rs` drives: prior to this module,
-//! every test built its own scaffolding in isolation (its own CA, its own
-//! registry, its own single relay), so nothing had ever exercised the
-//! pieces wired together the way a real deployment actually runs them.
-//! Building this module immediately surfaced one real bug: see
-//! `src/transport/hub.rs`'s doc comment.
+//! Assembles every EdgeTAK component — CA, device registry, mission store,
+//! shared relay hub, enrollment HTTP endpoint, Marti missions HTTP
+//! endpoint, plain-TCP relay, and mTLS relay — into one runnable server.
+//! This is both `edgetakd`'s actual implementation (`src/main.rs`) and what
+//! `tests/e2e.rs` drives: prior to this module, every test built its own
+//! scaffolding in isolation (its own CA, its own registry, its own single
+//! relay), so nothing had ever exercised the pieces wired together the way
+//! a real deployment actually runs them. Building this module immediately
+//! surfaced one real bug: see `src/transport/hub.rs`'s doc comment.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,7 +15,9 @@ use rustls::pki_types::PrivateKeyDer;
 use rustls::ServerConfig;
 use time::Duration;
 
-use crate::marti::enrollment::{EnrollmentServer, EnrollmentState};
+use crate::marti::enrollment::EnrollmentState;
+use crate::marti::{enrollment, missions as missions_api, PlainHttpServer};
+use crate::missions::MissionStore;
 use crate::pki::{self, CertificateAuthority, PkiError};
 use crate::registry::DeviceRegistry;
 use crate::transport::hub::RelayHub;
@@ -26,6 +28,8 @@ use crate::transport::tls::{self, TlsRelay, TlsSetupError};
 pub struct AppConfig {
     /// Where the enrollment HTTP endpoint listens.
     pub enrollment_addr: SocketAddr,
+    /// Where the Marti missions HTTP endpoint listens.
+    pub marti_api_addr: SocketAddr,
     /// Where the unauthenticated plain-TCP CoT relay listens.
     pub plain_tcp_addr: SocketAddr,
     /// Where the mTLS CoT relay listens.
@@ -43,6 +47,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             enrollment_addr: "0.0.0.0:8446".parse().unwrap(),
+            marti_api_addr: "0.0.0.0:8443".parse().unwrap(),
             plain_tcp_addr: "0.0.0.0:8087".parse().unwrap(),
             mtls_addr: "0.0.0.0:8089".parse().unwrap(),
             ca_common_name: "EdgeTAK CA".to_string(),
@@ -68,14 +73,18 @@ pub enum AppError {
 /// what lets `tests/e2e.rs` bind on `:0` and learn the real ports to
 /// connect test clients to.
 ///
-/// **Known simplification**: the device registry is always in-memory here
-/// (no config option to persist it to disk yet, unlike
-/// [`DeviceRegistry::load_or_create`] which already supports that) — see
-/// `docs/ARCHITECTURE.md`'s backup-strategy roadmap item.
+/// **Known simplification**: the device registry and mission store are
+/// always in-memory here (no config option to persist either to disk yet,
+/// unlike [`DeviceRegistry::load_or_create`]/[`MissionStore::load_or_create`]
+/// which already support that) — see `docs/ARCHITECTURE.md`'s
+/// backup-strategy roadmap item. The Marti missions API is also not yet
+/// mTLS-authenticated — see `marti::missions`'s own doc comment (TC-MARTI-10).
 pub struct App {
     pub ca_cert_pem: String,
     pub registry: Arc<DeviceRegistry>,
-    enrollment: EnrollmentServer,
+    pub missions: Arc<MissionStore>,
+    enrollment: PlainHttpServer,
+    marti_api: PlainHttpServer,
     tcp: TcpRelay,
     tls: TlsRelay,
 }
@@ -85,12 +94,15 @@ impl App {
         let ca = CertificateAuthority::generate(&config.ca_common_name)?;
         let ca_cert_pem = ca.ca_cert_pem();
         let registry = Arc::new(DeviceRegistry::in_memory());
+        let missions = Arc::new(MissionStore::in_memory());
         let hub = RelayHub::new();
 
         // The mTLS listener's own server identity, issued by the same CA a
         // client would enroll against.
-        let (server_csr, server_key) =
-            pki::build_csr_with_san(&config.server_common_name, vec![config.server_common_name.clone()])?;
+        let (server_csr, server_key) = pki::build_csr_with_san(
+            &config.server_common_name,
+            vec![config.server_common_name.clone()],
+        )?;
         let signed_server_cert = ca.sign_csr(&server_csr, config.cert_validity)?;
         let server_cert_der = pki::cert_pem_to_der(&signed_server_cert.cert_pem)?;
         let ca_cert_der = pki::cert_pem_to_der(&ca_cert_pem)?;
@@ -106,7 +118,16 @@ impl App {
             cert_validity: config.cert_validity,
         });
 
-        let enrollment = EnrollmentServer::bind(config.enrollment_addr, enrollment_state).await?;
+        let enrollment = PlainHttpServer::bind(
+            config.enrollment_addr,
+            enrollment::router(enrollment_state),
+        )
+        .await?;
+        let marti_api = PlainHttpServer::bind(
+            config.marti_api_addr,
+            missions_api::router(Arc::clone(&missions)),
+        )
+        .await?;
         let tcp = TcpRelay::bind(config.plain_tcp_addr, hub.clone()).await?;
         let tls = TlsRelay::bind(
             config.mtls_addr,
@@ -119,7 +140,9 @@ impl App {
         Ok(Self {
             ca_cert_pem,
             registry,
+            missions,
             enrollment,
+            marti_api,
             tcp,
             tls,
         })
@@ -127,6 +150,10 @@ impl App {
 
     pub fn enrollment_addr(&self) -> std::io::Result<SocketAddr> {
         self.enrollment.local_addr()
+    }
+
+    pub fn marti_api_addr(&self) -> std::io::Result<SocketAddr> {
+        self.marti_api.local_addr()
     }
 
     pub fn plain_tcp_addr(&self) -> std::io::Result<SocketAddr> {
@@ -142,11 +169,12 @@ impl App {
     pub async fn run(self) -> std::io::Result<()> {
         let Self {
             enrollment,
+            marti_api,
             tcp,
             tls,
             ..
         } = self;
-        tokio::try_join!(enrollment.run(), tcp.run(), tls.run())?;
+        tokio::try_join!(enrollment.run(), marti_api.run(), tcp.run(), tls.run())?;
         Ok(())
     }
 }

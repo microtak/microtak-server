@@ -10,6 +10,7 @@
 pub mod app;
 pub mod cot;
 pub mod marti;
+pub mod missions;
 pub mod pki;
 pub mod registry;
 pub mod transport;
@@ -34,6 +35,10 @@ pub mod transport;
 // - `registry`: JSON-file-backed device registry, binds cert Common Name
 //   to CoT `uid` (TC-TLS-04) and tracks revocation. Re-enrolling a revoked
 //   device does not clear its revocation (no separate `unrevoke` exists).
-// - `marti::enrollment`: the HTTP `/Marti/api/tls/*` contract on top of
-//   `pki` + `registry`. No missions/DataSync/groups yet. Served over plain
-//   HTTP for now -- see `marti::enrollment`'s own doc comment.
+// - `missions`: JSON-file-backed mission (Data Sync) metadata store --
+//   create/update/delete, change log, subscriptions. No DataSync file
+//   *content* storage yet (TC-MARTI-07/08) -- see its own doc comment.
+// - `marti::enrollment` + `marti::missions`: the HTTP `/Marti/api/*`
+//   contract on top of `pki`/`registry`/`missions`. No groups/device
+//   profiles yet. Served over plain HTTP for now, including missions
+//   (TC-MARTI-10 not yet enforced) -- see `marti`'s own doc comment.

@@ -20,11 +20,13 @@ async fn main() -> std::io::Result<()> {
 
     tracing::info!(
         enrollment = %app.enrollment_addr()?,
+        marti_api = %app.marti_api_addr()?,
         plain_tcp = %app.plain_tcp_addr()?,
         mtls = %app.mtls_addr()?,
         "edgetakd starting"
     );
-    tracing::warn!("CA and device registry are in-memory only -- nothing persists across a restart yet");
+    tracing::warn!("CA, device registry, and mission store are in-memory only -- nothing persists across a restart yet");
+    tracing::warn!("Marti missions API is not yet mTLS-authenticated (TC-MARTI-10) -- do not expose it beyond a trusted network");
 
     app.run().await
 }
