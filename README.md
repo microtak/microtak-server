@@ -67,6 +67,8 @@ src/
   marti/enrollment.rs    — Marti-compatible certificate enrollment HTTP endpoint (plain HTTP)
   marti/missions.rs       — Marti missions HTTP API (mTLS-authenticated)
   marti/client_endpoints.rs — GET /Marti/api/clientEndPoints, backed by live connections
+  marti/content.rs        — DataSync file content upload/download by hash
+  content_store.rs        — hash-addressed content-addressed file storage
   transport/codec.rs     — incremental CoT XML stream decoder
   transport/hub.rs       — shared cross-transport broadcast bus
   transport/connections.rs — shared live connected-client registry
