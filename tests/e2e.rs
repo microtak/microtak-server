@@ -230,7 +230,7 @@ async fn e2e_missions_api_full_lifecycle() {
     // TC-MARTI-01/02: create, then reject a duplicate.
     let create_response = client
         .put(format!("{base_url}/Marti/api/missions/Recon%20Alpha"))
-        .json(&serde_json::json!({"creatorUid": "user-1", "description": "first pass"}))
+        .json(&serde_json::json!({"creatorUid": "missions-client", "description": "first pass"}))
         .send()
         .await
         .unwrap();
@@ -238,7 +238,7 @@ async fn e2e_missions_api_full_lifecycle() {
 
     let duplicate_response = client
         .put(format!("{base_url}/Marti/api/missions/Recon%20Alpha"))
-        .json(&serde_json::json!({"creatorUid": "user-1"}))
+        .json(&serde_json::json!({"creatorUid": "missions-client"}))
         .send()
         .await
         .unwrap();
@@ -247,7 +247,7 @@ async fn e2e_missions_api_full_lifecycle() {
     // TC-MARTI-04: subscribe.
     let subscribe_response = client
         .put(format!(
-            "{base_url}/Marti/api/missions/Recon%20Alpha/subscription?uid=device-a"
+            "{base_url}/Marti/api/missions/Recon%20Alpha/subscription?uid=missions-client"
         ))
         .send()
         .await
@@ -260,7 +260,7 @@ async fn e2e_missions_api_full_lifecycle() {
         .put(format!(
             "{base_url}/Marti/api/missions/Recon%20Alpha/contents"
         ))
-        .json(&serde_json::json!({"hash": "abc123", "filename": "map.kml", "creatorUid": "device-a"}))
+        .json(&serde_json::json!({"hash": "abc123", "filename": "map.kml", "creatorUid": "missions-client"}))
         .send()
         .await
         .unwrap();
@@ -268,7 +268,7 @@ async fn e2e_missions_api_full_lifecycle() {
 
     let update_response = client
         .patch(format!("{base_url}/Marti/api/missions/Recon%20Alpha"))
-        .json(&serde_json::json!({"description": "updated", "actorUid": "user-1"}))
+        .json(&serde_json::json!({"description": "updated", "actorUid": "missions-client"}))
         .send()
         .await
         .unwrap();
@@ -312,6 +312,39 @@ async fn e2e_missions_api_full_lifecycle() {
         .await
         .unwrap();
     assert_eq!(get_after_delete.status(), 404);
+}
+
+/// TC-MARTI-10's residual gap, closed and verified end-to-end: a real,
+/// validly mTLS-authenticated caller still gets rejected if the
+/// `creatorUid` it claims doesn't match its own cert's CN.
+#[tokio::test]
+async fn e2e_missions_api_rejects_creatoruid_not_matching_authenticated_cert() {
+    let app = App::bind(test_config()).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    tokio::spawn(app.run());
+
+    let enrollment_base_url = format!("http://{enrollment_addr}");
+    let (cert, key) = enroll(&enrollment_base_url, "real-identity").await;
+    let client = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
+    let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
+
+    let response = client
+        .put(format!("{base_url}/Marti/api/missions/Spoofed"))
+        .json(&serde_json::json!({"creatorUid": "someone-else"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+
+    // The rejected request must not have created anything.
+    let get_response = client
+        .get(format!("{base_url}/Marti/api/missions/Spoofed"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_response.status(), 404);
 }
 
 /// TC-MARTI-10, the other half: a request presenting no client cert at all
