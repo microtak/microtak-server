@@ -54,8 +54,11 @@ pub enum StreamError {
 /// One decoded unit of stream progress.
 #[derive(Debug)]
 pub enum DecodedItem {
-    /// A complete, valid CoT event.
-    Event(Event),
+    /// A complete, valid CoT event. Boxed: `Event` grew large once
+    /// `cot::Detail` started modeling real sub-elements (contact/chat/marti),
+    /// and `DecodedItem` shouldn't pay that size on every variant just for
+    /// `Skipped`'s much smaller payload.
+    Event(Box<Event>),
     /// A complete, well-bounded `<event>...</event>` document that failed to
     /// parse as a valid CoT event (missing required attribute, malformed
     /// inner XML, etc). Per TC-STREAM-05, this does NOT terminate the
@@ -129,7 +132,7 @@ impl StreamDecoder {
                             self.buf.drain(..end + EVENT_CLOSE.len()).collect();
                         let xml = String::from_utf8_lossy(&xml_bytes).into_owned();
                         match Event::from_xml(&xml) {
-                            Ok(event) => items.push(DecodedItem::Event(event)),
+                            Ok(event) => items.push(DecodedItem::Event(Box::new(event))),
                             Err(error) => items.push(DecodedItem::Skipped { xml, error }),
                         }
                         continue;
