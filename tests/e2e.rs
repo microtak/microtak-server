@@ -37,6 +37,7 @@ const SERVER_NAME: &str = "edgetak-server";
 fn test_config() -> AppConfig {
     AppConfig {
         enrollment_addr: "127.0.0.1:0".parse().unwrap(),
+        marti_api_addr: "127.0.0.1:0".parse().unwrap(),
         plain_tcp_addr: "127.0.0.1:0".parse().unwrap(),
         mtls_addr: "127.0.0.1:0".parse().unwrap(),
         ..AppConfig::default()
@@ -161,6 +162,107 @@ async fn e2e_enroll_then_connect_via_mtls_and_relay_across_transports() {
         .expect("mTLS client should receive an event relayed from a plain-TCP client")
         .unwrap();
     assert!(String::from_utf8_lossy(&buf[..n]).contains("FROM-PLAIN-TCP"));
+}
+
+/// Missions API full lifecycle against the real, running Marti HTTP
+/// endpoint: create (409 on a duplicate), subscribe, add content, patch,
+/// read back the change log, then delete. Not tied to enrollment/mTLS —
+/// the missions API is its own (for now unauthenticated) HTTP surface, see
+/// `marti::missions`'s doc comment on TC-MARTI-10.
+#[tokio::test]
+async fn e2e_missions_api_full_lifecycle() {
+    let app = App::bind(test_config()).await.unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    tokio::spawn(app.run());
+
+    let base_url = format!("http://{marti_api_addr}");
+    let client = reqwest::Client::new();
+
+    // TC-MARTI-01/02: create, then reject a duplicate.
+    let create_response = client
+        .put(format!("{base_url}/Marti/api/missions/Recon%20Alpha"))
+        .json(&serde_json::json!({"creatorUid": "user-1", "description": "first pass"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 201);
+
+    let duplicate_response = client
+        .put(format!("{base_url}/Marti/api/missions/Recon%20Alpha"))
+        .json(&serde_json::json!({"creatorUid": "user-1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate_response.status(), 409);
+
+    // TC-MARTI-04: subscribe.
+    let subscribe_response = client
+        .put(format!(
+            "{base_url}/Marti/api/missions/Recon%20Alpha/subscription?uid=device-a"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(subscribe_response.status(), 200);
+
+    // Add content, then a partial update (TC-MARTI-12: only description
+    // changes, keywords untouched).
+    let content_response = client
+        .put(format!(
+            "{base_url}/Marti/api/missions/Recon%20Alpha/contents"
+        ))
+        .json(&serde_json::json!({"hash": "abc123", "filename": "map.kml", "creatorUid": "device-a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(content_response.status(), 200);
+
+    let update_response = client
+        .patch(format!("{base_url}/Marti/api/missions/Recon%20Alpha"))
+        .json(&serde_json::json!({"description": "updated", "actorUid": "user-1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), 200);
+    let updated: serde_json::Value = update_response.json().await.unwrap();
+    assert_eq!(updated["description"], "updated");
+    assert_eq!(updated["contents"][0]["hash"], "abc123");
+
+    // TC-MARTI-05: the change log reflects the full history in order.
+    let changes_response = client
+        .get(format!(
+            "{base_url}/Marti/api/missions/Recon%20Alpha/changes"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(changes_response.status(), 200);
+    let changes: serde_json::Value = changes_response.json().await.unwrap();
+    let change_types: Vec<&str> = changes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["change_type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        change_types,
+        vec!["Create", "Subscribe", "AddContent", "Update"]
+    );
+
+    // Delete, then confirm it's gone.
+    let delete_response = client
+        .delete(format!("{base_url}/Marti/api/missions/Recon%20Alpha"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete_response.status(), 204);
+
+    let get_after_delete = client
+        .get(format!("{base_url}/Marti/api/missions/Recon%20Alpha"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_after_delete.status(), 404);
 }
 
 /// Per this project's own testing philosophy (see `docs/TEST-PLAN.md` §7,
