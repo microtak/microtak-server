@@ -6,19 +6,22 @@
 //!   (`/Marti/api/missions/*`), served mTLS-authenticated via
 //!   [`MtlsHttpServer`] — TC-MARTI-10.
 //!
-//! Not yet implemented: DataSync file content storage (hash-addressed
-//! upload/download, TC-MARTI-07/08), `clientEndPoints` reflecting live
-//! connections (TC-MARTI-09), groups, device profiles. Authenticating the
-//! *connection* (a valid cert signed by the CA is required) is as far as
-//! this goes — request handlers don't yet cross-check a claimed
-//! `creatorUid`/`actorUid` against the connecting cert's identity, the same
-//! incremental order the CoT transport followed (mTLS first, then identity
-//! binding as its own pass — see `transport::tls`'s history).
+//! Not yet implemented: `clientEndPoints` reflecting live connections
+//! (TC-MARTI-09), groups, device profiles.
+//!
+//! [`MtlsHttpServer`] injects the connecting cert's Common Name into every
+//! request as a [`PeerIdentity`] extension — [`missions`] uses this to
+//! reject a request whose claimed `creatorUid`/`actorUid` doesn't match the
+//! authenticated connection's own identity (EdgeTAK's policy: an HTTP API
+//! caller's identity *is* its cert's CN, the same identity enrollment
+//! issued it — this doesn't require any prior CoT-relay interaction, so it
+//! works for HTTP-only callers like a web frontend that never streams raw
+//! CoT through the relay).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::Router;
+use axum::{Extension, Router};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use hyper_util::service::TowerToHyperService;
@@ -29,6 +32,13 @@ use tracing::warn;
 
 pub mod enrollment;
 pub mod missions;
+
+/// The authenticated identity of an mTLS-connected caller — the connecting
+/// client certificate's Common Name. Injected as a request extension by
+/// [`MtlsHttpServer`]; extract it in a handler with
+/// `Extension(PeerIdentity(cn)): Extension<PeerIdentity>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerIdentity(pub String);
 
 /// A plain-HTTP listener serving a pre-built [`Router`], following the same
 /// bind-then-`local_addr`-then-`run` shape as
@@ -96,8 +106,8 @@ impl MtlsHttpServer {
 
     /// Accept connections forever, spawning a task per client. Only returns
     /// on a fatal `accept()` error (the listener socket itself is broken).
-    /// A failed TLS handshake (untrusted/missing client cert) disconnects
-    /// that one client and does not affect the listener.
+    /// A failed TLS handshake, or a cert with no extractable Common Name,
+    /// disconnects that one client and does not affect the listener.
     pub async fn run(self) -> std::io::Result<()> {
         loop {
             let (stream, peer) = self.listener.accept().await?;
@@ -112,6 +122,19 @@ impl MtlsHttpServer {
                     }
                 };
 
+                let cn = {
+                    let (_, connection) = tls_stream.get_ref();
+                    connection
+                        .peer_certificates()
+                        .and_then(|certs| certs.first())
+                        .and_then(|cert| crate::pki::common_name_from_cert_der(cert.as_ref()))
+                };
+                let Some(cn) = cn else {
+                    warn!(%peer, "client cert has no extractable Common Name, disconnecting");
+                    return;
+                };
+
+                let router = router.layer(Extension(PeerIdentity(cn)));
                 let io = TokioIo::new(tls_stream);
                 let service = TowerToHyperService::new(router);
                 if let Err(error) = ConnBuilder::new(TokioExecutor::new())

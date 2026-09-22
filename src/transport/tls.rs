@@ -146,14 +146,7 @@ fn peer_common_name(stream: &TlsStream<TcpStream>) -> Option<String> {
     let (_, connection) = stream.get_ref();
     let certs = connection.peer_certificates()?;
     let leaf = certs.first()?;
-    let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref()).ok()?;
-    let cn = parsed
-        .subject()
-        .iter_common_name()
-        .next()
-        .and_then(|cn| cn.as_str().ok())
-        .map(str::to_string);
-    cn
+    crate::pki::common_name_from_cert_der(leaf.as_ref())
 }
 
 async fn handle_client(

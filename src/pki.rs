@@ -147,6 +147,21 @@ pub fn cert_pem_to_der(pem_str: &str) -> Result<CertificateDer<'static>, PkiErro
     Ok(CertificateDer::from(parsed.contents().to_vec()))
 }
 
+/// Extract the Common Name from a DER-encoded certificate, e.g. an mTLS
+/// peer certificate presented during a handshake. Shared by
+/// `transport::tls` and `marti::MtlsHttpServer` — one identity-extraction
+/// implementation, not two.
+pub fn common_name_from_cert_der(der: &[u8]) -> Option<String> {
+    let (_, parsed) = x509_parser::parse_x509_certificate(der).ok()?;
+    let cn = parsed
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .map(str::to_string);
+    cn
+}
+
 /// Build a PEM-encoded CSR for the given Common Name, for use in tests and
 /// as a reference client-side implementation.
 pub fn build_csr(common_name: &str) -> Result<(String, KeyPair), PkiError> {
