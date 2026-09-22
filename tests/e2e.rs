@@ -103,6 +103,37 @@ async fn connect_mtls(
         .await
 }
 
+/// An mTLS-capable `reqwest` client for hitting the Marti missions API,
+/// which (unlike enrollment) requires a client cert per request. Since the
+/// server cert's SAN is the fixed name `SERVER_NAME`, not an IP,
+/// `.resolve()` is used to point that hostname at the real loopback address
+/// so hostname verification succeeds against `https://edgetak-server:<port>/...`
+/// URLs (the port in the URL is what's actually used to connect --
+/// `resolve()`'s own port is ignored per its documented behavior).
+fn mtls_reqwest_client(
+    ca_cert_pem: &str,
+    cert_pem: &str,
+    key: rcgen::KeyPair,
+    addr: SocketAddr,
+) -> reqwest::Client {
+    let mut identity_pem = cert_pem.as_bytes().to_vec();
+    identity_pem.extend_from_slice(key.serialize_pem().as_bytes());
+    let identity = reqwest::Identity::from_pem(&identity_pem).unwrap();
+    let ca_cert = reqwest::Certificate::from_pem(ca_cert_pem.as_bytes()).unwrap();
+
+    reqwest::Client::builder()
+        .identity(identity)
+        .add_root_certificate(ca_cert)
+        .resolve(SERVER_NAME, SocketAddr::new(addr.ip(), 0))
+        // This is a loopback test server, not a real internet host -- the
+        // sandbox's https_proxy env var would otherwise make reqwest try to
+        // CONNECT through it to the fake SERVER_NAME hostname, which the
+        // proxy can't resolve.
+        .no_proxy()
+        .build()
+        .unwrap()
+}
+
 /// The core end-to-end chain nothing else tests: enroll via real HTTP,
 /// then actually connect via mTLS using the cert that enrollment returned,
 /// against the *same* running server -- proving the whole pipeline
@@ -164,19 +195,24 @@ async fn e2e_enroll_then_connect_via_mtls_and_relay_across_transports() {
     assert!(String::from_utf8_lossy(&buf[..n]).contains("FROM-PLAIN-TCP"));
 }
 
-/// Missions API full lifecycle against the real, running Marti HTTP
-/// endpoint: create (409 on a duplicate), subscribe, add content, patch,
-/// read back the change log, then delete. Not tied to enrollment/mTLS —
-/// the missions API is its own (for now unauthenticated) HTTP surface, see
-/// `marti::missions`'s doc comment on TC-MARTI-10.
+/// Missions API full lifecycle against the real, running, mTLS-authenticated
+/// Marti HTTP endpoint (TC-MARTI-10): enroll a device via real HTTP first
+/// (the same chain the core mTLS test exercises), then use its cert to
+/// create (409 on a duplicate), subscribe, add content, patch, read back
+/// the change log, and delete a mission.
 #[tokio::test]
 async fn e2e_missions_api_full_lifecycle() {
     let app = App::bind(test_config()).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
     let marti_api_addr = app.marti_api_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
 
-    let base_url = format!("http://{marti_api_addr}");
-    let client = reqwest::Client::new();
+    let enrollment_base_url = format!("http://{enrollment_addr}");
+    let (cert, key) = enroll(&enrollment_base_url, "missions-client").await;
+    let client = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
+
+    let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
 
     // TC-MARTI-01/02: create, then reject a duplicate.
     let create_response = client
@@ -263,6 +299,37 @@ async fn e2e_missions_api_full_lifecycle() {
         .await
         .unwrap();
     assert_eq!(get_after_delete.status(), 404);
+}
+
+/// TC-MARTI-10, the other half: a request presenting no client cert at all
+/// must fail -- the missions API requires mTLS just like the CoT relay.
+#[tokio::test]
+async fn e2e_missions_api_rejects_requests_with_no_client_cert() {
+    let app = App::bind(test_config()).await.unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    tokio::spawn(app.run());
+
+    let ca_cert = reqwest::Certificate::from_pem(ca_cert_pem.as_bytes()).unwrap();
+    let client = reqwest::Client::builder()
+        .add_root_certificate(ca_cert)
+        .resolve(SERVER_NAME, SocketAddr::new(marti_api_addr.ip(), 0))
+        .no_proxy()
+        .build()
+        .unwrap();
+
+    let result = client
+        .get(format!(
+            "https://{SERVER_NAME}:{}/Marti/api/missions",
+            marti_api_addr.port()
+        ))
+        .send()
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a request with no client cert must fail the mTLS handshake"
+    );
 }
 
 /// Per this project's own testing philosophy (see `docs/TEST-PLAN.md` §7,
