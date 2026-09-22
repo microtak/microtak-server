@@ -151,6 +151,8 @@ This entire section is speculative and will change once Reticulum/LXMF prototypi
 
 ## 10. Configuration
 
+**Implemented** (`src/config.rs`, `src/app.rs`): an optional TOML config file (`$EDGETAK_CONFIG` or `./edgetak.toml`, every field individually overridable, backed by the same defaults as `AppConfig`) plus real persistence — CA, device registry, and mission store all read from and write to `data_dir` (default `./data`), surviving a restart instead of regenerating on every startup. Verified against the real binary, not just the test suite: a CA's SHA-256 fingerprint was confirmed identical across two actual `edgetakd` runs against the same `data_dir`. TC-CFG-01 covers both a cheap type-level check (an out-of-range port fails TOML deserialization itself) and an eager semantic check (`bind_host` must parse as an IP, `cert_validity_days` must be positive) rather than surfacing as a confusing later `SocketAddr`-bind or silently-negative-duration failure. TC-CFG-02's spirit is satisfied the other way around from its literal wording (no external TLS cert/key path exists to reference, since EdgeTAK issues its own CA-derived certs) — a *missing* config file is fine (falls back to defaults), a *present-but-invalid* one is a hard startup error, which is the distinction that actually matters here.
+
 | ID | Case | Type |
 |---|---|---|
 | TC-CFG-01 | Invalid config values that are cheap to check (out-of-range ports, non-integer TTLs) are rejected at startup, not deferred to first use | [DESIGN] |

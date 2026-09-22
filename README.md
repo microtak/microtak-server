@@ -12,9 +12,10 @@ reappears.
 parsing, a plain-TCP and an mTLS CoT relay sharing one cross-transport
 broadcast bus, a certificate authority with CSR signing, a device registry
 with identity binding and revocation, a certificate enrollment HTTP
-endpoint, and an mTLS-authenticated mission (Data Sync) metadata API — CRUD,
-change log, subscriptions. No config file, no persistence across restarts,
-no DataSync file content storage, and no mesh-sync layer yet — see
+endpoint, an mTLS-authenticated mission (Data Sync) metadata API — CRUD,
+change log, subscriptions — an optional TOML config file, and persistence
+(CA, device registry, and mission store all survive a restart). No DataSync
+file content storage and no mesh-sync layer yet — see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for exactly what's built vs.
 still design-stage.
 
@@ -46,12 +47,18 @@ cargo test --test e2e    # end-to-end suite against the assembled server
 cargo run --bin edgetakd # starts a real server on the default ports
 ```
 
+Config is optional: `$EDGETAK_CONFIG`, or `./edgetak.toml` if unset (see
+[docs/TEST-PLAN.md](docs/TEST-PLAN.md) §10). A missing file falls back to
+defaults. CA, device registry, and mission store persist under `data_dir`
+(default `./data`) and reload on the next start.
+
 ## Project layout
 
 ```
 src/
   lib.rs                — crate root, module map
   app.rs                — assembles every component into one runnable server
+  config.rs              — optional TOML config file, converted into AppConfig
   cot.rs                — CoT <event>/<point> XML parsing and serialization
   pki.rs                — certificate authority: CA generation, CSR signing
   registry.rs            — device registry: cert CN <-> CoT uid binding, revocation
