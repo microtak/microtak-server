@@ -8,10 +8,14 @@ grid-down "island" scenarios where instances may be cut off from each other
 for extended periods and need to resync opportunistically once a link
 reappears.
 
-**Status: early scaffold.** Only the CoT `<event>`/`<point>` XML model
-(`src/cot.rs`) is implemented and tested. CoT streaming transport, the Marti
-REST API, certificate enrollment, and the mesh-sync layer are all
-design-stage — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+**Status: early but functional.** `edgetakd` runs a real server today: CoT
+parsing, a plain-TCP and an mTLS CoT relay sharing one cross-transport
+broadcast bus, a certificate authority with CSR signing, a device registry
+with identity binding and revocation, and a certificate enrollment HTTP
+endpoint. No config file, no persistence across restarts, no missions API,
+and no mesh-sync layer yet — see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for exactly what's built vs.
+still design-stage.
 
 This is a from-scratch implementation, not a fork of any existing TAK
 server. Its design draws on source-level research into the official TAK
@@ -28,22 +32,36 @@ compatibility targets and as a "don't repeat this bug" checklist. See
 
 Every feature is expected to be backed by tests (API-level integration tests
 and/or unit tests) before being considered complete — see the test plan for
-what "tested" means for each area.
+what "tested" means for each area. `tests/e2e.rs` drives the fully-assembled
+server (real HTTP enrollment, then real mTLS/plain-TCP connections against
+the same running instance); everything else is tested at the module level.
 
-## Building
+## Building and running
 
 ```sh
 cargo build
-cargo test
+cargo test               # unit + module-level integration tests
+cargo test --test e2e    # end-to-end suite against the assembled server
+cargo run --bin edgetakd # starts a real server on the default ports
 ```
 
 ## Project layout
 
 ```
 src/
-  lib.rs   — crate root, module map (most modules are planned, not yet implemented)
-  cot.rs   — CoT <event>/<point> XML parsing and serialization (implemented + tested)
-  main.rs  — daemon entrypoint (currently a stub)
+  lib.rs                — crate root, module map
+  app.rs                — assembles every component into one runnable server
+  cot.rs                — CoT <event>/<point> XML parsing and serialization
+  pki.rs                — certificate authority: CA generation, CSR signing
+  registry.rs            — device registry: cert CN <-> CoT uid binding, revocation
+  marti/enrollment.rs    — Marti-compatible certificate enrollment HTTP endpoint
+  transport/codec.rs     — incremental CoT XML stream decoder
+  transport/hub.rs       — shared cross-transport broadcast bus
+  transport/tcp.rs       — plain-TCP CoT relay
+  transport/tls.rs       — mTLS-authenticated CoT relay
+  main.rs                — edgetakd entrypoint
+tests/
+  e2e.rs                 — end-to-end suite against the assembled server
 ```
 
 ## License

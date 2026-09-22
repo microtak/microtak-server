@@ -34,7 +34,7 @@ Each test case is tagged with why it exists:
 
 The single most important interoperability risk identified during research.
 
-**Implemented** (`src/transport/codec.rs`, `src/transport/tcp.rs`): TC-STREAM-01 through 05, plus TC-ROUTE-01 (baseline broadcast relay) — TC-STREAM-01/02/03/05 as fast unit tests directly against `StreamDecoder`, TC-STREAM-04/05/TC-ROUTE-01 as real socket-level integration tests against an actual `TcpListener`. TC-STREAM-06 through 11 (TAK Protocol binary framing, TLS handshake timeout, idle-client tolerance, startup timeout) are not yet implemented.
+**Implemented** (`src/transport/codec.rs`, `src/transport/tcp.rs`, `src/transport/hub.rs`): TC-STREAM-01 through 05, plus TC-ROUTE-01 (broadcast relay) — TC-STREAM-01/02/03/05 as fast unit tests directly against `StreamDecoder`, TC-STREAM-04/05/TC-ROUTE-01 as real socket-level integration tests against an actual `TcpListener`. TC-ROUTE-01 is now cross-transport: `TcpRelay` and `TlsRelay` share one `RelayHub` broadcast bus, after building the end-to-end test suite (§13) surfaced that they originally ran on two independent channels — a CoT event from a plain-TCP client never reached an mTLS client, and vice versa. TC-STREAM-06 through 11 (TAK Protocol binary framing, TLS handshake timeout, idle-client tolerance, startup timeout) are not yet implemented.
 
 | ID | Case | Type |
 |---|---|---|
@@ -167,6 +167,21 @@ Added alongside the enrollment endpoint (§4) — tracks enrolled devices by cer
 **Implemented** (`src/registry.rs`), each with a passing unit test: enroll and find a device; re-enrollment (cert rotation) preserves an existing `uid` binding; re-enrollment preserves an existing revocation (does **not** silently un-revoke — a real bug caught by the mTLS integration tests during development, see TC-TLS-05 above); bind a `uid` on first use; idempotent re-assertion of an already-owned `uid`; reject binding a `uid` already owned by a different device; reject a device rebinding to a *different* `uid` than the one it already owns; revoke a device; revoking an unknown device errors; the registry persists across a reload from its JSON file; loading a nonexistent path starts empty rather than erroring.
 
 **Not yet implemented**: an explicit `unrevoke` action (revocation is currently one-way); any capacity/pagination concerns (irrelevant at this project's target scale, see `docs/ARCHITECTURE.md`).
+
+## 13. End-to-End Test Suite (`tests/e2e.rs`)
+
+Every test above (§1-12) exercises one module in isolation, each building its own scaffolding (its own CA, its own registry, its own single relay). Nothing had ever exercised the pieces wired together the way `edgetakd` actually runs them — until `src/app.rs` (which assembles CA + registry + relay hub + enrollment endpoint + both relays into one runnable server) and this suite were built together. Building them immediately surfaced the cross-transport routing bug described in §2.
+
+**Implemented**, each as a real test against the fully-assembled `App` bound on ephemeral ports — devices are enrolled through the real HTTP endpoint (not by reaching into a registry directly) and then driven through real mTLS/plain-TCP connections against that same running server:
+
+- Enroll two devices via HTTP, connect both via mTLS using the certs enrollment actually returned, and confirm cross-transport relay in both directions (mTLS→plain-TCP and plain-TCP→mTLS) — the core chain nothing else tests, and the one that would have caught the hub bug.
+- Fan-out to three simultaneous clients across mixed transports (two mTLS, one plain-TCP) from a fourth, unauthenticated plain-TCP sender.
+- Cross-device uid spoofing, rejected after real HTTP enrollment (vs. `transport::tls`'s own unit test, which enrolls directly into a bespoke registry).
+- A revoked device's new connection is rejected (revocation applied via `App::registry`, the same escape hatch an eventual admin API would use internally — no HTTP revocation endpoint exists yet).
+- A plain-TCP client sending garbage is disconnected inside the fully assembled server, not just the isolated `TcpRelay`.
+- A client cert signed by a foreign CA is rejected by this server's mTLS listener.
+
+**Not yet covered**: TAK Protocol binary framing, GeoChat/team routing (no detail-element modeling yet, see TC-COT-10), mesh sync (not implemented), and anything requiring a config file (none exists yet).
 
 ## Pending research
 

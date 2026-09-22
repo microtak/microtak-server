@@ -1,6 +1,6 @@
 # EdgeTAK Architecture
 
-**Status: early scaffold, research-driven design.** Only the CoT `<event>`/`<point>` XML model is implemented (`src/cot.rs`). Everything below describes the target design, not current behavior.
+**Status: early but functional.** `edgetakd` runs a real server: CoT parsing (`src/cot.rs`), a plain-TCP and an mTLS CoT relay sharing one cross-transport broadcast bus (`src/transport/`), a certificate authority with CSR signing (`src/pki.rs`), a device registry with cert-CN↔uid identity binding and revocation (`src/registry.rs`), and a certificate enrollment HTTP endpoint (`src/marti/enrollment.rs`) — all assembled by `src/app.rs`. Covered end-to-end by `tests/e2e.rs` in addition to each module's own tests. No config file, no persistence across restarts, no missions/DataSync API, and no mesh sync yet — everything below past this point describes target design, not all of it built.
 
 ## What this is
 
