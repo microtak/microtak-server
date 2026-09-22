@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.7"
+hyper-util = { version = "0.1.20", default-features = false, features = ["server", "server-auto", "tokio", "service"] }
 pem = "4"
 quick-xml = { version = "0.36", features = ["serialize"] }
 rcgen = { version = "0.14", features = ["x509-parser"] }

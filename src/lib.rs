@@ -40,5 +40,8 @@ pub mod transport;
 //   *content* storage yet (TC-MARTI-07/08) -- see its own doc comment.
 // - `marti::enrollment` + `marti::missions`: the HTTP `/Marti/api/*`
 //   contract on top of `pki`/`registry`/`missions`. No groups/device
-//   profiles yet. Served over plain HTTP for now, including missions
-//   (TC-MARTI-10 not yet enforced) -- see `marti`'s own doc comment.
+//   profiles yet. Enrollment is deliberately plain HTTP (unauthenticated by
+//   design); missions is mTLS-authenticated via `marti::MtlsHttpServer`
+//   (TC-MARTI-10) -- request handlers don't yet cross-check a claimed
+//   creatorUid/actorUid against the connecting cert's identity, though; see
+//   `marti`'s own doc comment.

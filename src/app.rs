@@ -16,7 +16,7 @@ use rustls::ServerConfig;
 use time::Duration;
 
 use crate::marti::enrollment::EnrollmentState;
-use crate::marti::{enrollment, missions as missions_api, PlainHttpServer};
+use crate::marti::{enrollment, missions as missions_api, MtlsHttpServer, PlainHttpServer};
 use crate::missions::MissionStore;
 use crate::pki::{self, CertificateAuthority, PkiError};
 use crate::registry::DeviceRegistry;
@@ -77,14 +77,16 @@ pub enum AppError {
 /// always in-memory here (no config option to persist either to disk yet,
 /// unlike [`DeviceRegistry::load_or_create`]/[`MissionStore::load_or_create`]
 /// which already support that) — see `docs/ARCHITECTURE.md`'s
-/// backup-strategy roadmap item. The Marti missions API is also not yet
-/// mTLS-authenticated — see `marti::missions`'s own doc comment (TC-MARTI-10).
+/// backup-strategy roadmap item. The Marti missions API's request handlers
+/// don't yet cross-check a claimed `creatorUid`/`actorUid` against the
+/// connecting cert's identity — only connection-level cert validation is
+/// enforced so far (see `marti::mod`'s doc comment).
 pub struct App {
     pub ca_cert_pem: String,
     pub registry: Arc<DeviceRegistry>,
     pub missions: Arc<MissionStore>,
     enrollment: PlainHttpServer,
-    marti_api: PlainHttpServer,
+    marti_api: MtlsHttpServer,
     tcp: TcpRelay,
     tls: TlsRelay,
 }
@@ -106,11 +108,16 @@ impl App {
         let signed_server_cert = ca.sign_csr(&server_csr, config.cert_validity)?;
         let server_cert_der = pki::cert_pem_to_der(&signed_server_cert.cert_pem)?;
         let ca_cert_der = pki::cert_pem_to_der(&ca_cert_pem)?;
-        let tls_server_config: ServerConfig = tls::server_config(
+        // Shared between the CoT mTLS relay and the Marti API's mTLS HTTP
+        // listener -- same server identity, same CA-based client
+        // verification policy, no reason to issue a second server cert or
+        // build a second ServerConfig for what is otherwise a second
+        // protocol on a second port.
+        let tls_server_config: Arc<ServerConfig> = Arc::new(tls::server_config(
             ca_cert_der,
             vec![server_cert_der],
             PrivateKeyDer::from(server_key),
-        )?;
+        )?);
 
         let enrollment_state = Arc::new(EnrollmentState {
             ca,
@@ -123,15 +130,16 @@ impl App {
             enrollment::router(enrollment_state),
         )
         .await?;
-        let marti_api = PlainHttpServer::bind(
+        let marti_api = MtlsHttpServer::bind(
             config.marti_api_addr,
+            Arc::clone(&tls_server_config),
             missions_api::router(Arc::clone(&missions)),
         )
         .await?;
         let tcp = TcpRelay::bind(config.plain_tcp_addr, hub.clone()).await?;
         let tls = TlsRelay::bind(
             config.mtls_addr,
-            Arc::new(tls_server_config),
+            tls_server_config,
             hub,
             Arc::clone(&registry),
         )
