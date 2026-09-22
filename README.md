@@ -66,8 +66,10 @@ src/
   marti/mod.rs            — shared plain-HTTP and mTLS HTTP server plumbing
   marti/enrollment.rs    — Marti-compatible certificate enrollment HTTP endpoint (plain HTTP)
   marti/missions.rs       — Marti missions HTTP API (mTLS-authenticated)
+  marti/client_endpoints.rs — GET /Marti/api/clientEndPoints, backed by live connections
   transport/codec.rs     — incremental CoT XML stream decoder
   transport/hub.rs       — shared cross-transport broadcast bus
+  transport/connections.rs — shared live connected-client registry
   transport/tcp.rs       — plain-TCP CoT relay
   transport/tls.rs       — mTLS-authenticated CoT relay
   main.rs                — edgetakd entrypoint
