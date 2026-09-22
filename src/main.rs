@@ -1,10 +1,30 @@
 //! EdgeTAK daemon entrypoint.
 //!
-//! Scaffold only — no networking/server logic implemented yet. See
-//! `wiki/EdgeTAK.md` for architecture and `wiki/EdgeTAK-Test-Plan.md` for
-//! the test-case catalog driving what gets built next.
+//! No configuration file yet (see `docs/TEST-PLAN.md` §10 TC-CFG-*) —
+//! listens on the hardcoded default ports from [`edgetak::app::AppConfig`],
+//! generates a fresh in-memory CA and device registry on every startup (no
+//! persistence across restarts yet). Suitable for local testing only; see
+//! `docs/ARCHITECTURE.md` for the open questions blocking a real deployment
+//! (config surface, CA/registry persistence, mesh sync).
 
-fn main() {
-    println!("edgetakd {} — scaffold only, not yet functional", env!("CARGO_PKG_VERSION"));
-    println!("See wiki/EdgeTAK.md and wiki/EdgeTAK-Test-Plan.md in the parent monorepo.");
+use edgetak::app::{App, AppConfig};
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let config = AppConfig::default();
+    let app = App::bind(config)
+        .await
+        .unwrap_or_else(|error| panic!("failed to start EdgeTAK: {error}"));
+
+    tracing::info!(
+        enrollment = %app.enrollment_addr()?,
+        plain_tcp = %app.plain_tcp_addr()?,
+        mtls = %app.mtls_addr()?,
+        "edgetakd starting"
+    );
+    tracing::warn!("CA and device registry are in-memory only -- nothing persists across a restart yet");
+
+    app.run().await
 }
