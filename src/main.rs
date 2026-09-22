@@ -1,19 +1,30 @@
 //! EdgeTAK daemon entrypoint.
 //!
-//! No configuration file yet (see `docs/TEST-PLAN.md` §10 TC-CFG-*) —
-//! listens on the hardcoded default ports from [`edgetak::app::AppConfig`],
-//! generates a fresh in-memory CA, device registry, and mission store on
-//! every startup (no persistence across restarts yet). Suitable for local
-//! testing only; see `docs/ARCHITECTURE.md` for the open questions blocking
-//! a real deployment (config surface, persistence, mesh sync).
+//! Config file path: `$EDGETAK_CONFIG`, or `./edgetak.toml` if unset — see
+//! [`edgetak::config::Config`]. A missing file falls back to
+//! [`edgetak::app::AppConfig::default`]'s ports; a present-but-invalid one
+//! is a fatal startup error. CA, device registry, and mission store persist
+//! to `data_dir` (default `./data`) and reload across restarts. No mesh
+//! sync yet; see `docs/ARCHITECTURE.md` for the remaining open questions.
 
-use edgetak::app::{App, AppConfig};
+use std::path::PathBuf;
+
+use edgetak::app::App;
+use edgetak::config::Config;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let config = AppConfig::default();
+    let config_path = std::env::var("EDGETAK_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./edgetak.toml"));
+    let config = Config::load_or_default(&config_path)
+        .and_then(|c| c.to_app_config())
+        .unwrap_or_else(|error| {
+            panic!("failed to load config from {}: {error}", config_path.display())
+        });
+
     let app = App::bind(config)
         .await
         .unwrap_or_else(|error| panic!("failed to start EdgeTAK: {error}"));
@@ -25,7 +36,6 @@ async fn main() -> std::io::Result<()> {
         mtls = %app.mtls_addr()?,
         "edgetakd starting"
     );
-    tracing::warn!("CA, device registry, and mission store are in-memory only -- nothing persists across a restart yet");
 
     app.run().await
 }

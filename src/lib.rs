@@ -8,6 +8,7 @@
 //! EdgeTAK's own design decisions where no authoritative spec exists.
 
 pub mod app;
+pub mod config;
 pub mod cot;
 pub mod marti;
 pub mod missions;
@@ -24,14 +25,18 @@ pub mod transport;
 //
 // Current state of the implemented modules:
 // - `app`: wires everything below into one runnable server (`App`) --
-//   `src/main.rs` and `tests/e2e.rs` are its two consumers.
+//   `src/main.rs` and `tests/e2e.rs` are its two consumers. CA, device
+//   registry, and mission store all persist to `AppConfig::data_dir` and
+//   reload across restarts.
+// - `config`: optional TOML config file, converted into `AppConfig`. A
+//   missing file falls back to defaults; a present-but-invalid one is a
+//   hard startup error (TC-CFG-01/02).
 // - `transport`: plain-TCP relay (no auth) and mTLS relay, sharing one
 //   `transport::hub::RelayHub` so a CoT event crosses transports. The mTLS
 //   relay enforces `registry`-based identity binding (TC-TLS-04) and
 //   connect-time revocation (TC-TLS-05) -- see `transport::tls`'s own doc
 //   comment for exactly what's and isn't covered.
-// - `pki`: CA generation and CSR signing. No persistence of the CA itself
-//   yet (only the device registry persists).
+// - `pki`: CA generation and CSR signing.
 // - `registry`: JSON-file-backed device registry, binds cert Common Name
 //   to CoT `uid` (TC-TLS-04) and tracks revocation. Re-enrolling a revoked
 //   device does not clear its revocation (no separate `unrevoke` exists).
