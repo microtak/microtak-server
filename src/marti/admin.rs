@@ -9,13 +9,15 @@
 //! configured, the admin API is unreachable by anyone (fails closed, not
 //! open).
 //!
-//! **Bootstrap order**: the admin's own device must be enrolled *before*
-//! [`crate::app::AppConfig::enrollment_requires_token`] is turned on --
-//! these endpoints are only reachable over mTLS using a cert enrollment
-//! already issued, so there's no way to mint the very first token through
-//! this API if enrollment is already locked down and nobody holds a valid
-//! token yet. Enroll the admin device while enrollment is still open, then
-//! flip `enrollment_requires_token` on and restart.
+//! **Bootstrap order, still real even with [`crate::app::EnrollmentMode::Auto`]'s
+//! live transition**: these endpoints are only reachable over mTLS using a
+//! cert enrollment already issued, so the admin's own device necessarily
+//! has to enroll first -- which it can, since `Auto` only locks enrollment
+//! down *after* that device exists in the registry (see
+//! `marti::enrollment::EnrollmentState::is_locked_down`). No restart is
+//! needed for this to happen, unlike the two-phase restart-based design
+//! this replaced: enroll the admin device, and enrollment is locked for
+//! everyone else from that same moment on, in the same running process.
 
 use std::sync::Arc;
 

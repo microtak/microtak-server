@@ -33,6 +33,7 @@ use serde_json::json;
 use time::{Duration, OffsetDateTime};
 use tracing::{info, warn};
 
+use crate::app::EnrollmentMode;
 use crate::enrollment_tokens::EnrollmentTokenStore;
 use crate::pki::CertificateAuthority;
 use crate::registry::DeviceRegistry;
@@ -42,9 +43,30 @@ pub struct EnrollmentState {
     pub registry: Arc<DeviceRegistry>,
     pub cert_validity: Duration,
     pub tokens: Arc<EnrollmentTokenStore>,
-    /// See `AppConfig::enrollment_requires_token` -- off by default,
-    /// matching the real Marti enrollment contract (wide open by design).
-    pub requires_token: bool,
+    /// See [`EnrollmentMode`]'s own doc comment.
+    pub enrollment_mode: EnrollmentMode,
+    /// Which cert Common Name counts as "the admin" for
+    /// [`EnrollmentMode::Auto`]'s live check -- same value
+    /// `marti::admin::AdminState` uses, kept here too since this handler
+    /// needs to check the registry for it independently.
+    pub admin_common_name: Option<String>,
+}
+
+impl EnrollmentState {
+    /// Whether a request right now must present a valid token --
+    /// evaluated live, not decided once at startup, since
+    /// [`EnrollmentMode::Auto`] depends on whether the admin device has
+    /// been enrolled *yet*, which can change between one request and the
+    /// next with no restart involved.
+    fn is_locked_down(&self) -> bool {
+        match self.enrollment_mode {
+            EnrollmentMode::Open => false,
+            EnrollmentMode::Auto => self
+                .admin_common_name
+                .as_deref()
+                .is_some_and(|admin_cn| self.registry.find(admin_cn).is_some()),
+        }
+    }
 }
 
 /// Build the enrollment router. Bind it with [`super::PlainHttpServer`].
@@ -123,14 +145,15 @@ async fn sign_client_v2(
         }
     };
 
-    // Opt-in gate (off by default -- see AppConfig::enrollment_requires_token):
-    // a valid, unused, unexpired token must accompany the CSR. Checked
-    // *after* signing (so we know the real common_name to record the token
-    // as consumed-by) but *before* recording the device or returning the
-    // cert -- a rejected request neither registers the device nor learns
-    // its own cert, even though the CA already did the (side-effect-free)
-    // work of signing it.
-    if state.requires_token {
+    // Secure-by-default gate (see EnrollmentMode's own doc comment): a
+    // valid, unused, unexpired token must accompany the CSR once the
+    // configured admin device has actually enrolled (Auto mode; Open never
+    // requires one). Checked *after* signing (so we know the real
+    // common_name to record the token as consumed-by) but *before*
+    // recording the device or returning the cert -- a rejected request
+    // neither registers the device nor learns its own cert, even though
+    // the CA already did the (side-effect-free) work of signing it.
+    if state.is_locked_down() {
         let token = match &query.token {
             Some(token) => token.as_str(),
             None => {
@@ -230,7 +253,8 @@ mod tests {
             registry: Arc::new(DeviceRegistry::in_memory()),
             cert_validity: Duration::days(365),
             tokens: Arc::new(EnrollmentTokenStore::in_memory()),
-            requires_token: false,
+            enrollment_mode: EnrollmentMode::Open,
+            admin_common_name: None,
         })
     }
 
@@ -394,20 +418,31 @@ mod tests {
         assert!(record.is_some());
     }
 
+    /// `Auto` mode *with the admin device already enrolled* -- the state
+    /// that actually locks enrollment down (see `EnrollmentState::is_locked_down`).
+    /// Pre-enrolling the admin directly into the registry (bypassing HTTP)
+    /// simulates "the admin already bootstrapped," the same way other
+    /// tests in this project seed store state directly rather than only
+    /// ever going through the HTTP layer being tested.
     fn test_state_requiring_tokens() -> Arc<EnrollmentState> {
+        let registry = Arc::new(DeviceRegistry::in_memory());
+        registry.enroll("test-admin", "fake-admin-cert-pem", 0).unwrap();
         Arc::new(EnrollmentState {
             ca: CertificateAuthority::generate("MicroTAK Test CA").unwrap(),
-            registry: Arc::new(DeviceRegistry::in_memory()),
+            registry,
             cert_validity: Duration::days(365),
             tokens: Arc::new(EnrollmentTokenStore::in_memory()),
-            requires_token: true,
+            enrollment_mode: EnrollmentMode::Auto,
+            admin_common_name: Some("test-admin".to_string()),
         })
     }
 
-    /// The gate is off by default: `test_state()` already proves enrollment
-    /// works with no token at all (every test above uses it). This proves
-    /// the *other* half: once `requires_token` is on, a request with no
-    /// token at all is rejected, and the device is never registered.
+    /// The gate is off by default (no admin enrolled yet): `test_state()`
+    /// already proves enrollment works with no token at all in that state
+    /// (every test above uses it). This proves the *other* half: once the
+    /// admin device has actually enrolled under `Auto` mode, a request
+    /// with no token at all is rejected, and the device is never
+    /// registered.
     #[tokio::test]
     async fn rejects_enrollment_with_no_token_when_gating_is_enabled() {
         let state = test_state_requiring_tokens();
@@ -509,5 +544,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 403);
+    }
+
+    /// `Open` is a real, permanent override: enrollment stays open even
+    /// once the admin device has enrolled, unlike `Auto`. Distinguishes
+    /// "we deliberately keep this open" from "Auto just hasn't locked down
+    /// yet" -- both would otherwise look identical from the outside if
+    /// this branch were ever accidentally collapsed into `Auto`'s check.
+    #[tokio::test]
+    async fn open_mode_stays_open_even_after_the_admin_has_enrolled() {
+        let registry = Arc::new(DeviceRegistry::in_memory());
+        registry.enroll("open-mode-admin", "fake-cert-pem", 0).unwrap();
+        let state = Arc::new(EnrollmentState {
+            ca: CertificateAuthority::generate("MicroTAK Test CA").unwrap(),
+            registry,
+            cert_validity: Duration::days(365),
+            tokens: Arc::new(EnrollmentTokenStore::in_memory()),
+            enrollment_mode: EnrollmentMode::Open,
+            admin_common_name: Some("open-mode-admin".to_string()),
+        });
+        let base_url = spawn_server(state).await;
+
+        let (csr_pem, _key) = build_csr("device-still-open").unwrap();
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(csr_pem)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
     }
 }
