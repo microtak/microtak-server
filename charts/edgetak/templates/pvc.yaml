@@ -1,0 +1,35 @@
+{{- if and .Values.persistence.data.enabled (not .Values.persistence.data.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "edgetak.dataClaimName" . }}
+  labels:
+    {{- include "edgetak.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.data.accessMode }}
+  {{- if .Values.persistence.data.storageClassName }}
+  storageClassName: {{ .Values.persistence.data.storageClassName }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.data.size }}
+{{- end }}
+---
+{{- if and .Values.persistence.backup.enabled (not .Values.persistence.backup.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "edgetak.backupClaimName" . }}
+  labels:
+    {{- include "edgetak.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.backup.accessMode }}
+  {{- if .Values.persistence.backup.storageClassName }}
+  storageClassName: {{ .Values.persistence.backup.storageClassName }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.backup.size }}
+{{- end }}

@@ -1,0 +1,11 @@
+/target
+/data
+/backup
+.git
+.gitignore
+Dockerfile
+.dockerignore
+docker-compose.yml
+charts
+edgetak.toml
+*.md

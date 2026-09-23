@@ -1,0 +1,21 @@
+services:
+  edgetak:
+    build: .
+    image: edgetak:latest
+    restart: unless-stopped
+    ports:
+      # host:container -- enrollment, Marti API (mTLS), plain-TCP CoT, mTLS CoT.
+      - "8446:8446"
+      - "8443:8443"
+      - "8087:8087"
+      - "8089:8089"
+    volumes:
+      - edgetak-data:/var/lib/edgetak/data
+      - edgetak-backup:/var/lib/edgetak/backup
+      # Uncomment to override defaults with your own edgetak.toml (see
+      # README.md "Building and running" for the available fields):
+      # - ./edgetak.toml:/etc/edgetak/edgetak.toml:ro
+
+volumes:
+  edgetak-data:
+  edgetak-backup:

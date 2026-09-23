@@ -1,0 +1,33 @@
+EdgeTAK has been deployed as {{ include "edgetak.fullname" . }}.
+
+Service ports (via {{ .Values.service.type }} service {{ include "edgetak.fullname" . }}):
+  enrollment  {{ .Values.service.ports.enrollment }}  (plain HTTP, unauthenticated CSR signing)
+  marti-api   {{ .Values.service.ports.martiApi }}  (mTLS, missions/DataSync/clientEndPoints)
+  plain-tcp   {{ .Values.service.ports.plainTcp }}  (unauthenticated CoT relay)
+  mtls        {{ .Values.service.ports.mtls }}  (mTLS CoT relay)
+
+{{- if eq .Values.service.type "ClusterIP" }}
+Reach it from inside the cluster, or port-forward to try it locally:
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "edgetak.fullname" . }} 8446:{{ .Values.service.ports.enrollment }} 8443:{{ .Values.service.ports.martiApi }} 8087:{{ .Values.service.ports.plainTcp }} 8089:{{ .Values.service.ports.mtls }}
+{{- end }}
+
+Enroll a device to get started (see the main repo's README "Building and
+running" for what enrollment actually does):
+  openssl req -new -newkey rsa:2048 -nodes -keyout device.key -subj "/CN=my-device" -out device.csr
+  curl -X POST http://<enrollment-address>:{{ .Values.service.ports.enrollment }}/Marti/api/tls/signClient/v2 \
+    -H "Content-Type: application/octet-stream" --data-binary @device.csr
+
+{{- if not .Values.persistence.data.enabled }}
+
+WARNING: persistence.data.enabled is false -- the CA, device registry, and
+mission store live only in the pod's ephemeral storage and will be lost on
+every restart, including regenerating a brand new CA (which invalidates
+every previously-issued client certificate). Fine for a quick trial, not
+for anything real.
+{{- end }}
+{{- if and .Values.config.backup.enabled (not .Values.persistence.backup.enabled) }}
+
+WARNING: config.backup.enabled is true but persistence.backup.enabled is
+false -- backups are being written to the pod's ephemeral storage and will
+be lost on rescheduling. Enable persistence.backup too for a real backup.
+{{- end }}

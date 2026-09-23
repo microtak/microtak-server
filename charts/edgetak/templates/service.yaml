@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "edgetak.fullname" . }}
+  labels:
+    {{- include "edgetak.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "edgetak.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: enrollment
+      port: {{ .Values.service.ports.enrollment }}
+      targetPort: enrollment
+      protocol: TCP
+    - name: marti-api
+      port: {{ .Values.service.ports.martiApi }}
+      targetPort: marti-api
+      protocol: TCP
+    - name: plain-tcp
+      port: {{ .Values.service.ports.plainTcp }}
+      targetPort: plain-tcp
+      protocol: TCP
+    - name: mtls
+      port: {{ .Values.service.ports.mtls }}
+      targetPort: mtls
+      protocol: TCP

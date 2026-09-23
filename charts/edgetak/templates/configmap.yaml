@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "edgetak.fullname" . }}-config
+  labels:
+    {{- include "edgetak.labels" . | nindent 4 }}
+data:
+  edgetak.toml: |
+    bind_host = {{ .Values.config.bindHost | quote }}
+    ca_common_name = {{ .Values.config.caCommonName | quote }}
+    server_common_name = {{ .Values.config.serverCommonName | quote }}
+    cert_validity_days = {{ .Values.config.certValidityDays }}
+    enrollment_port = {{ .Values.service.ports.enrollment }}
+    marti_api_port = {{ .Values.service.ports.martiApi }}
+    plain_tcp_port = {{ .Values.service.ports.plainTcp }}
+    mtls_port = {{ .Values.service.ports.mtls }}
+    # Fixed to the mounted volumes -- see values.yaml's `config` comment.
+    data_dir = "/var/lib/edgetak/data"
+    backup_dir = "/var/lib/edgetak/backup"
+    backup_enabled = {{ .Values.config.backup.enabled }}
+    backup_interval_seconds = {{ .Values.config.backup.intervalSeconds }}
+    backup_offsite_command = [{{ range $i, $part := .Values.config.backup.offsiteCommand }}{{ if $i }}, {{ end }}{{ $part | quote }}{{ end }}]

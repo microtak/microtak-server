@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "edgetak.fullname" . }}
+  labels:
+    {{- include "edgetak.labels" . | nindent 4 }}
+spec:
+  # Fixed at 1 -- see values.yaml's replicaCount comment on why this isn't
+  # horizontally scalable. Recreate (not RollingUpdate) because the data PVC
+  # is ReadWriteOnce: a rolling update would try to schedule a second pod
+  # against the same volume before the first releases it.
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "edgetak.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "edgetak.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: edgetak
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: EDGETAK_CONFIG
+              value: /etc/edgetak/edgetak.toml
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: enrollment
+              containerPort: {{ .Values.service.ports.enrollment }}
+            - name: marti-api
+              containerPort: {{ .Values.service.ports.martiApi }}
+            - name: plain-tcp
+              containerPort: {{ .Values.service.ports.plainTcp }}
+            - name: mtls
+              containerPort: {{ .Values.service.ports.mtls }}
+          # The enrollment endpoint is plain, unauthenticated HTTP by design
+          # (a device has no cert yet) -- GET /Marti/api/tls/config is a
+          # real, cheap, always-available route on it, so it doubles as a
+          # health check without needing a dedicated one.
+          livenessProbe:
+            httpGet:
+              path: /Marti/api/tls/config
+              port: enrollment
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /Marti/api/tls/config
+              port: enrollment
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/edgetak
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/edgetak/data
+            {{- if .Values.persistence.backup.enabled }}
+            - name: backup
+              mountPath: /var/lib/edgetak/backup
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "edgetak.fullname" . }}-config
+        - name: data
+          {{- if .Values.persistence.data.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "edgetak.dataClaimName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.persistence.backup.enabled }}
+        - name: backup
+          persistentVolumeClaim:
+            claimName: {{ include "edgetak.backupClaimName" . }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

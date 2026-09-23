@@ -1,0 +1,102 @@
+# Default values for the edgetak chart.
+
+image:
+  repository: edgetak
+  # Defaults to .Chart.AppVersion when unset.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# EdgeTAK is a single stateful "island" instance, not a horizontally
+# scalable stateless service -- its CA, device registry, and mission store
+# all live on the one attached volume. Do not scale this above 1; a second
+# replica would either fight over the same volume (ReadWriteOnce) or, if
+# each got its own volume, silently split into two different servers with
+# two different CAs. Run additional independent EdgeTAK islands as separate
+# `helm install` releases instead.
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  ports:
+    enrollment: 8446
+    martiApi: 8443
+    plainTcp: 8087
+    mtls: 8089
+
+persistence:
+  data:
+    enabled: true
+    size: 1Gi
+    storageClassName: ""
+    accessMode: ReadWriteOnce
+    # Use an existing PVC instead of creating one.
+    existingClaim: ""
+  backup:
+    # Off by default, matching config.backup.enabled below. If you turn on
+    # config.backup.enabled without also enabling this, backups land on the
+    # pod's writable container layer -- functional, but lost on pod
+    # rescheduling, not a real backup. Turn both on together for anything
+    # that matters.
+    enabled: false
+    size: 1Gi
+    storageClassName: ""
+    accessMode: ReadWriteOnce
+    existingClaim: ""
+
+# Rendered into a ConfigMap at /etc/edgetak/edgetak.toml -- see
+# docs/TEST-PLAN.md §10 in the main repo for the full field reference.
+# data_dir and backup_dir are fixed by this chart to the mounted volume
+# paths (/var/lib/edgetak/data, /var/lib/edgetak/backup) and are not
+# exposed here -- overriding them would point the app outside its
+# persistent volumes.
+config:
+  bindHost: "0.0.0.0"
+  caCommonName: "EdgeTAK CA"
+  serverCommonName: "edgetak-server"
+  certValidityDays: 365
+  backup:
+    enabled: false
+    intervalSeconds: 3600
+    # e.g. ["rsync", "-a", "{src}/", "user@host:/backups/edgetak/"] -- the
+    # image ships rsync and an ssh client for exactly this. An SSH private
+    # key/known_hosts for this needs its own Secret volume mount, not
+    # provided by this chart -- add one via `extraVolumes`/`extraVolumeMounts`
+    # below if you need offsite shipping.
+    offsiteCommand: []
+
+extraVolumes: []
+extraVolumeMounts: []
+extraEnv: []
+
+resources: {}
+# Example:
+# resources:
+#   requests:
+#     cpu: 100m
+#     memory: 64Mi
+#   limits:
+#     memory: 256Mi
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 10001
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
