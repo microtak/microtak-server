@@ -18,8 +18,10 @@ per-request identity-claim enforcement — hash-addressed DataSync file
 content storage with server-verified hashes and atomic writes, a
 `GET /Marti/api/clientEndPoints` endpoint backed by live connections, an
 optional TOML config file, persistence (CA, device registry, mission store,
-and uploaded content all survive a restart), and periodic local + optional
-offsite backup (off by default). No mesh-sync layer yet — see
+and uploaded content all survive a restart), periodic local + optional
+offsite backup (off by default), and opt-in enrollment invite tokens plus a
+minimal admin API to mint/list/revoke them (off by default). No mesh-sync
+layer yet — see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for exactly what's built vs.
 still design-stage.
 
@@ -77,7 +79,9 @@ src/
   marti/missions.rs       — Marti missions HTTP API (mTLS-authenticated)
   marti/client_endpoints.rs — GET /Marti/api/clientEndPoints, backed by live connections
   marti/content.rs        — DataSync file content upload/download by hash
+  marti/admin.rs           — mint/list/revoke enrollment invite tokens (mTLS admin API)
   content_store.rs        — hash-addressed content-addressed file storage
+  enrollment_tokens.rs     — enrollment invite tokens: mint, validate, consume, revoke
   backup.rs               — periodic local + optional offsite backup of data_dir
   transport/codec.rs     — incremental CoT XML stream decoder
   transport/hub.rs       — shared cross-transport broadcast bus
