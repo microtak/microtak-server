@@ -1,11 +1,11 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "edgetak.fullname" . }}-config
+  name: {{ include "microtak-server.fullname" . }}-config
   labels:
-    {{- include "edgetak.labels" . | nindent 4 }}
+    {{- include "microtak-server.labels" . | nindent 4 }}
 data:
-  edgetak.toml: |
+  microtak.toml: |
     bind_host = {{ .Values.config.bindHost | quote }}
     ca_common_name = {{ .Values.config.caCommonName | quote }}
     server_common_name = {{ .Values.config.serverCommonName | quote }}
@@ -15,8 +15,8 @@ data:
     plain_tcp_port = {{ .Values.service.ports.plainTcp }}
     mtls_port = {{ .Values.service.ports.mtls }}
     # Fixed to the mounted volumes -- see values.yaml's `config` comment.
-    data_dir = "/var/lib/edgetak/data"
-    backup_dir = "/var/lib/edgetak/backup"
+    data_dir = "/var/lib/microtak-server/data"
+    backup_dir = "/var/lib/microtak-server/backup"
     backup_enabled = {{ .Values.config.backup.enabled }}
     backup_interval_seconds = {{ .Values.config.backup.intervalSeconds }}
     backup_offsite_command = [{{ range $i, $part := .Values.config.backup.offsiteCommand }}{{ if $i }}, {{ end }}{{ $part | quote }}{{ end }}]

@@ -1,9 +1,9 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "edgetak.fullname" . }}
+  name: {{ include "microtak-server.fullname" . }}
   labels:
-    {{- include "edgetak.labels" . | nindent 4 }}
+    {{- include "microtak-server.labels" . | nindent 4 }}
 spec:
   # Fixed at 1 -- see values.yaml's replicaCount comment on why this isn't
   # horizontally scalable. Recreate (not RollingUpdate) because the data PVC
@@ -14,7 +14,7 @@ spec:
     type: Recreate
   selector:
     matchLabels:
-      {{- include "edgetak.selectorLabels" . | nindent 6 }}
+      {{- include "microtak-server.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       annotations:
@@ -23,7 +23,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       labels:
-        {{- include "edgetak.selectorLabels" . | nindent 8 }}
+        {{- include "microtak-server.selectorLabels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -35,14 +35,14 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-        - name: edgetak
+        - name: microtak
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           env:
-            - name: EDGETAK_CONFIG
-              value: /etc/edgetak/edgetak.toml
+            - name: MICROTAK_CONFIG
+              value: /etc/microtak/microtak.toml
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -73,13 +73,13 @@ spec:
             periodSeconds: 10
           volumeMounts:
             - name: config
-              mountPath: /etc/edgetak
+              mountPath: /etc/microtak
               readOnly: true
             - name: data
-              mountPath: /var/lib/edgetak/data
+              mountPath: /var/lib/microtak-server/data
             {{- if .Values.persistence.backup.enabled }}
             - name: backup
-              mountPath: /var/lib/edgetak/backup
+              mountPath: /var/lib/microtak-server/backup
             {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
@@ -89,18 +89,18 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: {{ include "edgetak.fullname" . }}-config
+            name: {{ include "microtak-server.fullname" . }}-config
         - name: data
           {{- if .Values.persistence.data.enabled }}
           persistentVolumeClaim:
-            claimName: {{ include "edgetak.dataClaimName" . }}
+            claimName: {{ include "microtak-server.dataClaimName" . }}
           {{- else }}
           emptyDir: {}
           {{- end }}
         {{- if .Values.persistence.backup.enabled }}
         - name: backup
           persistentVolumeClaim:
-            claimName: {{ include "edgetak.backupClaimName" . }}
+            claimName: {{ include "microtak-server.backupClaimName" . }}
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

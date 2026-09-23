@@ -1,6 +1,6 @@
-EdgeTAK has been deployed as {{ include "edgetak.fullname" . }}.
+MicroTAK has been deployed as {{ include "microtak-server.fullname" . }}.
 
-Service ports (via {{ .Values.service.type }} service {{ include "edgetak.fullname" . }}):
+Service ports (via {{ .Values.service.type }} service {{ include "microtak-server.fullname" . }}):
   enrollment  {{ .Values.service.ports.enrollment }}  (plain HTTP, unauthenticated CSR signing)
   marti-api   {{ .Values.service.ports.martiApi }}  (mTLS, missions/DataSync/clientEndPoints)
   plain-tcp   {{ .Values.service.ports.plainTcp }}  (unauthenticated CoT relay)
@@ -8,7 +8,7 @@ Service ports (via {{ .Values.service.type }} service {{ include "edgetak.fullna
 
 {{- if eq .Values.service.type "ClusterIP" }}
 Reach it from inside the cluster, or port-forward to try it locally:
-  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "edgetak.fullname" . }} 8446:{{ .Values.service.ports.enrollment }} 8443:{{ .Values.service.ports.martiApi }} 8087:{{ .Values.service.ports.plainTcp }} 8089:{{ .Values.service.ports.mtls }}
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "microtak-server.fullname" . }} 8446:{{ .Values.service.ports.enrollment }} 8443:{{ .Values.service.ports.martiApi }} 8087:{{ .Values.service.ports.plainTcp }} 8089:{{ .Values.service.ports.mtls }}
 {{- end }}
 
 Enroll a device to get started (see the main repo's README "Building and

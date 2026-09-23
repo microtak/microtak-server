@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "edgetak.fullname" . }}
+  name: {{ include "microtak-server.fullname" . }}
   labels:
-    {{- include "edgetak.labels" . | nindent 4 }}
+    {{- include "microtak-server.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.service.type }}
   selector:
-    {{- include "edgetak.selectorLabels" . | nindent 4 }}
+    {{- include "microtak-server.selectorLabels" . | nindent 4 }}
   ports:
     - name: enrollment
       port: {{ .Values.service.ports.enrollment }}

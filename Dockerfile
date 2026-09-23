@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Cache dependency compilation separately from source changes: build a
 # throwaway binary against just the manifest first, so `cargo build` only
-# recompiles edgetak's own code (not its whole dependency tree) on a
+# recompiles microtak-server's own code (not its whole dependency tree) on a
 # source-only change.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src \
@@ -21,7 +21,7 @@ RUN mkdir -p src \
 
 COPY src ./src
 RUN touch src/main.rs src/lib.rs \
-    && cargo build --release --locked --bin edgetakd
+    && cargo build --release --locked --bin microtakd
 
 # ---- Runtime stage --------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -38,22 +38,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tini \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --system --create-home --home-dir /var/lib/edgetak --uid 10001 --shell /usr/sbin/nologin edgetak
+RUN useradd --system --create-home --home-dir /var/lib/microtak-server --uid 10001 --shell /usr/sbin/nologin microtak
 
-COPY --from=builder /build/target/release/edgetakd /usr/local/bin/edgetakd
+COPY --from=builder /build/target/release/microtakd /usr/local/bin/microtakd
 
-WORKDIR /var/lib/edgetak
+WORKDIR /var/lib/microtak-server
 # data_dir/backup_dir default to relative paths ("./data", "./backup"),
 # resolved against this working directory -- so they land here, under the
-# two volumes below, without needing an edgetak.toml at all.
-RUN mkdir -p data backup && chown -R edgetak:edgetak /var/lib/edgetak
+# two volumes below, without needing a microtak.toml at all.
+RUN mkdir -p data backup && chown -R microtak:microtak /var/lib/microtak-server
 
-ENV EDGETAK_CONFIG=/etc/edgetak/edgetak.toml
-VOLUME ["/var/lib/edgetak/data", "/var/lib/edgetak/backup"]
+ENV MICROTAK_CONFIG=/etc/microtak/microtak.toml
+VOLUME ["/var/lib/microtak-server/data", "/var/lib/microtak-server/backup"]
 
 # enrollment (plain HTTP), marti_api (mTLS), plain_tcp (unauthenticated CoT),
 # mtls (mTLS CoT) -- see src/app.rs::AppConfig::default.
 EXPOSE 8446 8443 8087 8089
 
-USER edgetak
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/edgetakd"]
+USER microtak
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/microtakd"]

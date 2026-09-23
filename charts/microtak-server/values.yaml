@@ -1,7 +1,7 @@
-# Default values for the edgetak chart.
+# Default values for the microtak-server chart.
 
 image:
-  repository: edgetak
+  repository: microtak-server
   # Defaults to .Chart.AppVersion when unset.
   tag: ""
   pullPolicy: IfNotPresent
@@ -10,12 +10,12 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-# EdgeTAK is a single stateful "island" instance, not a horizontally
+# MicroTAK is a single stateful "island" instance, not a horizontally
 # scalable stateless service -- its CA, device registry, and mission store
 # all live on the one attached volume. Do not scale this above 1; a second
 # replica would either fight over the same volume (ReadWriteOnce) or, if
 # each got its own volume, silently split into two different servers with
-# two different CAs. Run additional independent EdgeTAK islands as separate
+# two different CAs. Run additional independent MicroTAK islands as separate
 # `helm install` releases instead.
 replicaCount: 1
 
@@ -47,21 +47,21 @@ persistence:
     accessMode: ReadWriteOnce
     existingClaim: ""
 
-# Rendered into a ConfigMap at /etc/edgetak/edgetak.toml -- see
+# Rendered into a ConfigMap at /etc/microtak/microtak.toml -- see
 # docs/TEST-PLAN.md §10 in the main repo for the full field reference.
 # data_dir and backup_dir are fixed by this chart to the mounted volume
-# paths (/var/lib/edgetak/data, /var/lib/edgetak/backup) and are not
+# paths (/var/lib/microtak-server/data, /var/lib/microtak-server/backup) and are not
 # exposed here -- overriding them would point the app outside its
 # persistent volumes.
 config:
   bindHost: "0.0.0.0"
-  caCommonName: "EdgeTAK CA"
-  serverCommonName: "edgetak-server"
+  caCommonName: "MicroTAK CA"
+  serverCommonName: "microtak-server"
   certValidityDays: 365
   backup:
     enabled: false
     intervalSeconds: 3600
-    # e.g. ["rsync", "-a", "{src}/", "user@host:/backups/edgetak/"] -- the
+    # e.g. ["rsync", "-a", "{src}/", "user@host:/backups/microtak/"] -- the
     # image ships rsync and an ssh client for exactly this. An SSH private
     # key/known_hosts for this needs its own Secret volume mount, not
     # provided by this chart -- add one via `extraVolumes`/`extraVolumeMounts`

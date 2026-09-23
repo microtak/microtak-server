@@ -7,5 +7,5 @@ Dockerfile
 .dockerignore
 docker-compose.yml
 charts
-edgetak.toml
+microtak.toml
 *.md

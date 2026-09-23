@@ -1,7 +1,7 @@
 services:
-  edgetak:
+  microtak-server:
     build: .
-    image: edgetak:latest
+    image: microtak-server:latest
     restart: unless-stopped
     ports:
       # host:container -- enrollment, Marti API (mTLS), plain-TCP CoT, mTLS CoT.
@@ -10,12 +10,12 @@ services:
       - "8087:8087"
       - "8089:8089"
     volumes:
-      - edgetak-data:/var/lib/edgetak/data
-      - edgetak-backup:/var/lib/edgetak/backup
-      # Uncomment to override defaults with your own edgetak.toml (see
+      - microtak-data:/var/lib/microtak-server/data
+      - microtak-backup:/var/lib/microtak-server/backup
+      # Uncomment to override defaults with your own microtak.toml (see
       # README.md "Building and running" for the available fields):
-      # - ./edgetak.toml:/etc/edgetak/edgetak.toml:ro
+      # - ./microtak.toml:/etc/microtak/microtak.toml:ro
 
 volumes:
-  edgetak-data:
-  edgetak-backup:
+  microtak-data:
+  microtak-backup:
