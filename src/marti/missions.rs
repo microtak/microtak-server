@@ -14,6 +14,20 @@
 //! can't act as any identity it merely claims in a request body/query
 //! param, closing the gap this module used to have.
 //!
+//! **Roles (`docs/ARCHITECTURE.md` "Enrollment lockdown / admin API" and
+//! the mission-roles follow-up it names)**: on top of the identity-claim
+//! check above, some actions also require a specific
+//! [`crate::missions::MissionRole`] on the target mission. `delete_mission`
+//! and `update_mission` require `Owner`; `add_content` requires *any* role
+//! (`Owner` or `Subscriber`) — a caller with no role on the mission at all
+//! can read it (`GET`, unrestricted, see below) but can't modify it.
+//! `assign_role`/`revoke_role` (`PUT`/`DELETE /missions/:name/role`) are
+//! `Owner`-only. **Deliberately unrestricted**: `list_missions`,
+//! `get_mission`, and `get_changes` remain open to any authenticated
+//! caller regardless of role, matching real collaborative
+//! situational-awareness use (discovering/previewing a mission you haven't
+//! joined yet) — only mutating actions are role-gated.
+//!
 //! **`PUT` vs `PATCH` (TC-MARTI-02/12)**: `PUT /missions/:name` is
 //! strict-create-only (409 if the name is already taken); updates go
 //! through `PATCH /missions/:name` and only touch the fields provided.
@@ -33,7 +47,9 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 
 use super::PeerIdentity;
-use crate::missions::{Mission, MissionContentRef, MissionError, MissionStore, MissionUpdate};
+use crate::missions::{
+    Mission, MissionContentRef, MissionError, MissionRole, MissionStore, MissionUpdate,
+};
 
 pub fn router(store: Arc<MissionStore>) -> Router {
     Router::new()
@@ -53,6 +69,11 @@ pub fn router(store: Arc<MissionStore>) -> Router {
         .route(
             "/Marti/api/missions/:name/subscription",
             put(subscribe).delete(unsubscribe),
+        )
+        .route("/Marti/api/missions/:name/role", put(assign_role))
+        .route(
+            "/Marti/api/missions/:name/role/:uid",
+            axum::routing::delete(revoke_role),
         )
         .with_state(store)
 }
@@ -97,7 +118,40 @@ fn mission_error_response(error: MissionError) -> Response {
         MissionError::NotFound(name) => {
             error_response(StatusCode::NOT_FOUND, format!("no mission named '{name}'"))
         }
+        MissionError::CannotRemoveLastOwner { name, uid } => error_response(
+            StatusCode::CONFLICT,
+            format!("cannot remove '{uid}' from mission '{name}': it is the last remaining owner"),
+        ),
         other => error_response(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    }
+}
+
+/// `Owner`-only actions (delete, update, role management). `None` if
+/// `identity` holds `Owner` on `name`; `Some(rejection)` otherwise --
+/// including if the mission doesn't exist, so a caller can't distinguish
+/// "not found" from "not yours" through this check alone (the handler's own
+/// subsequent `NotFound` handling covers the former distinctly where it
+/// matters, e.g. after a real mutation attempt).
+fn require_owner(store: &MissionStore, name: &str, identity: &PeerIdentity) -> Option<Response> {
+    match store.role_of(name, &identity.0) {
+        Some(MissionRole::Owner) => None,
+        _ => Some(error_response(
+            StatusCode::FORBIDDEN,
+            "this action requires the Owner role on this mission".to_string(),
+        )),
+    }
+}
+
+/// Actions any role holder may do (currently just adding content) --
+/// `Owner` or `Subscriber`, rejecting a caller with no role on the mission
+/// at all.
+fn require_any_role(store: &MissionStore, name: &str, identity: &PeerIdentity) -> Option<Response> {
+    match store.role_of(name, &identity.0) {
+        Some(_) => None,
+        None => Some(error_response(
+            StatusCode::FORBIDDEN,
+            "this action requires a role (Owner or Subscriber) on this mission".to_string(),
+        )),
     }
 }
 
@@ -164,6 +218,9 @@ async fn update_mission(
     if let Some(response) = require_matching_identity(&identity, &request.actor_uid) {
         return response;
     }
+    if let Some(response) = require_owner(&store, &name, &identity) {
+        return response;
+    }
     let update = MissionUpdate {
         description: request.description,
         keywords: request.keywords,
@@ -176,8 +233,12 @@ async fn update_mission(
 
 async fn delete_mission(
     State(store): State<Arc<MissionStore>>,
+    Extension(identity): Extension<PeerIdentity>,
     Path(name): Path<String>,
 ) -> Response {
+    if let Some(response) = require_owner(&store, &name, &identity) {
+        return response;
+    }
     match store.delete(&name) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => mission_error_response(error),
@@ -210,6 +271,9 @@ async fn add_content(
     Json(request): Json<AddContentRequest>,
 ) -> Response {
     if let Some(response) = require_matching_identity(&identity, &request.creator_uid) {
+        return response;
+    }
+    if let Some(response) = require_any_role(&store, &name, &identity) {
         return response;
     }
     let content = MissionContentRef {
@@ -258,6 +322,47 @@ async fn unsubscribe(
     }
     match store.unsubscribe(&name, &query.uid, now_unix()) {
         Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => mission_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct AssignRoleRequest {
+    uid: String,
+    role: MissionRole,
+}
+
+/// `Owner`-only: grant (or overwrite) another identity's role on this
+/// mission. Rejects demoting the mission's last `Owner` (see
+/// `MissionStore::assign_role`'s own doc comment) with 409, the same
+/// status this module already uses for other real state conflicts.
+async fn assign_role(
+    State(store): State<Arc<MissionStore>>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(name): Path<String>,
+    Json(request): Json<AssignRoleRequest>,
+) -> Response {
+    if let Some(response) = require_owner(&store, &name, &identity) {
+        return response;
+    }
+    match store.assign_role(&name, &request.uid, request.role, &identity.0, now_unix()) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => mission_error_response(error),
+    }
+}
+
+/// `Owner`-only: revoke another identity's role entirely. Same last-owner
+/// protection as [`assign_role`].
+async fn revoke_role(
+    State(store): State<Arc<MissionStore>>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path((name, uid)): Path<(String, String)>,
+) -> Response {
+    if let Some(response) = require_owner(&store, &name, &identity) {
+        return response;
+    }
+    match store.revoke_role(&name, &uid, &identity.0, now_unix()) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => mission_error_response(error),
     }
 }
@@ -575,5 +680,245 @@ mod tests {
         let mut app = app();
         let response = get_as(&mut app, "user-1", "/Marti/api/missions/nope").await;
         assert_eq!(response.status(), Status::NOT_FOUND);
+    }
+
+    /// A device that isn't the mission's Owner can't delete it, even if it
+    /// correctly claims its own identity everywhere -- the real gap this
+    /// project's own red-team review flagged as historically missing on
+    /// this exact handler.
+    #[tokio::test]
+    async fn rejects_delete_from_a_non_owner() {
+        let mut app = app();
+        json_request_as(
+            &mut app,
+            "owner",
+            "PUT",
+            "/Marti/api/missions/m",
+            serde_json::json!({"creatorUid": "owner"}),
+        )
+        .await;
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/Marti/api/missions/m")
+            .extension(PeerIdentity("someone-else".to_string()))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), Status::FORBIDDEN);
+
+        // The rejected request must not have deleted anything.
+        let response = get_as(&mut app, "owner", "/Marti/api/missions/m").await;
+        assert_eq!(response.status(), Status::OK);
+    }
+
+    /// The Owner (the creator, by default) can delete their own mission.
+    #[tokio::test]
+    async fn owner_can_delete_their_own_mission() {
+        let mut app = app();
+        json_request_as(
+            &mut app,
+            "owner",
+            "PUT",
+            "/Marti/api/missions/m",
+            serde_json::json!({"creatorUid": "owner"}),
+        )
+        .await;
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/Marti/api/missions/m")
+            .extension(PeerIdentity("owner".to_string()))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), Status::NO_CONTENT);
+    }
+
+    /// A non-owner (even one correctly claiming its own actorUid) can't
+    /// update mission metadata.
+    #[tokio::test]
+    async fn rejects_update_from_a_non_owner() {
+        let mut app = app();
+        json_request_as(
+            &mut app,
+            "owner",
+            "PUT",
+            "/Marti/api/missions/m",
+            serde_json::json!({"creatorUid": "owner", "description": "original"}),
+        )
+        .await;
+
+        let (status, _) = json_request_as(
+            &mut app,
+            "someone-else",
+            "PATCH",
+            "/Marti/api/missions/m",
+            serde_json::json!({"description": "tampered", "actorUid": "someone-else"}),
+        )
+        .await;
+        assert_eq!(status, Status::FORBIDDEN);
+
+        let response = get_as(&mut app, "owner", "/Marti/api/missions/m").await;
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mission: Mission = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(mission.description.as_deref(), Some("original"));
+    }
+
+    /// A device with no role on the mission at all (never subscribed, not
+    /// the creator) can't add content, even if the identity-claim check
+    /// alone would have let it through.
+    #[tokio::test]
+    async fn rejects_add_content_from_a_device_with_no_role() {
+        let mut app = app();
+        json_request_as(
+            &mut app,
+            "owner",
+            "PUT",
+            "/Marti/api/missions/m",
+            serde_json::json!({"creatorUid": "owner"}),
+        )
+        .await;
+
+        let (status, _) = json_request_as(
+            &mut app,
+            "uninvolved-device",
+            "PUT",
+            "/Marti/api/missions/m/contents",
+            serde_json::json!({"hash": "abc123", "filename": "f.kml", "creatorUid": "uninvolved-device"}),
+        )
+        .await;
+        assert_eq!(status, Status::FORBIDDEN);
+    }
+
+    /// A Subscriber (not just the Owner) can add content -- real
+    /// collaborative Data Sync usage, not locked to the creator alone.
+    #[tokio::test]
+    async fn subscriber_can_add_content() {
+        let mut app = app();
+        json_request_as(
+            &mut app,
+            "owner",
+            "PUT",
+            "/Marti/api/missions/m",
+            serde_json::json!({"creatorUid": "owner"}),
+        )
+        .await;
+        let subscribe_request = Request::builder()
+            .method("PUT")
+            .uri("/Marti/api/missions/m/subscription?uid=subscriber-1")
+            .extension(PeerIdentity("subscriber-1".to_string()))
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(subscribe_request).await.unwrap();
+
+        let (status, _) = json_request_as(
+            &mut app,
+            "subscriber-1",
+            "PUT",
+            "/Marti/api/missions/m/contents",
+            serde_json::json!({"hash": "abc123", "filename": "f.kml", "creatorUid": "subscriber-1"}),
+        )
+        .await;
+        assert_eq!(status, Status::OK);
+    }
+
+    /// The Owner can promote another identity to Owner via the role API.
+    #[tokio::test]
+    async fn owner_can_assign_a_role() {
+        let mut app = app();
+        json_request_as(
+            &mut app,
+            "owner",
+            "PUT",
+            "/Marti/api/missions/m",
+            serde_json::json!({"creatorUid": "owner"}),
+        )
+        .await;
+
+        let (status, _) = json_request_as(
+            &mut app,
+            "owner",
+            "PUT",
+            "/Marti/api/missions/m/role",
+            serde_json::json!({"uid": "co-owner", "role": "owner"}),
+        )
+        .await;
+        assert_eq!(status, Status::OK);
+
+        let response = get_as(&mut app, "owner", "/Marti/api/missions/m").await;
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mission: Mission = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(mission.roles.get("co-owner"), Some(&MissionRole::Owner));
+    }
+
+    /// A non-owner can't assign roles to anyone, including themselves.
+    #[tokio::test]
+    async fn non_owner_cannot_assign_roles() {
+        let mut app = app();
+        json_request_as(
+            &mut app,
+            "owner",
+            "PUT",
+            "/Marti/api/missions/m",
+            serde_json::json!({"creatorUid": "owner"}),
+        )
+        .await;
+
+        let (status, _) = json_request_as(
+            &mut app,
+            "someone-else",
+            "PUT",
+            "/Marti/api/missions/m/role",
+            serde_json::json!({"uid": "someone-else", "role": "owner"}),
+        )
+        .await;
+        assert_eq!(status, Status::FORBIDDEN);
+    }
+
+    /// The Owner can revoke another identity's role, and the last-owner
+    /// protection surfaces as a real, distinguishable 409 through the HTTP
+    /// layer, not just at the store level.
+    #[tokio::test]
+    async fn owner_can_revoke_a_role_but_not_the_last_owner() {
+        let mut app = app();
+        json_request_as(
+            &mut app,
+            "owner",
+            "PUT",
+            "/Marti/api/missions/m",
+            serde_json::json!({"creatorUid": "owner"}),
+        )
+        .await;
+        json_request_as(
+            &mut app,
+            "owner",
+            "PUT",
+            "/Marti/api/missions/m/role",
+            serde_json::json!({"uid": "co-owner", "role": "owner"}),
+        )
+        .await;
+
+        let revoke_request = Request::builder()
+            .method("DELETE")
+            .uri("/Marti/api/missions/m/role/co-owner")
+            .extension(PeerIdentity("owner".to_string()))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(revoke_request).await.unwrap();
+        assert_eq!(response.status(), Status::NO_CONTENT);
+
+        let last_owner_request = Request::builder()
+            .method("DELETE")
+            .uri("/Marti/api/missions/m/role/owner")
+            .extension(PeerIdentity("owner".to_string()))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(last_owner_request).await.unwrap();
+        assert_eq!(response.status(), Status::CONFLICT);
     }
 }

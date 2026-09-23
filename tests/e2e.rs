@@ -380,6 +380,143 @@ async fn e2e_missions_api_full_lifecycle() {
     assert_eq!(get_after_delete.status(), 404);
 }
 
+/// Mission roles, end-to-end with two real, separately-enrolled devices --
+/// not the identity-claim check alone (already covered above), the actual
+/// Owner/Subscriber authorization layered on top of it. Exercises the real
+/// collaborative-Data-Sync shape: an outsider can't touch the mission at
+/// all, a subscriber can contribute content but not manage it, and only the
+/// owner can update/delete/manage roles -- with the last-owner protection
+/// surfacing as a real 409 through the live server, not just at the store
+/// level.
+#[tokio::test]
+async fn e2e_mission_roles_enforce_owner_and_subscriber_authorization() {
+    let app = App::bind(test_config()).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    tokio::spawn(app.run());
+
+    let enrollment_base_url = format!("http://{enrollment_addr}");
+    let (owner_cert, owner_key) = enroll(&enrollment_base_url, "mission-owner").await;
+    let (subscriber_cert, subscriber_key) = enroll(&enrollment_base_url, "mission-subscriber").await;
+    let (outsider_cert, outsider_key) = enroll(&enrollment_base_url, "mission-outsider").await;
+
+    let owner_client = mtls_reqwest_client(&ca_cert_pem, &owner_cert, owner_key, marti_api_addr);
+    let subscriber_client =
+        mtls_reqwest_client(&ca_cert_pem, &subscriber_cert, subscriber_key, marti_api_addr);
+    let outsider_client =
+        mtls_reqwest_client(&ca_cert_pem, &outsider_cert, outsider_key, marti_api_addr);
+    let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
+
+    // The creator gets Owner automatically.
+    let create_response = owner_client
+        .put(format!("{base_url}/Marti/api/missions/Roles%20Test"))
+        .json(&serde_json::json!({"creatorUid": "mission-owner"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 201);
+    let mission: serde_json::Value = create_response.json().await.unwrap();
+    assert_eq!(mission["roles"]["mission-owner"], "owner");
+
+    // An outsider (never subscribed) can't add content.
+    let outsider_content = outsider_client
+        .put(format!("{base_url}/Marti/api/missions/Roles%20Test/contents"))
+        .json(&serde_json::json!({"hash": "aaa", "filename": "f.kml", "creatorUid": "mission-outsider"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(outsider_content.status(), 403);
+
+    // Subscribing grants the Subscriber role, which does allow adding content...
+    let subscribe_response = subscriber_client
+        .put(format!(
+            "{base_url}/Marti/api/missions/Roles%20Test/subscription?uid=mission-subscriber"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(subscribe_response.status(), 200);
+
+    let subscriber_content = subscriber_client
+        .put(format!("{base_url}/Marti/api/missions/Roles%20Test/contents"))
+        .json(&serde_json::json!({"hash": "bbb", "filename": "g.kml", "creatorUid": "mission-subscriber"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(subscriber_content.status(), 200);
+
+    // ...but not updating mission metadata or deleting it.
+    let subscriber_update = subscriber_client
+        .patch(format!("{base_url}/Marti/api/missions/Roles%20Test"))
+        .json(&serde_json::json!({"description": "hijacked", "actorUid": "mission-subscriber"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(subscriber_update.status(), 403);
+
+    let subscriber_delete = subscriber_client
+        .delete(format!("{base_url}/Marti/api/missions/Roles%20Test"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(subscriber_delete.status(), 403);
+
+    // The owner promotes the subscriber to co-owner via the real role API...
+    let promote_response = owner_client
+        .put(format!("{base_url}/Marti/api/missions/Roles%20Test/role"))
+        .json(&serde_json::json!({"uid": "mission-subscriber", "role": "owner"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(promote_response.status(), 200);
+
+    // ...after which the former subscriber can update the mission.
+    let now_owner_update = subscriber_client
+        .patch(format!("{base_url}/Marti/api/missions/Roles%20Test"))
+        .json(&serde_json::json!({"description": "co-owned now", "actorUid": "mission-subscriber"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(now_owner_update.status(), 200);
+
+    // With two owners now, demoting one of them is allowed -- only the
+    // *last* owner is protected.
+    let demote_original_owner = owner_client
+        .put(format!("{base_url}/Marti/api/missions/Roles%20Test/role"))
+        .json(&serde_json::json!({"uid": "mission-owner", "role": "subscriber"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(demote_original_owner.status(), 200);
+
+    // ...but now mission-subscriber is the *only* owner, so demoting/revoking
+    // them is rejected with a real 409 through the live server.
+    let demote_last_owner = subscriber_client
+        .put(format!("{base_url}/Marti/api/missions/Roles%20Test/role"))
+        .json(&serde_json::json!({"uid": "mission-subscriber", "role": "subscriber"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(demote_last_owner.status(), 409);
+
+    // The now-demoted-to-Subscriber original owner can no longer delete the
+    // mission; the remaining (last) owner still can.
+    let former_owner_delete = owner_client
+        .delete(format!("{base_url}/Marti/api/missions/Roles%20Test"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(former_owner_delete.status(), 403);
+
+    let last_owner_delete = subscriber_client
+        .delete(format!("{base_url}/Marti/api/missions/Roles%20Test"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(last_owner_delete.status(), 204);
+}
+
 /// TC-MARTI-07/08, end-to-end: upload real file bytes through the running
 /// server, get back the server's own computed hash, reference that hash in
 /// a mission's content list, then download it back and confirm the bytes

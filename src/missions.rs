@@ -47,8 +47,30 @@ pub enum MissionError {
     AlreadyExists(String),
     #[error("no mission found named '{0}'")]
     NotFound(String),
+    #[error("cannot remove '{uid}' from mission '{name}': it is the mission's last remaining owner")]
+    CannotRemoveLastOwner { name: String, uid: String },
     #[error("event log error: {0}")]
     EventLog(#[from] EventLogError),
+}
+
+/// A caller's authorization level on one specific mission -- see
+/// `docs/ARCHITECTURE.md`'s "Mission roles" section for the enforcement
+/// policy built on top of this (which handlers require which role; this
+/// module itself only tracks and queries role assignments, it doesn't
+/// enforce anything -- authorization checks live in `marti::missions`,
+/// matching how `require_matching_identity`'s identity-claim checks
+/// already work).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MissionRole {
+    /// Full control: update, delete, add content, and manage other
+    /// identities' roles. Assigned automatically to a mission's creator.
+    Owner,
+    /// Can add content, but not update mission metadata, delete the
+    /// mission, or manage roles. Assigned automatically on subscribing
+    /// (and removed on unsubscribing) unless the identity already holds
+    /// `Owner`, which subscribing/unsubscribing never changes.
+    Subscriber,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,6 +82,7 @@ pub struct Mission {
     pub keywords: Vec<String>,
     pub contents: Vec<MissionContentRef>,
     pub subscribers: Vec<String>,
+    pub roles: HashMap<String, MissionRole>,
 }
 
 /// A reference to Data Package content associated with a mission — just
@@ -90,6 +113,8 @@ pub enum ChangeType {
     RemoveContent,
     Subscribe,
     Unsubscribe,
+    RoleAssigned,
+    RoleRevoked,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -151,6 +176,19 @@ enum MissionEvent {
     Unsubscribed {
         name: String,
         uid: String,
+        at_unix: i64,
+    },
+    RoleAssigned {
+        name: String,
+        uid: String,
+        role: MissionRole,
+        actor_uid: String,
+        at_unix: i64,
+    },
+    RoleRevoked {
+        name: String,
+        uid: String,
+        actor_uid: String,
         at_unix: i64,
     },
 }
@@ -382,6 +420,105 @@ impl MissionStore {
         apply_event(&mut missions, &event);
         Ok(())
     }
+
+    /// The role `uid` currently holds on mission `name` -- `None` if the
+    /// mission doesn't exist, or `uid` holds no role on it. This is a pure
+    /// query; `marti::missions` is where a returned role actually gets
+    /// enforced against what a given HTTP action requires.
+    pub fn role_of(&self, name: &str, uid: &str) -> Option<MissionRole> {
+        self.missions
+            .read()
+            .unwrap()
+            .get(name)
+            .and_then(|r| r.mission.as_ref())
+            .and_then(|m| m.roles.get(uid).copied())
+    }
+
+    /// Assign (or overwrite) `uid`'s role on `name`. Rejects demoting the
+    /// mission's *last* `Owner` to `Subscriber` -- a mission with zero
+    /// owners can never have its roles managed again, a permanent lockout
+    /// this guards against by construction rather than trusting every
+    /// caller to check first.
+    pub fn assign_role(
+        &self,
+        name: &str,
+        uid: &str,
+        role: MissionRole,
+        actor_uid: &str,
+        now_unix: i64,
+    ) -> Result<(), MissionError> {
+        let mut missions = self.missions.write().unwrap();
+        let mission = missions
+            .get(name)
+            .and_then(|r| r.mission.as_ref())
+            .ok_or_else(|| MissionError::NotFound(name.to_string()))?;
+
+        if role != MissionRole::Owner
+            && mission.roles.get(uid) == Some(&MissionRole::Owner)
+            && count_owners(mission) <= 1
+        {
+            return Err(MissionError::CannotRemoveLastOwner {
+                name: name.to_string(),
+                uid: uid.to_string(),
+            });
+        }
+
+        let event = MissionEvent::RoleAssigned {
+            name: name.to_string(),
+            uid: uid.to_string(),
+            role,
+            actor_uid: actor_uid.to_string(),
+            at_unix: now_unix,
+        };
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply_event(&mut missions, &event);
+        Ok(())
+    }
+
+    /// Revoke `uid`'s role on `name` entirely (they keep no access at all
+    /// afterward). Same last-owner protection as [`Self::assign_role`].
+    pub fn revoke_role(
+        &self,
+        name: &str,
+        uid: &str,
+        actor_uid: &str,
+        now_unix: i64,
+    ) -> Result<(), MissionError> {
+        let mut missions = self.missions.write().unwrap();
+        let mission = missions
+            .get(name)
+            .and_then(|r| r.mission.as_ref())
+            .ok_or_else(|| MissionError::NotFound(name.to_string()))?;
+
+        if mission.roles.get(uid) == Some(&MissionRole::Owner) && count_owners(mission) <= 1 {
+            return Err(MissionError::CannotRemoveLastOwner {
+                name: name.to_string(),
+                uid: uid.to_string(),
+            });
+        }
+
+        let event = MissionEvent::RoleRevoked {
+            name: name.to_string(),
+            uid: uid.to_string(),
+            actor_uid: actor_uid.to_string(),
+            at_unix: now_unix,
+        };
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply_event(&mut missions, &event);
+        Ok(())
+    }
+}
+
+fn count_owners(mission: &Mission) -> usize {
+    mission
+        .roles
+        .values()
+        .filter(|r| **r == MissionRole::Owner)
+        .count()
 }
 
 /// The reducer: apply one durable event to in-memory state. Used both for
@@ -398,6 +535,8 @@ fn apply_event(missions: &mut HashMap<String, MissionRecord>, event: &MissionEve
             keywords,
             at_unix,
         } => {
+            let mut roles = HashMap::new();
+            roles.insert(creator_uid.clone(), MissionRole::Owner);
             let mission = Mission {
                 name: name.clone(),
                 description: description.clone(),
@@ -406,6 +545,7 @@ fn apply_event(missions: &mut HashMap<String, MissionRecord>, event: &MissionEve
                 keywords: keywords.clone(),
                 contents: Vec::new(),
                 subscribers: Vec::new(),
+                roles,
             };
             let record = missions.entry(name.clone()).or_default();
             record.mission = Some(mission);
@@ -482,6 +622,9 @@ fn apply_event(missions: &mut HashMap<String, MissionRecord>, event: &MissionEve
             if let Some(record) = missions.get_mut(name) {
                 if let Some(mission) = record.mission.as_mut() {
                     mission.subscribers.push(uid.clone());
+                    // Subscribing never demotes an existing Owner -- only
+                    // grants Subscriber to an identity with no role yet.
+                    mission.roles.entry(uid.clone()).or_insert(MissionRole::Subscriber);
                 }
                 record.changes.push(MissionChange {
                     change_type: ChangeType::Subscribe,
@@ -495,11 +638,53 @@ fn apply_event(missions: &mut HashMap<String, MissionRecord>, event: &MissionEve
             if let Some(record) = missions.get_mut(name) {
                 if let Some(mission) = record.mission.as_mut() {
                     mission.subscribers.retain(|s| s != uid);
+                    // Unsubscribing only ever removes a Subscriber role --
+                    // an Owner who unsubscribes keeps their Owner role.
+                    if mission.roles.get(uid) == Some(&MissionRole::Subscriber) {
+                        mission.roles.remove(uid);
+                    }
                 }
                 record.changes.push(MissionChange {
                     change_type: ChangeType::Unsubscribe,
                     timestamp_unix: *at_unix,
                     creator_uid: uid.clone(),
+                    content_hash: None,
+                });
+            }
+        }
+        MissionEvent::RoleAssigned {
+            name,
+            uid,
+            role,
+            actor_uid,
+            at_unix,
+        } => {
+            if let Some(record) = missions.get_mut(name) {
+                if let Some(mission) = record.mission.as_mut() {
+                    mission.roles.insert(uid.clone(), *role);
+                }
+                record.changes.push(MissionChange {
+                    change_type: ChangeType::RoleAssigned,
+                    timestamp_unix: *at_unix,
+                    creator_uid: actor_uid.clone(),
+                    content_hash: None,
+                });
+            }
+        }
+        MissionEvent::RoleRevoked {
+            name,
+            uid,
+            actor_uid,
+            at_unix,
+        } => {
+            if let Some(record) = missions.get_mut(name) {
+                if let Some(mission) = record.mission.as_mut() {
+                    mission.roles.remove(uid);
+                }
+                record.changes.push(MissionChange {
+                    change_type: ChangeType::RoleRevoked,
+                    timestamp_unix: *at_unix,
+                    creator_uid: actor_uid.clone(),
                     content_hash: None,
                 });
             }
@@ -672,6 +857,93 @@ mod tests {
     }
 
     #[test]
+    fn creator_gets_owner_role_automatically() {
+        let store = MissionStore::in_memory();
+        store.create("m", None, "user-1", vec![], 1_000).unwrap();
+        assert_eq!(store.role_of("m", "user-1"), Some(MissionRole::Owner));
+        assert_eq!(store.role_of("m", "user-2"), None);
+    }
+
+    #[test]
+    fn subscribing_grants_subscriber_role_and_unsubscribing_removes_it() {
+        let store = MissionStore::in_memory();
+        store.create("m", None, "user-1", vec![], 1_000).unwrap();
+        store.subscribe("m", "user-2", 2_000).unwrap();
+        assert_eq!(store.role_of("m", "user-2"), Some(MissionRole::Subscriber));
+
+        store.unsubscribe("m", "user-2", 3_000).unwrap();
+        assert_eq!(store.role_of("m", "user-2"), None);
+    }
+
+    /// The creator subscribing to their own mission (a real thing a client
+    /// might do) must not demote them from Owner to Subscriber.
+    #[test]
+    fn owner_subscribing_to_their_own_mission_keeps_owner_role() {
+        let store = MissionStore::in_memory();
+        store.create("m", None, "user-1", vec![], 1_000).unwrap();
+        store.subscribe("m", "user-1", 2_000).unwrap();
+        assert_eq!(store.role_of("m", "user-1"), Some(MissionRole::Owner));
+
+        // ...and unsubscribing afterward must not remove it either.
+        store.unsubscribe("m", "user-1", 3_000).unwrap();
+        assert_eq!(store.role_of("m", "user-1"), Some(MissionRole::Owner));
+    }
+
+    #[test]
+    fn owner_can_assign_and_revoke_roles() {
+        let store = MissionStore::in_memory();
+        store.create("m", None, "user-1", vec![], 1_000).unwrap();
+
+        store
+            .assign_role("m", "user-2", MissionRole::Owner, "user-1", 2_000)
+            .unwrap();
+        assert_eq!(store.role_of("m", "user-2"), Some(MissionRole::Owner));
+
+        store.revoke_role("m", "user-2", "user-1", 3_000).unwrap();
+        assert_eq!(store.role_of("m", "user-2"), None);
+    }
+
+    /// The core safety invariant: a mission can never end up with zero
+    /// owners, whether by demotion or outright revocation -- either would
+    /// permanently lock the mission out of ever being managed again.
+    #[test]
+    fn cannot_demote_or_revoke_the_last_owner() {
+        let store = MissionStore::in_memory();
+        store.create("m", None, "user-1", vec![], 1_000).unwrap();
+
+        let demote = store.assign_role("m", "user-1", MissionRole::Subscriber, "user-1", 2_000);
+        assert!(matches!(
+            demote,
+            Err(MissionError::CannotRemoveLastOwner { .. })
+        ));
+        assert_eq!(store.role_of("m", "user-1"), Some(MissionRole::Owner));
+
+        let revoke = store.revoke_role("m", "user-1", "user-1", 2_000);
+        assert!(matches!(
+            revoke,
+            Err(MissionError::CannotRemoveLastOwner { .. })
+        ));
+        assert_eq!(store.role_of("m", "user-1"), Some(MissionRole::Owner));
+    }
+
+    /// With *two* owners, demoting/revoking one is fine -- the mission
+    /// still has an owner left.
+    #[test]
+    fn demoting_one_of_two_owners_is_allowed() {
+        let store = MissionStore::in_memory();
+        store.create("m", None, "user-1", vec![], 1_000).unwrap();
+        store
+            .assign_role("m", "user-2", MissionRole::Owner, "user-1", 2_000)
+            .unwrap();
+
+        store
+            .assign_role("m", "user-1", MissionRole::Subscriber, "user-2", 3_000)
+            .unwrap();
+        assert_eq!(store.role_of("m", "user-1"), Some(MissionRole::Subscriber));
+        assert_eq!(store.role_of("m", "user-2"), Some(MissionRole::Owner));
+    }
+
+    #[test]
     fn persists_across_reload() {
         let dir = std::env::temp_dir().join(format!("microtak-missions-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -725,6 +997,42 @@ mod tests {
         );
         let m2 = replayed.get("m2").unwrap();
         assert_eq!(m2.description.as_deref(), Some("updated"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Role state (auto-assigned Owner/Subscriber *and* explicit
+    /// assign/revoke calls) survives a reload exactly -- roles aren't
+    /// stored as their own field in the event log, they're deterministically
+    /// re-derived by the reducer on every replay from the same
+    /// Created/Subscribed/Unsubscribed/RoleAssigned/RoleRevoked events that
+    /// already existed for other reasons, so this also confirms that
+    /// derivation is itself replay-safe, not just correct on a live store.
+    #[test]
+    fn role_assignments_survive_a_reload() {
+        let dir = std::env::temp_dir().join(format!(
+            "microtak-missions-roles-replay-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("missions.log");
+
+        {
+            let store = MissionStore::load_or_create(&path).unwrap();
+            store.create("m", None, "user-1", vec![], 1_000).unwrap();
+            store.subscribe("m", "user-2", 2_000).unwrap();
+            store
+                .assign_role("m", "user-3", MissionRole::Owner, "user-1", 3_000)
+                .unwrap();
+            store.subscribe("m", "user-4", 4_000).unwrap();
+            store.unsubscribe("m", "user-4", 5_000).unwrap();
+        }
+
+        let replayed = MissionStore::load_or_create(&path).unwrap();
+        assert_eq!(replayed.role_of("m", "user-1"), Some(MissionRole::Owner));
+        assert_eq!(replayed.role_of("m", "user-2"), Some(MissionRole::Subscriber));
+        assert_eq!(replayed.role_of("m", "user-3"), Some(MissionRole::Owner));
+        assert_eq!(replayed.role_of("m", "user-4"), None);
 
         std::fs::remove_dir_all(&dir).ok();
     }
