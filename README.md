@@ -91,4 +91,4 @@ tests/
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0-or-later — see [LICENSE](LICENSE). Chosen specifically so that anyone running a modified version of this server as a network service (not just distributing a binary) has to make their modified source available too — see `docs/ARCHITECTURE.md` for the reasoning.
