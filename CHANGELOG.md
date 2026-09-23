@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.0](https://github.com/microtak/microtak-server/compare/v0.3.0...v0.4.0) (2026-09-23)
+
+
+### Features
+
+* **enrollment:** add opt-in enrollment invite tokens and admin API ([f052cc6](https://github.com/microtak/microtak-server/commit/f052cc66d1ec0b1cdf3c57f0d25151e47310244f))
+* **missions:** add MISSION_OWNER/SUBSCRIBER-style roles ([54e09dd](https://github.com/microtak/microtak-server/commit/54e09dda49bd8343edb21779e2ef9778dd59aaa5))
+
+
+### Documentation
+
+* record enrollment lockdown / admin API design and test catalog ([19312bf](https://github.com/microtak/microtak-server/commit/19312bf003e366751e025fd95ee09a8c34a532e5))
+* record measured resource requirements (100 clients, Pi Zero) ([8bd1965](https://github.com/microtak/microtak-server/commit/8bd196587d6f9f209220897bce3cb3ab0cf38009))
+* record mission roles (Owner/Subscriber) design and test catalog ([72bc2b5](https://github.com/microtak/microtak-server/commit/72bc2b5de6f98aa4e7b1fe50e074ca88bb1529f3))
+
 ## [0.3.0](https://github.com/microtak/microtak-server/compare/v0.2.0...v0.3.0) (2026-09-23)
 
 
