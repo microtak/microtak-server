@@ -14,7 +14,8 @@ broadcast bus and one live connected-client registry, a certificate
 authority with CSR signing, a device registry with identity binding and
 revocation, a certificate enrollment HTTP endpoint, an mTLS-authenticated
 mission (Data Sync) metadata API — CRUD, change log, subscriptions,
-per-request identity-claim enforcement — hash-addressed DataSync file
+per-request identity-claim enforcement, Owner/Subscriber role-based
+authorization on updates/deletes/content — hash-addressed DataSync file
 content storage with server-verified hashes and atomic writes, a
 `GET /Marti/api/clientEndPoints` endpoint backed by live connections, an
 optional TOML config file, persistence (CA, device registry, mission store,
