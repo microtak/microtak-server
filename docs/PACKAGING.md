@@ -31,9 +31,11 @@ None of the three packaging targets below are meaningfully startable until this 
 
 These don't require anyone else's approval and can ship as soon as Phase 0 lands.
 
-### Nix (flakes)
+### Nix (flakes) — done, 2026-09-23
 
-Add a `flake.nix` to each repo (`microtak-server`, `microtak-admin-cli`) using `crane` or `naersk` to build the Cargo project, exposing a `packages.default` and an `apps.default` (so `nix run github:microtak/microtak-server` and `nix run github:microtak/microtak-admin-cli` work immediately, no PR review needed). For `microtak-server`, also expose a NixOS module (`nixosModules.default`) wrapping the systemd unit as a proper `systemd.services.microtak-server` + `services.microtak-server.enable` option, which is the idiomatic way NixOS users actually want to run a service — a plain package alone is a weaker offering here than for a CLI tool.
+Added `flake.nix` to both `microtak-server` and `microtak-admin-cli`, built with `crane` + `rust-overlay` — `nix run github:microtak/microtak-server` and `nix run github:microtak/microtak-admin-cli` work with no PR review needed. `microtak-server` also exposes `nixosModules.default`, wrapping a real `systemd.services.microtak-server` unit behind `services.microtak-server.enable`/`.configFile` options — the idiomatic way a NixOS user actually wants to run a server daemon, not just a plain package.
+
+Both flakes' outputs (`packages`, `apps`, `checks`) are defined for `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`, and `aarch64-darwin` — pulled forward from the Phase 3 "multi-arch" item below, since with Nix this is nearly free: each system builds *natively* on its own architecture (a Mac builds the `aarch64-darwin` output locally; an ARM board running NixOS, e.g. a Pi Zero 2 W, builds `aarch64-linux` locally), not through cross-compilation from x86_64 CI. `nix build`/`nix flake check` were run for real (not just written on faith) against `x86_64-linux` in development, including running the full test suite and clippy as flake checks (`checks.test`, `checks.clippy`), matching the CI pipeline's own gate. The `aarch64-linux`/`darwin` outputs are structurally identical and use the same cross-platform-safe dependency set (`rustls`, no `openssl-sys`) but haven't been built on real ARM/Apple hardware yet — flag that as the one remaining gap before calling multi-arch Nix support fully verified.
 
 Actual `nixpkgs` inclusion (a PR to `NixOS/nixpkgs` adding `pkgs/by-name/mi/microtak-server/package.nix`) is a separate, slower, community-reviewed step — worth doing eventually for discoverability (`nix-env -iA nixpkgs.microtak-server`), but the flake alone already gets Nix users a working install path without waiting on that.
 
@@ -60,7 +62,7 @@ Already partly done for `microtak-admin-cli`. Extend to `microtak-server` (Phase
 
 - Actual `nixpkgs` inclusion (upstream PR).
 - Actual Debian/Ubuntu official archive inclusion (ITP process).
-- Multi-arch binaries (`aarch64-unknown-linux-gnu` for Raspberry Pi — directly relevant given this project's own measured Pi Zero resource-requirements research in this same doc — plus macOS targets) via `cross` in CI, feeding all of the above with more than just x86_64-linux artifacts.
+- Multi-arch **release binaries and Docker images** (`aarch64-unknown-linux-gnu` for Raspberry Pi — directly relevant given this project's own measured Pi Zero resource-requirements research in this same doc — plus macOS targets) via `cross` in CI, feeding the GitHub Releases / `.deb` / AUR paths with more than just x86_64-linux artifacts. Nix users already get native ARM/Apple Silicon builds today (see the Nix section above) — this item is specifically about the *non-Nix* packaging paths catching up.
 - A Homebrew tap for macOS users, the natural sibling to AUR/apt for that platform (not explicitly requested, but cheap once cross-compiled macOS binaries exist).
 
 ## What this deliberately does *not* attempt
