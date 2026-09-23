@@ -960,62 +960,56 @@ async fn e2e_rejects_client_cert_not_signed_by_this_servers_ca() {
     }
 }
 
-/// The full documented bootstrap flow for locking down enrollment (see
-/// `docs/ARCHITECTURE.md` / `src/marti/admin.rs`), exercised across two
-/// separate `App::bind` calls against the same `data_dir` -- simulating a
-/// real restart, since `enrollment_requires_token` is a startup-time
-/// config, not a live toggle:
+/// The secure-by-default `Auto` enrollment mode's live transition (see
+/// `docs/ARCHITECTURE.md` / `src/marti/admin.rs`): unlike the old
+/// restart-based two-phase design this replaced, everything here happens
+/// against *one* continuously-running server, no restart involved --
+/// enrolling the configured admin device is itself what flips enrollment
+/// from open to locked, live.
 ///
-/// 1. First boot, enrollment open: enroll the admin device.
-/// 2. "Restart" with `enrollment_requires_token = true`: the admin's
-///    already-issued cert still works for mTLS (gating only affects *new*
-///    enrollments); the admin mints a token via the real admin API; a new
-///    device enrolling with no token is rejected; the same device enrolling
-///    with the minted token succeeds and the token becomes unusable again.
+/// 1. Server starts with `admin_common_name` configured but no device
+///    enrolled yet under that name -- enrollment is still open (an
+///    unrelated device can enroll with no token at all).
+/// 2. The admin device itself enrolls, also with no token (it has to be
+///    able to bootstrap without one).
+/// 3. From that moment on, with no restart, a new device with no token is
+///    rejected.
+/// 4. The admin mints a token via the real admin API (now reachable, since
+///    the admin's own cert works over mTLS); a device enrolling with it
+///    succeeds and the cert actually works over mTLS; the token can't be
+///    reused by a second device.
 #[tokio::test]
-async fn e2e_enrollment_lockdown_bootstrap_flow() {
-    let data_dir = unique_temp_dir();
-
-    // Phase 1: enrollment wide open, enroll the admin device.
-    let (admin_cert, admin_key, ca_cert_pem) = {
-        let config = AppConfig {
-            data_dir: data_dir.clone(),
-            ..test_config()
-        };
-        let app = App::bind(config).await.unwrap();
-        let enrollment_addr = app.enrollment_addr().unwrap();
-        let ca_cert_pem = app.ca_cert_pem.clone();
-        tokio::spawn(app.run());
-
-        let base_url = format!("http://{enrollment_addr}");
-        let (cert, key) = enroll(&base_url, "jz-admin").await;
-        (cert, key, ca_cert_pem)
-    };
-
-    // Phase 2: "restart" with the lockdown enabled and an admin configured.
+async fn e2e_enrollment_auto_mode_locks_down_the_moment_the_admin_enrolls() {
     let config = AppConfig {
-        data_dir: data_dir.clone(),
         admin_common_name: Some("jz-admin".to_string()),
-        enrollment_requires_token: true,
+        // enrollment_mode defaults to Auto -- deliberately not set here,
+        // to also prove the *default* is what locks down, not an opt-in
+        // flag someone has to remember to flip.
         ..test_config()
     };
     let app = App::bind(config).await.unwrap();
     let enrollment_addr = app.enrollment_addr().unwrap();
     let marti_api_addr = app.marti_api_addr().unwrap();
     let mtls_addr = app.mtls_addr().unwrap();
-    assert_eq!(
-        app.ca_cert_pem, ca_cert_pem,
-        "the same CA must persist across the simulated restart"
-    );
+    let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
 
-    let admin_client = mtls_reqwest_client(&ca_cert_pem, &admin_cert, admin_key, marti_api_addr);
-    let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
-
-    // A brand-new device with no token is rejected.
     let enrollment_base_url = format!("http://{enrollment_addr}");
-    let (no_token_csr, _key) = pki::build_csr("device-no-token").unwrap();
+    let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
     let plain_client = reqwest::Client::new();
+
+    // Before the admin has enrolled, an unrelated device can enroll with
+    // no token at all -- still open.
+    let (before_cert, _before_key) = enroll(&enrollment_base_url, "device-before-admin").await;
+    assert!(before_cert.contains("BEGIN CERTIFICATE"));
+
+    // The admin device itself bootstraps the same way -- no token needed
+    // for this specific enrollment either, or there'd be no way in at all.
+    let (admin_cert, admin_key) = enroll(&enrollment_base_url, "jz-admin").await;
+
+    // From this exact point on, with the same server still running, a new
+    // device with no token is rejected -- the live transition.
+    let (no_token_csr, _key) = pki::build_csr("device-no-token").unwrap();
     let rejected = plain_client
         .post(format!(
             "{enrollment_base_url}/Marti/api/tls/signClient/v2"
@@ -1026,6 +1020,8 @@ async fn e2e_enrollment_lockdown_bootstrap_flow() {
         .await
         .unwrap();
     assert_eq!(rejected.status(), 403);
+
+    let admin_client = mtls_reqwest_client(&ca_cert_pem, &admin_cert, admin_key, marti_api_addr);
 
     // The admin mints a real token through the real admin API.
     let mint_response = admin_client

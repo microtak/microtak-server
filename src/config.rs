@@ -16,7 +16,7 @@ use serde::Deserialize;
 use time::Duration;
 use thiserror::Error;
 
-use crate::app::{AppConfig, BackupConfig};
+use crate::app::{AppConfig, BackupConfig, EnrollmentMode};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -45,14 +45,13 @@ pub struct Config {
     /// caller; set this to your own enrolled device's CN to use them. See
     /// `src/marti/admin.rs`.
     pub admin_common_name: Option<String>,
-    /// Whether `/Marti/api/tls/signClient/v2` requires a valid enrollment
-    /// token (`?token=...`) in addition to the CSR -- off by default,
-    /// matching the real Marti enrollment contract (wide open by design).
-    /// Bootstrap order matters: enroll your own admin device *before*
-    /// turning this on, since the admin endpoints themselves are reached
-    /// over mTLS using a cert issued by enrollment. See
-    /// `src/enrollment_tokens.rs`.
-    pub enrollment_requires_token: bool,
+    /// `"auto"` (the default) or `"open"` -- see [`EnrollmentMode`]'s own
+    /// doc comment. `"auto"` requires a valid enrollment token (`?token=...`)
+    /// on `/Marti/api/tls/signClient/v2` once, and only once, the
+    /// configured `admin_common_name` has actually enrolled -- secure by
+    /// default without an insecure-by-default flag, and without needing a
+    /// restart to flip it on.
+    pub enrollment_mode: EnrollmentMode,
 }
 
 impl Default for Config {
@@ -73,7 +72,7 @@ impl Default for Config {
             backup_dir: defaults.backup.backup_dir,
             backup_offsite_command: defaults.backup.offsite_command,
             admin_common_name: defaults.admin_common_name,
-            enrollment_requires_token: defaults.enrollment_requires_token,
+            enrollment_mode: defaults.enrollment_mode,
         }
     }
 }
@@ -153,7 +152,7 @@ impl Config {
                 offsite_command: self.backup_offsite_command.clone(),
             },
             admin_common_name: self.admin_common_name.clone(),
-            enrollment_requires_token: self.enrollment_requires_token,
+            enrollment_mode: self.enrollment_mode,
         })
     }
 }
@@ -308,7 +307,7 @@ mod tests {
             &path,
             r#"
             admin_common_name = "jz-admin"
-            enrollment_requires_token = true
+            enrollment_mode = "open"
             "#,
         )
         .unwrap();
@@ -316,15 +315,19 @@ mod tests {
         let config = Config::load_or_default(&path).unwrap();
         let app_config = config.to_app_config().unwrap();
         assert_eq!(app_config.admin_common_name.as_deref(), Some("jz-admin"));
-        assert!(app_config.enrollment_requires_token);
+        assert_eq!(app_config.enrollment_mode, EnrollmentMode::Open);
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Secure by default, without an insecure-by-default flag: with no
+    /// config at all, mode is `Auto` (not `Open`) -- see
+    /// `EnrollmentMode`'s own doc comment for why `Auto` alone, with no
+    /// admin enrolled yet, still behaves as open in practice.
     #[test]
-    fn enrollment_gating_is_off_by_default() {
+    fn enrollment_mode_defaults_to_auto_not_open() {
         let app_config = Config::default().to_app_config().unwrap();
         assert!(app_config.admin_common_name.is_none());
-        assert!(!app_config.enrollment_requires_token);
+        assert_eq!(app_config.enrollment_mode, EnrollmentMode::Auto);
     }
 }

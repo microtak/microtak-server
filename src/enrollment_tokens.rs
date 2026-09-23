@@ -1,13 +1,13 @@
-//! Enrollment invite tokens: an opt-in gate on device enrollment.
+//! Enrollment invite tokens: a secure-by-default gate on device enrollment.
 //!
-//! By default, `/Marti/api/tls/signClient/v2` is wide open to anyone who can
-//! reach it -- deliberate, matching the real Marti enrollment contract (see
+//! `/Marti/api/tls/signClient/v2` is wide open to anyone who can reach it --
+//! deliberate, matching the real Marti enrollment contract (see
 //! `marti::enrollment`'s own doc comment), but a real gap for any deployment
-//! not fully isolated on a trusted network. When
-//! [`AppConfig::enrollment_requires_token`] is enabled, a caller must also
-//! present a valid, unused, unexpired token (`?token=...` on the enrollment
-//! request) -- minted ahead of time via the admin API (`marti::admin`),
-//! single-use, and revocable.
+//! not fully isolated on a trusted network. [`crate::app::EnrollmentMode::Auto`]
+//! (the default) requires a caller to also present a valid, unused,
+//! unexpired token (`?token=...` on the enrollment request) once the
+//! configured admin device has actually enrolled -- minted ahead of time
+//! via the admin API (`marti::admin`), single-use, and revocable.
 //!
 //! Persisted the same way as every other piece of MicroTAK state: an
 //! append-only, replayable event log (see [`crate::eventlog`]).

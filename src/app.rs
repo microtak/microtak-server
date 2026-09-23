@@ -68,9 +68,30 @@ pub struct AppConfig {
     /// See `src/marti/admin.rs` -- `None` means the admin API
     /// (enrollment-token minting) is unreachable by anyone.
     pub admin_common_name: Option<String>,
-    /// See `src/enrollment_tokens.rs` -- off by default, matching the real
-    /// Marti enrollment contract (wide open by design).
-    pub enrollment_requires_token: bool,
+    /// See `src/enrollment_tokens.rs` and [`EnrollmentMode`]'s own doc
+    /// comment -- `Auto` by default: secure by default without requiring
+    /// the operator to separately remember to lock enrollment down.
+    pub enrollment_mode: EnrollmentMode,
+}
+
+/// Whether `/Marti/api/tls/signClient/v2` requires a valid enrollment
+/// token. **Secure by default, without an insecure default**: `Auto`
+/// (the default) requires a token *only once an admin device actually
+/// exists* -- checked live against the device registry on every
+/// enrollment attempt, not a static flag decided once at startup. A fresh
+/// deployment with no `admin_common_name` configured yet (or one
+/// configured but not yet enrolled) stays open, so bootstrap needs no
+/// separate "temporarily open it, then lock it down and restart" dance --
+/// enrolling the admin device is itself what flips enrollment locked,
+/// live, no restart required. `Open` is an explicit, permanent override
+/// for a deployment that wants enrollment open regardless (e.g. one
+/// gating access at the network/firewall level instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnrollmentMode {
+    #[default]
+    Auto,
+    Open,
 }
 
 /// See `src/backup.rs`'s doc comment for the design this configures.
@@ -117,7 +138,7 @@ impl Default for AppConfig {
             backup: BackupConfig::default(),
             data_dir: PathBuf::from("./data"),
             admin_common_name: None,
-            enrollment_requires_token: false,
+            enrollment_mode: EnrollmentMode::default(),
         }
     }
 }
@@ -206,7 +227,8 @@ impl App {
             registry: Arc::clone(&registry),
             cert_validity: config.cert_validity,
             tokens: Arc::clone(&enrollment_tokens),
-            requires_token: config.enrollment_requires_token,
+            enrollment_mode: config.enrollment_mode,
+            admin_common_name: config.admin_common_name.clone(),
         });
 
         let enrollment = PlainHttpServer::bind(
