@@ -52,6 +52,31 @@ perimeter), set `enrollment_mode = "open"` to disable the lockdown
 permanently — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the
 reasoning behind the two modes.
 
+## System requirements
+
+MicroTAK is deliberately lightweight — it's built to run on the kind of
+hardware other TAK servers can't touch.
+
+- **CPU / RAM**: 1 vCPU and 256MB RAM is comfortable for 100 connected
+  clients with real headroom to spare, per actual load testing (not just
+  estimation) — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the
+  numbers. Idle memory use is under 10MB. A Raspberry Pi Zero 2 W should
+  handle 100+ clients; the original single-core Pi Zero is good for roughly
+  15–60 depending on how chatty your clients are (that estimate hasn't been
+  verified on real hardware yet — see the same doc for caveats).
+- **Disk**: minimal. State (CA, device registry, missions, uploaded mission
+  content) is stored under `data_dir`; size scales with how much mission
+  content you upload, not with client count. Add extra headroom if you
+  enable periodic backups.
+- **OS / architecture**: Linux, x86_64. The Docker image and prebuilt
+  release binaries currently target `x86_64-linux` (glibc). ARM builds (for
+  a Pi) aren't packaged yet — see
+  [docs/PACKAGING.md](docs/PACKAGING.md) — so an ARM device today means
+  building from source with a stable Rust toolchain (edition 2021).
+- **Network**: MicroTAK needs four ports reachable by your clients (see the
+  table below) — no other services or databases required. It has no
+  external runtime dependencies beyond what's in the Docker image.
+
 ## Running it
 
 The quickest way to try MicroTAK is Docker:
