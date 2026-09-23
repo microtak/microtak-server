@@ -99,6 +99,37 @@ MicroTAK is licensed **AGPL-3.0-or-later**, not the MIT license it started under
 
 Practical consequence: any dependency pulled into `microtak-server` must be permissively licensed (MIT/Apache-2.0/BSD) or itself AGPL/GPL-compatible — permissive-into-copyleft is fine (see the Reticulum crate license note above), the reverse is not.
 
+## Resource requirements — measured 2026-09-23, not estimated
+
+Actually load-tested against the real published `ghcr.io/microtak/microtak-server:latest` image (Docker, `docker stats`), not benchmarked-by-arithmetic. Methodology: N concurrent real client connections (plain-TCP or mTLS, each enrolling for real over HTTP for the mTLS cases), each sending a realistic ~250-300 byte PLI-style CoT event (position + contact + status + group) at a configurable interval, relayed by the real broadcast fan-out to every other connection — the O(N²)-ish cost this architecture's whole design is actually exercising.
+
+| Scenario | Server CPU | Memory (RSS) | Notes |
+|---|---|---|---|
+| Idle, 0 clients | ~0% | 6.7 MiB | baseline |
+| 100 clients, plain-TCP, realistic rate (avg ~8s/update) | 4.7–5.7% of 1 core | 6.8–7.2 MiB | ~13.5 events/s ingress, ~1,336 deliveries/s fan-out |
+| 100 clients, plain-TCP, aggressive rate (avg ~2s/update) | 10.5–14% of 1 core | 6.6–6.9 MiB | scales sublinearly with event rate, not the bottleneck at this N |
+| 100 simultaneous mTLS handshakes (reconnect-storm simulation) | 34.6% spike, gone within ~1s | 9.4–9.7 MiB | real but brief; ECDSA handshake cost, not sustained load |
+| 100 mTLS clients, sustained relay (same rate as plain-TCP case) | ~0.01% | 9.4–9.7 MiB | identical relay code path to plain-TCP once connected — mTLS's only added cost is the one-time handshake |
+
+Caveat on the mTLS handshake numbers: a client-side per-handshake latency figure (~400ms average) was also measured but discarded as unreliable — it's an artifact of the single-threaded Python test client doing 100 real OpenSSL handshakes itself, not a server-side signal. The server-side CPU spike (34.6%, resolving within ~1s) is the trustworthy number.
+
+**Headroom conclusion**: at 100 clients, even the worst-case mixed scenario tested (mass mTLS reconnect immediately followed by aggressive-rate updates) doesn't come close to stressing a modern single core, and memory stays under 10MB total. **1 vCPU / 256MB RAM is comfortable for 100 clients** with real headroom to spare — the limiting factor at higher N would be aggregate bandwidth from the broadcast fan-out (O(N²) in client count × update rate), not CPU or memory.
+
+### Raspberry Pi Zero estimate
+
+No physical unit was available to test against directly, so this combines one real empirical technique (Docker `--cpus`/`--memory` cgroup constraints against the actual image, which exactly replicates the 512MB RAM ceiling both Pi Zero variants share) with published single-core benchmark ratios (necessarily lower-confidence than the table above):
+
+- Constraining the container to a 5%-of-this-test-host's-core CPU quota **saturated** under the aggressive-rate 100-client workload (pinned at the quota ceiling).
+- Constraining to 15% left comfortable headroom (~3.3% actual use) under the realistic-rate workload.
+- Memory never exceeded ~10MB even at 100 mTLS clients — the 512MB ceiling on either Pi Zero variant is not a constraint at this scale.
+
+Extrapolating from there using published Geekbench single-core figures (Pi Zero's ARM11 core scores roughly 30-50 vs. a typical modern server/desktop core's 1500-2500+, i.e. very roughly 1.5-3% of one modern core; Pi Zero 2 W's Cortex-A53 cores score roughly 130-180, i.e. very roughly 6-12% each, ×4 cores):
+
+- **Original Pi Zero** (single ARM11 core @ 1GHz, ARMv6, no NEON): roughly **30-60 clients at realistic update rates**, **15-30 clients** if most are updating aggressively. Real open question, not verified: whether the `ring` crypto backend has an optimized path for ARMv6 at all, or falls back to a slower generic implementation, which would specifically hurt mTLS handshake cost (not steady-state relay throughput).
+- **Pi Zero 2 W** (quad-core Cortex-A53 @ 1GHz, ARMv8): roughly **100-300 clients at realistic rates**, likely still fine at 100+ under aggressive rates given 4 available cores against a workload that barely stresses one. Lower-confidence than the original-Pi-Zero estimate since multi-core scaling wasn't specifically emulated.
+
+Both estimates should be treated as informed extrapolation, not measurement — re-verify on real hardware before using either number for a real deployment decision.
+
 ## Open questions
 
 - Async runtime and HTTP framework choice for the Marti API surface (`tokio` + `axum` are the likely default, not yet decided in code).
