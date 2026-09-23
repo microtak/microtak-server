@@ -23,15 +23,17 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
 use tracing::{info, warn};
 
+use crate::enrollment_tokens::EnrollmentTokenStore;
 use crate::pki::CertificateAuthority;
 use crate::registry::DeviceRegistry;
 
@@ -39,6 +41,10 @@ pub struct EnrollmentState {
     pub ca: CertificateAuthority,
     pub registry: Arc<DeviceRegistry>,
     pub cert_validity: Duration,
+    pub tokens: Arc<EnrollmentTokenStore>,
+    /// See `AppConfig::enrollment_requires_token` -- off by default,
+    /// matching the real Marti enrollment contract (wide open by design).
+    pub requires_token: bool,
 }
 
 /// Build the enrollment router. Bind it with [`super::PlainHttpServer`].
@@ -65,9 +71,16 @@ async fn get_config(State(state): State<Arc<EnrollmentState>>) -> impl IntoRespo
     )
 }
 
+#[derive(Deserialize)]
+struct EnrollQuery {
+    #[serde(default)]
+    token: Option<String>,
+}
+
 /// TC-ENROLL-02/03/06/07.
 async fn sign_client_v2(
     State(state): State<Arc<EnrollmentState>>,
+    Query(query): Query<EnrollQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -109,6 +122,31 @@ async fn sign_client_v2(
             );
         }
     };
+
+    // Opt-in gate (off by default -- see AppConfig::enrollment_requires_token):
+    // a valid, unused, unexpired token must accompany the CSR. Checked
+    // *after* signing (so we know the real common_name to record the token
+    // as consumed-by) but *before* recording the device or returning the
+    // cert -- a rejected request neither registers the device nor learns
+    // its own cert, even though the CA already did the (side-effect-free)
+    // work of signing it.
+    if state.requires_token {
+        let token = match &query.token {
+            Some(token) => token.as_str(),
+            None => {
+                warn!(common_name = %signed.common_name, "enrollment rejected: no token provided");
+                return error_response(StatusCode::FORBIDDEN, "a valid enrollment token is required");
+            }
+        };
+        if let Err(error) =
+            state
+                .tokens
+                .validate_and_consume(token, &signed.common_name, OffsetDateTime::now_utc().unix_timestamp())
+        {
+            warn!(common_name = %signed.common_name, %error, "enrollment rejected: invalid token");
+            return error_response(StatusCode::FORBIDDEN, &format!("invalid enrollment token: {error}"));
+        }
+    }
 
     if let Err(error) = state.registry.enroll(
         &signed.common_name,
@@ -191,6 +229,8 @@ mod tests {
             ca: CertificateAuthority::generate("MicroTAK Test CA").unwrap(),
             registry: Arc::new(DeviceRegistry::in_memory()),
             cert_validity: Duration::days(365),
+            tokens: Arc::new(EnrollmentTokenStore::in_memory()),
+            requires_token: false,
         })
     }
 
@@ -352,5 +392,122 @@ mod tests {
 
         let record = registry_check.registry.find("device-registry-check");
         assert!(record.is_some());
+    }
+
+    fn test_state_requiring_tokens() -> Arc<EnrollmentState> {
+        Arc::new(EnrollmentState {
+            ca: CertificateAuthority::generate("MicroTAK Test CA").unwrap(),
+            registry: Arc::new(DeviceRegistry::in_memory()),
+            cert_validity: Duration::days(365),
+            tokens: Arc::new(EnrollmentTokenStore::in_memory()),
+            requires_token: true,
+        })
+    }
+
+    /// The gate is off by default: `test_state()` already proves enrollment
+    /// works with no token at all (every test above uses it). This proves
+    /// the *other* half: once `requires_token` is on, a request with no
+    /// token at all is rejected, and the device is never registered.
+    #[tokio::test]
+    async fn rejects_enrollment_with_no_token_when_gating_is_enabled() {
+        let state = test_state_requiring_tokens();
+        let registry_check = Arc::clone(&state);
+        let base_url = spawn_server(state).await;
+
+        let (csr_pem, _key) = build_csr("device-no-token").unwrap();
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(csr_pem)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 403);
+        assert!(registry_check.registry.find("device-no-token").is_none());
+    }
+
+    /// A valid, freshly-minted token lets enrollment through, and is
+    /// consumed by it (single-use).
+    #[tokio::test]
+    async fn accepts_enrollment_with_a_valid_token_and_consumes_it() {
+        let state = test_state_requiring_tokens();
+        let tokens = Arc::clone(&state.tokens);
+        let base_url = spawn_server(state).await;
+
+        let token = tokens.mint(None, None, 1_000).unwrap();
+        let (csr_pem, _key) = build_csr("device-with-token").unwrap();
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!(
+                "{base_url}/Marti/api/tls/signClient/v2?token={token}"
+            ))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(csr_pem)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let all = tokens.list();
+        assert!(all[0].used, "the token should be consumed after use");
+        assert_eq!(all[0].used_by_common_name.as_deref(), Some("device-with-token"));
+    }
+
+    /// The same token can't be used twice -- the second device is rejected
+    /// and never registered, even though the token was real.
+    #[tokio::test]
+    async fn rejects_reusing_an_already_consumed_token() {
+        let state = test_state_requiring_tokens();
+        let tokens = Arc::clone(&state.tokens);
+        let registry_check = Arc::clone(&state);
+        let base_url = spawn_server(state).await;
+
+        let token = tokens.mint(None, None, 1_000).unwrap();
+        let client = reqwest::Client::new();
+
+        let (csr_a, _key_a) = build_csr("device-a").unwrap();
+        let first = client
+            .post(format!("{base_url}/Marti/api/tls/signClient/v2?token={token}"))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(csr_a)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), 200);
+
+        let (csr_b, _key_b) = build_csr("device-b").unwrap();
+        let second = client
+            .post(format!("{base_url}/Marti/api/tls/signClient/v2?token={token}"))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(csr_b)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), 403);
+        assert!(registry_check.registry.find("device-b").is_none());
+    }
+
+    /// A revoked token is rejected even if it was never used.
+    #[tokio::test]
+    async fn rejects_a_revoked_token() {
+        let state = test_state_requiring_tokens();
+        let tokens = Arc::clone(&state.tokens);
+        let base_url = spawn_server(state).await;
+
+        let token = tokens.mint(None, None, 1_000).unwrap();
+        tokens.revoke(&token).unwrap();
+
+        let (csr_pem, _key) = build_csr("device-revoked-token").unwrap();
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base_url}/Marti/api/tls/signClient/v2?token={token}"))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(csr_pem)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
     }
 }

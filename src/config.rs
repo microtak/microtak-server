@@ -39,6 +39,20 @@ pub struct Config {
     /// `["rsync", "-a", "{src}/", "user@host:/backups/microtak/"]`. Empty
     /// means local-only backup, no offsite shipping.
     pub backup_offsite_command: Vec<String>,
+    /// If set, only this cert Common Name may call the admin endpoints
+    /// (`/Marti/api/admin/*`) -- minting/listing/revoking enrollment
+    /// tokens. `None` (the default) means the admin endpoints reject every
+    /// caller; set this to your own enrolled device's CN to use them. See
+    /// `src/marti/admin.rs`.
+    pub admin_common_name: Option<String>,
+    /// Whether `/Marti/api/tls/signClient/v2` requires a valid enrollment
+    /// token (`?token=...`) in addition to the CSR -- off by default,
+    /// matching the real Marti enrollment contract (wide open by design).
+    /// Bootstrap order matters: enroll your own admin device *before*
+    /// turning this on, since the admin endpoints themselves are reached
+    /// over mTLS using a cert issued by enrollment. See
+    /// `src/enrollment_tokens.rs`.
+    pub enrollment_requires_token: bool,
 }
 
 impl Default for Config {
@@ -58,6 +72,8 @@ impl Default for Config {
             backup_interval_seconds: defaults.backup.interval.as_secs().max(1),
             backup_dir: defaults.backup.backup_dir,
             backup_offsite_command: defaults.backup.offsite_command,
+            admin_common_name: defaults.admin_common_name,
+            enrollment_requires_token: defaults.enrollment_requires_token,
         }
     }
 }
@@ -136,6 +152,8 @@ impl Config {
                 backup_dir: self.backup_dir.clone(),
                 offsite_command: self.backup_offsite_command.clone(),
             },
+            admin_common_name: self.admin_common_name.clone(),
+            enrollment_requires_token: self.enrollment_requires_token,
         })
     }
 }
@@ -276,5 +294,37 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enrollment_gating_settings_round_trip_from_toml() {
+        let dir = std::env::temp_dir().join(format!(
+            "microtak-config-test-enroll-gate-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("microtak.toml");
+        std::fs::write(
+            &path,
+            r#"
+            admin_common_name = "jz-admin"
+            enrollment_requires_token = true
+            "#,
+        )
+        .unwrap();
+
+        let config = Config::load_or_default(&path).unwrap();
+        let app_config = config.to_app_config().unwrap();
+        assert_eq!(app_config.admin_common_name.as_deref(), Some("jz-admin"));
+        assert!(app_config.enrollment_requires_token);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enrollment_gating_is_off_by_default() {
+        let app_config = Config::default().to_app_config().unwrap();
+        assert!(app_config.admin_common_name.is_none());
+        assert!(!app_config.enrollment_requires_token);
     }
 }

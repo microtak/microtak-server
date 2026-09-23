@@ -18,9 +18,11 @@ use time::Duration;
 
 use crate::backup::{BackupRunner, OffsiteTarget};
 use crate::content_store::ContentStore;
+use crate::enrollment_tokens::{EnrollmentTokenError, EnrollmentTokenStore};
+use crate::marti::admin::AdminState;
 use crate::marti::enrollment::EnrollmentState;
 use crate::marti::{
-    client_endpoints, content as content_api, enrollment, missions as missions_api,
+    admin, client_endpoints, content as content_api, enrollment, missions as missions_api,
     MtlsHttpServer, PlainHttpServer,
 };
 use crate::missions::{MissionError, MissionStore};
@@ -63,6 +65,12 @@ pub struct AppConfig {
     /// `src/backup.rs` for the local-mirror + optional-offsite-command
     /// design.
     pub backup: BackupConfig,
+    /// See `src/marti/admin.rs` -- `None` means the admin API
+    /// (enrollment-token minting) is unreachable by anyone.
+    pub admin_common_name: Option<String>,
+    /// See `src/enrollment_tokens.rs` -- off by default, matching the real
+    /// Marti enrollment contract (wide open by design).
+    pub enrollment_requires_token: bool,
 }
 
 /// See `src/backup.rs`'s doc comment for the design this configures.
@@ -108,6 +116,8 @@ impl Default for AppConfig {
             cert_validity: Duration::days(365),
             backup: BackupConfig::default(),
             data_dir: PathBuf::from("./data"),
+            admin_common_name: None,
+            enrollment_requires_token: false,
         }
     }
 }
@@ -122,6 +132,8 @@ pub enum AppError {
     Registry(#[from] RegistryError),
     #[error("mission store setup failed: {0}")]
     Missions(#[from] MissionError),
+    #[error("enrollment token store setup failed: {0}")]
+    EnrollmentTokens(#[from] EnrollmentTokenError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -163,6 +175,9 @@ impl App {
             config.data_dir.join("missions.log"),
         )?);
         let content_store = Arc::new(ContentStore::open(config.data_dir.join("content"))?);
+        let enrollment_tokens = Arc::new(EnrollmentTokenStore::load_or_create(
+            config.data_dir.join("enrollment_tokens.log"),
+        )?);
         let hub = RelayHub::new();
         let clients = ConnectedClients::new();
 
@@ -190,6 +205,8 @@ impl App {
             ca,
             registry: Arc::clone(&registry),
             cert_validity: config.cert_validity,
+            tokens: Arc::clone(&enrollment_tokens),
+            requires_token: config.enrollment_requires_token,
         });
 
         let enrollment = PlainHttpServer::bind(
@@ -197,9 +214,14 @@ impl App {
             enrollment::router(enrollment_state),
         )
         .await?;
+        let admin_state = AdminState {
+            tokens: enrollment_tokens,
+            admin_common_name: config.admin_common_name.clone(),
+        };
         let marti_router = missions_api::router(Arc::clone(&missions))
             .merge(client_endpoints::router(clients.clone()))
-            .merge(content_api::router(Arc::clone(&content_store)));
+            .merge(content_api::router(Arc::clone(&content_store)))
+            .merge(admin::router(admin_state));
         let marti_api =
             MtlsHttpServer::bind(config.marti_api_addr, Arc::clone(&tls_server_config), marti_router)
                 .await?;
