@@ -1,102 +1,122 @@
 # MicroTAK
 
-A lightweight TAK (Team Awareness Kit) server, written in Rust, designed to
-run on modest/edge infrastructure and to **federate with other MicroTAK
-instances over heterogeneous, often low-bandwidth transports** (MeshCore LoRa
-mesh, Reticulum/LXMF, Starlink, potentially AX.25 packet radio) — built for
-grid-down "island" scenarios where instances may be cut off from each other
-for extended periods and need to resync opportunistically once a link
-reappears.
+A lightweight TAK (Team Awareness Kit) server, written in Rust, for running
+your own ATAK/iTAK/WinTAK infrastructure on modest hardware — a Raspberry Pi,
+a small VPS, a laptop in a go-bag.
 
-**Status: early but functional.** `microtakd` runs a real server today: CoT
-parsing, a plain-TCP and an mTLS CoT relay sharing one cross-transport
-broadcast bus and one live connected-client registry, a certificate
-authority with CSR signing, a device registry with identity binding and
-revocation, a certificate enrollment HTTP endpoint, an mTLS-authenticated
-mission (Data Sync) metadata API — CRUD, change log, subscriptions,
-per-request identity-claim enforcement, Owner/Subscriber role-based
-authorization on updates/deletes/content — hash-addressed DataSync file
-content storage with server-verified hashes and atomic writes, a
-`GET /Marti/api/clientEndPoints` endpoint backed by live connections, an
-optional TOML config file, persistence (CA, device registry, mission store,
-and uploaded content all survive a restart), periodic local + optional
-offsite backup (off by default), and opt-in enrollment invite tokens plus a
-minimal admin API to mint/list/revoke them (off by default). No mesh-sync
-layer yet — see
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for exactly what's built vs.
-still design-stage.
+MicroTAK speaks the same protocols as the official TAK Server (CoT over
+TLS/TCP, certificate enrollment, the Marti mission/Data Sync API), so
+existing ATAK, iTAK, and WinTAK clients connect to it without modification.
+It's a from-scratch implementation, not a fork — built after studying the
+official TAK Server, [taky](https://github.com/tkuester/taky), and
+[OpenTAKServer](https://github.com/brian7704/OpenTAKServer) for protocol
+compatibility and to avoid their known rough edges.
 
-This is a from-scratch implementation, not a fork of any existing TAK
-server. Its design draws on source-level research into the official TAK
-Server, `tkuester/taky`, and `brian7704/OpenTAKServer` — both for protocol
-compatibility targets and as a "don't repeat this bug" checklist. See
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for what was found.
+The longer-term goal is federation between MicroTAK instances over
+low-bandwidth or intermittent links (LoRa mesh, Reticulum/LXMF, satellite,
+packet radio) for "island" deployments that lose connectivity to each other
+and need to resync once a link comes back. That part isn't built yet — see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for what's running today versus
+still on the drawing board.
+
+## What it does today
+
+- Real-time CoT relay over plain TCP and mutual-TLS, so ATAK/iTAK/WinTAK
+  clients see each other's positions and markers live.
+- Certificate-based device enrollment — a client requests a cert, the server
+  signs it with its own CA, done. Enrollment is **secure by default**: once
+  you've enrolled your own admin device, the server automatically locks
+  further enrollment behind one-time invite tokens. See "Enrollment &
+  access control" below.
+- Missions (Data Sync) — shared folders of markers and files that sync
+  across devices, with Owner/Subscriber permissions so not everyone can
+  delete or rewrite someone else's mission.
+- Everything persists to disk and survives a restart, with optional
+  periodic backups (local or offsite via a command you control, e.g.
+  `rsync`).
+
+## Enrollment & access control
+
+By default (`enrollment_mode = "auto"`), a brand-new MicroTAK server accepts
+any enrollment — there's no admin yet, so there's nothing to protect. The
+moment your configured admin device (`admin_common_name` in the config)
+actually enrolls, the server locks down live, no restart required: from then
+on, new devices need a one-time invite token to enroll. Mint, list, and
+revoke those tokens through the mTLS-authenticated admin API, or more
+conveniently with the companion CLI,
+[microtak-admin-cli](https://github.com/microtak/microtak-admin-cli), which
+also prints enrollment QR codes for handing a device its token.
+
+If you'd rather manage access some other way (e.g. a firewall/VPN
+perimeter), set `enrollment_mode = "open"` to disable the lockdown
+permanently — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the
+reasoning behind the two modes.
+
+## Running it
+
+The quickest way to try MicroTAK is Docker:
+
+```sh
+docker compose up
+```
+
+This builds the image and exposes the four ports MicroTAK listens on:
+
+| Port | Purpose |
+|------|---------|
+| 8446 | Certificate enrollment (plain HTTP) |
+| 8443 | Marti API — missions, admin (mTLS) |
+| 8087 | CoT relay (plain TCP) |
+| 8089 | CoT relay (mTLS) |
+
+Data and backups live in Docker volumes so they survive container restarts.
+To customize settings, drop a `microtak.toml` next to `docker-compose.yml`
+and uncomment the volume mount for it.
+
+A [Helm chart](charts/microtak-server) is also available for Kubernetes
+deployments. See [docs/PACKAGING.md](docs/PACKAGING.md) for the plan to add
+apt, Nix, and AUR packages on top of these.
+
+### Building from source
+
+```sh
+cargo build --release
+cargo run --release --bin microtakd
+```
+
+Config is optional — MicroTAK reads `$MICROTAK_CONFIG`, or `./microtak.toml`
+if that's unset, and falls back to sensible defaults if neither exists.
+
+## The MicroTAK ecosystem
+
+- **microtak-server** (this repo) — the server itself.
+- [microtak-admin-cli](https://github.com/microtak/microtak-admin-cli) — a
+  command-line tool for enrolling devices, minting/managing invite tokens,
+  and managing mission roles, with terminal QR codes for handoff.
+- microtak-admin-web — a web-based admin UI, in progress.
 
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — design decisions, protocol
   notes, and how MicroTAK relates to existing TAK servers.
-- [docs/TEST-PLAN.md](docs/TEST-PLAN.md) — the full test-case catalog every
+- [docs/TEST-PLAN.md](docs/TEST-PLAN.md) — the test-case catalog every
   feature is expected to satisfy before being considered done.
-- [docs/PACKAGING.md](docs/PACKAGING.md) — the plan for getting the whole
-  MicroTAK ecosystem installable via apt, Nix, and the AUR, on top of the
-  existing Docker image and Helm chart.
+- [docs/PACKAGING.md](docs/PACKAGING.md) — the plan for making the whole
+  ecosystem installable via apt, Nix, and the AUR.
 
-Every feature is expected to be backed by tests (API-level integration tests
-and/or unit tests) before being considered complete — see the test plan for
-what "tested" means for each area. `tests/e2e.rs` drives the fully-assembled
-server (real HTTP enrollment, then real mTLS/plain-TCP connections against
-the same running instance); everything else is tested at the module level.
+## Contributing
 
-## Building and running
+Every feature is expected to come with tests before it's considered done —
+see the test plan for what "tested" means for a given area.
 
 ```sh
-cargo build
 cargo test               # unit + module-level integration tests
-cargo test --test e2e    # end-to-end suite against the assembled server
-cargo run --bin microtakd # starts a real server on the default ports
-```
-
-Config is optional: `$MICROTAK_CONFIG`, or `./microtak.toml` if unset (see
-[docs/TEST-PLAN.md](docs/TEST-PLAN.md) §10). A missing file falls back to
-defaults. CA, device registry, mission store, and uploaded DataSync content
-persist under `data_dir` (default `./data`) and reload on the next start.
-Periodic backup is off by default; enable it with `backup_enabled = true`
-plus `backup_interval_seconds`, `backup_dir`, and an optional
-`backup_offsite_command` (e.g.
-`["rsync", "-a", "{src}/", "user@host:/backups/microtak/"]`) — see
-[docs/TEST-PLAN.md](docs/TEST-PLAN.md) §14.
-
-## Project layout
-
-```
-src/
-  lib.rs                — crate root, module map
-  app.rs                — assembles every component into one runnable server
-  config.rs              — optional TOML config file, converted into AppConfig
-  cot.rs                — CoT <event>/<point> XML parsing and serialization
-  pki.rs                — certificate authority: CA generation, CSR signing
-  registry.rs            — device registry: cert CN <-> CoT uid binding, revocation
-  missions.rs             — mission (Data Sync) metadata store: CRUD, change log, subscriptions
-  marti/mod.rs            — shared plain-HTTP and mTLS HTTP server plumbing
-  marti/enrollment.rs    — Marti-compatible certificate enrollment HTTP endpoint (plain HTTP)
-  marti/missions.rs       — Marti missions HTTP API (mTLS-authenticated)
-  marti/client_endpoints.rs — GET /Marti/api/clientEndPoints, backed by live connections
-  marti/content.rs        — DataSync file content upload/download by hash
-  marti/admin.rs           — mint/list/revoke enrollment invite tokens (mTLS admin API)
-  content_store.rs        — hash-addressed content-addressed file storage
-  enrollment_tokens.rs     — enrollment invite tokens: mint, validate, consume, revoke
-  backup.rs               — periodic local + optional offsite backup of data_dir
-  transport/codec.rs     — incremental CoT XML stream decoder
-  transport/hub.rs       — shared cross-transport broadcast bus
-  transport/connections.rs — shared live connected-client registry
-  transport/tcp.rs       — plain-TCP CoT relay
-  transport/tls.rs       — mTLS-authenticated CoT relay
-  main.rs                — microtakd entrypoint
-tests/
-  e2e.rs                 — end-to-end suite against the assembled server
+cargo test --test e2e    # end-to-end suite against a fully assembled server
 ```
 
 ## License
 
-AGPL-3.0-or-later — see [LICENSE](LICENSE). Chosen specifically so that anyone running a modified version of this server as a network service (not just distributing a binary) has to make their modified source available too — see `docs/ARCHITECTURE.md` for the reasoning.
+AGPL-3.0-or-later — see [LICENSE](LICENSE). Chosen so that anyone running a
+modified version of this server as a network service, not just distributing
+a binary, has to share their modifications too. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the reasoning.
