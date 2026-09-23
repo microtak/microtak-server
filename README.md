@@ -38,6 +38,9 @@ compatibility targets and as a "don't repeat this bug" checklist. See
   notes, and how MicroTAK relates to existing TAK servers.
 - [docs/TEST-PLAN.md](docs/TEST-PLAN.md) — the full test-case catalog every
   feature is expected to satisfy before being considered done.
+- [docs/PACKAGING.md](docs/PACKAGING.md) — the plan for getting the whole
+  MicroTAK ecosystem installable via apt, Nix, and the AUR, on top of the
+  existing Docker image and Helm chart.
 
 Every feature is expected to be backed by tests (API-level integration tests
 and/or unit tests) before being considered complete — see the test plan for
