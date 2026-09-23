@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0](https://github.com/microtak/microtak-server/compare/v0.4.0...v0.5.0) (2026-09-23)
+
+
+### Features
+
+* **enrollment:** switch enrollment gating to Auto/Open, secure by default ([307e631](https://github.com/microtak/microtak-server/commit/307e631357ff0facd4600051ab55a5f18d3e42a7))
+* **nix:** add flake.nix with a NixOS module ([905424c](https://github.com/microtak/microtak-server/commit/905424c54a44e2b29a847d54e9389093d2d8fe9d))
+
+
+### Documentation
+
+* add the MicroTAK ecosystem packaging plan (apt, Nix, AUR) ([eea5f75](https://github.com/microtak/microtak-server/commit/eea5f75958203215a8f78299e6abd729654bed3b))
+* **readme:** add system requirements section ([168392e](https://github.com/microtak/microtak-server/commit/168392e88b8279a3f717cf92854efab39964692b))
+* **readme:** rewrite for humans, not as a status log ([92e01d3](https://github.com/microtak/microtak-server/commit/92e01d3f71d9088c952ffc6cfb4722b44242de93))
+
 ## [0.4.0](https://github.com/microtak/microtak-server/compare/v0.3.0...v0.4.0) (2026-09-23)
 
 
