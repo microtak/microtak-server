@@ -822,3 +822,115 @@ async fn e2e_rejects_client_cert_not_signed_by_this_servers_ca() {
         }
     }
 }
+
+/// The full documented bootstrap flow for locking down enrollment (see
+/// `docs/ARCHITECTURE.md` / `src/marti/admin.rs`), exercised across two
+/// separate `App::bind` calls against the same `data_dir` -- simulating a
+/// real restart, since `enrollment_requires_token` is a startup-time
+/// config, not a live toggle:
+///
+/// 1. First boot, enrollment open: enroll the admin device.
+/// 2. "Restart" with `enrollment_requires_token = true`: the admin's
+///    already-issued cert still works for mTLS (gating only affects *new*
+///    enrollments); the admin mints a token via the real admin API; a new
+///    device enrolling with no token is rejected; the same device enrolling
+///    with the minted token succeeds and the token becomes unusable again.
+#[tokio::test]
+async fn e2e_enrollment_lockdown_bootstrap_flow() {
+    let data_dir = unique_temp_dir();
+
+    // Phase 1: enrollment wide open, enroll the admin device.
+    let (admin_cert, admin_key, ca_cert_pem) = {
+        let config = AppConfig {
+            data_dir: data_dir.clone(),
+            ..test_config()
+        };
+        let app = App::bind(config).await.unwrap();
+        let enrollment_addr = app.enrollment_addr().unwrap();
+        let ca_cert_pem = app.ca_cert_pem.clone();
+        tokio::spawn(app.run());
+
+        let base_url = format!("http://{enrollment_addr}");
+        let (cert, key) = enroll(&base_url, "jz-admin").await;
+        (cert, key, ca_cert_pem)
+    };
+
+    // Phase 2: "restart" with the lockdown enabled and an admin configured.
+    let config = AppConfig {
+        data_dir: data_dir.clone(),
+        admin_common_name: Some("jz-admin".to_string()),
+        enrollment_requires_token: true,
+        ..test_config()
+    };
+    let app = App::bind(config).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let mtls_addr = app.mtls_addr().unwrap();
+    assert_eq!(
+        app.ca_cert_pem, ca_cert_pem,
+        "the same CA must persist across the simulated restart"
+    );
+    tokio::spawn(app.run());
+
+    let admin_client = mtls_reqwest_client(&ca_cert_pem, &admin_cert, admin_key, marti_api_addr);
+    let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
+
+    // A brand-new device with no token is rejected.
+    let enrollment_base_url = format!("http://{enrollment_addr}");
+    let (no_token_csr, _key) = pki::build_csr("device-no-token").unwrap();
+    let plain_client = reqwest::Client::new();
+    let rejected = plain_client
+        .post(format!(
+            "{enrollment_base_url}/Marti/api/tls/signClient/v2"
+        ))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(no_token_csr)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 403);
+
+    // The admin mints a real token through the real admin API.
+    let mint_response = admin_client
+        .post(format!("{base_url}/Marti/api/admin/enrollmentTokens"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mint_response.status(), 201);
+    let mint_body: serde_json::Value = mint_response.json().await.unwrap();
+    let token = mint_body["token"].as_str().unwrap();
+
+    // A device enrolling with that token succeeds.
+    let (with_token_csr, device_key) = pki::build_csr("device-with-token").unwrap();
+    let signed = plain_client
+        .post(format!(
+            "{enrollment_base_url}/Marti/api/tls/signClient/v2?token={token}"
+        ))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(with_token_csr)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signed.status(), 200);
+    let signed_body: serde_json::Value = signed.json().await.unwrap();
+    let device_cert = signed_body["signedCert"].as_str().unwrap().to_string();
+
+    // The new cert actually works over mTLS -- not just "the server said
+    // 200." for the enrollment call.
+    connect_mtls(mtls_addr, &ca_cert_pem, &device_cert, device_key)
+        .await
+        .expect("the token-enrolled device's cert should be accepted for mTLS");
+
+    // The now-consumed token can't be reused by a second device.
+    let (second_csr, _key2) = pki::build_csr("device-second").unwrap();
+    let reused = plain_client
+        .post(format!(
+            "{enrollment_base_url}/Marti/api/tls/signClient/v2?token={token}"
+        ))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(second_csr)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reused.status(), 403);
+}

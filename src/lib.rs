@@ -12,6 +12,7 @@ pub mod backup;
 pub mod config;
 pub mod content_store;
 pub mod cot;
+pub mod enrollment_tokens;
 pub mod eventlog;
 pub mod marti;
 pub mod missions;

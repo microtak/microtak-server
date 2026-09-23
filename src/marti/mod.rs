@@ -11,6 +11,10 @@
 //! - [`content`]: DataSync file content upload/download by hash
 //!   (`/Marti/api/sync/*`, TC-MARTI-07/08), on top of
 //!   [`crate::content_store::ContentStore`].
+//! - [`admin`]: mint/list/revoke enrollment invite tokens
+//!   (`/Marti/api/admin/*`), gated by a configured admin cert Common Name
+//!   on top of the usual mTLS auth -- see its own doc comment for the
+//!   bootstrap order this implies.
 //!
 //! Not yet implemented: groups, device profiles.
 //!
@@ -35,6 +39,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::warn;
 
+pub mod admin;
 pub mod client_endpoints;
 pub mod content;
 pub mod enrollment;
