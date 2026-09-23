@@ -1,12 +1,12 @@
 //! DataSync file content upload/download — `docs/TEST-PLAN.md` §5,
 //! TC-MARTI-07/08 — on top of [`crate::content_store::ContentStore`].
 //!
-//! **Endpoint naming is EdgeTAK's own choice, not a copied contract**: no
+//! **Endpoint naming is MicroTAK's own choice, not a copied contract**: no
 //! single authoritative source for these two routes was found across the
 //! reference implementations this project studied (taky documents
 //! `GET /Marti/api/sync/content?hash=<h>` for download; a real deployed
 //! community server instead uses `POST /Marti/sync/upload` for upload,
-//! under a different path prefix entirely). EdgeTAK keeps both routes under
+//! under a different path prefix entirely). MicroTAK keeps both routes under
 //! one consistent `/Marti/api/sync/*` prefix:
 //! - `POST /Marti/api/sync/missionupload?hash=<sha256>` — raw request body
 //!   is the file's bytes; `hash` is optional but, if given, must match the
@@ -105,7 +105,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "edgetak-marti-content-{}-{n}",
+            "microtak-marti-content-{}-{n}",
             std::process::id()
         ));
         Arc::new(ContentStore::open(dir).unwrap())

@@ -5,7 +5,7 @@
 //! Backs `GET /Marti/api/clientEndPoints` (TC-MARTI-09): a real reference
 //! implementation was found to return a static/hardcoded empty list for
 //! this endpoint regardless of who was actually connected — this registry
-//! exists specifically so EdgeTAK's answer is never that.
+//! exists specifically so MicroTAK's answer is never that.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

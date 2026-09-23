@@ -163,7 +163,7 @@ impl DeviceRegistry {
     /// periodically) and does **not** append a new event — the log only
     /// ever records genuine state transitions. A device that has already
     /// bound a different `uid` attempting to bind yet another one is also
-    /// rejected — EdgeTAK treats a device's `uid` as fixed once bound, a
+    /// rejected — MicroTAK treats a device's `uid` as fixed once bound, a
     /// deliberate simplification (see `docs/ARCHITECTURE.md`) vs.
     /// real-world devices that might legitimately change identity (e.g.
     /// app reinstall); revoking and re-enrolling is the escape hatch for
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn persists_across_reload() {
-        let dir = std::env::temp_dir().join(format!("edgetak-registry-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("microtak-registry-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("devices.log");
 
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn loading_nonexistent_path_starts_empty() {
-        let dir = std::env::temp_dir().join(format!("edgetak-registry-empty-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("microtak-registry-empty-{}", std::process::id()));
         let path = dir.join("does-not-exist.log");
         let registry = DeviceRegistry::load_or_create(&path).unwrap();
         assert!(registry.find("anything").is_none());
@@ -384,7 +384,7 @@ mod tests {
     /// single write-then-read.
     #[test]
     fn replay_reconstructs_a_realistic_mutation_sequence_exactly() {
-        let dir = std::env::temp_dir().join(format!("edgetak-registry-replay-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("microtak-registry-replay-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("devices.log");
 

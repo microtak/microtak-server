@@ -1,7 +1,7 @@
-//! Assembles every EdgeTAK component — CA, device registry, mission store,
+//! Assembles every MicroTAK component — CA, device registry, mission store,
 //! shared relay hub, enrollment HTTP endpoint, Marti missions HTTP
 //! endpoint, plain-TCP relay, and mTLS relay — into one runnable server.
-//! This is both `edgetakd`'s actual implementation (`src/main.rs`) and what
+//! This is both `microtakd`'s actual implementation (`src/main.rs`) and what
 //! `tests/e2e.rs` drives: prior to this module, every test built its own
 //! scaffolding in isolation (its own CA, its own registry, its own single
 //! relay), so nothing had ever exercised the pieces wired together the way
@@ -80,7 +80,7 @@ pub struct BackupConfig {
     /// against the current working directory, same as `data_dir`.
     pub backup_dir: PathBuf,
     /// An external command shipping `backup_dir` elsewhere, e.g.
-    /// `["rsync", "-a", "{src}/", "user@host:/backups/edgetak/"]`. Empty
+    /// `["rsync", "-a", "{src}/", "user@host:/backups/microtak/"]`. Empty
     /// means offsite shipping is disabled -- local-only backup.
     pub offsite_command: Vec<String>,
 }
@@ -103,8 +103,8 @@ impl Default for AppConfig {
             marti_api_addr: "0.0.0.0:8443".parse().unwrap(),
             plain_tcp_addr: "0.0.0.0:8087".parse().unwrap(),
             mtls_addr: "0.0.0.0:8089".parse().unwrap(),
-            ca_common_name: "EdgeTAK CA".to_string(),
-            server_common_name: "edgetak-server".to_string(),
+            ca_common_name: "MicroTAK CA".to_string(),
+            server_common_name: "microtak-server".to_string(),
             cert_validity: Duration::days(365),
             backup: BackupConfig::default(),
             data_dir: PathBuf::from("./data"),
@@ -126,7 +126,7 @@ pub enum AppError {
     Io(#[from] std::io::Error),
 }
 
-/// A fully-bound (but not yet running) EdgeTAK server: every listener has
+/// A fully-bound (but not yet running) MicroTAK server: every listener has
 /// already claimed its port, so real addresses (including resolved
 /// ephemeral ports) are available before [`App::run`] is called — this is
 /// what lets `tests/e2e.rs` bind on `:0` and learn the real ports to
@@ -299,7 +299,7 @@ mod tests {
     /// shared fixed directory would race across tests.
     fn unique_temp_dir(label: &str) -> PathBuf {
         let n = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("edgetak-app-{label}-{}-{n}", std::process::id()))
+        std::env::temp_dir().join(format!("microtak-app-{label}-{}-{n}", std::process::id()))
     }
 
     fn ephemeral_config(data_dir: PathBuf) -> AppConfig {

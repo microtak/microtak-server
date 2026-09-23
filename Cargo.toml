@@ -1,16 +1,16 @@
 [package]
-name = "edgetak"
+name = "microtak-server"
 version = "0.1.0"
 edition = "2021"
-description = "EdgeTAK: a lightweight, mesh-federated TAK server for grid-down / island deployments"
+description = "MicroTAK server: a lightweight, mesh-federated TAK server for grid-down / island deployments"
 license = "MIT"
 
 [lib]
-name = "edgetak"
+name = "microtak_server"
 path = "src/lib.rs"
 
 [[bin]]
-name = "edgetakd"
+name = "microtakd"
 path = "src/main.rs"
 
 [dependencies]

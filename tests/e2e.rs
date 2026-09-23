@@ -1,6 +1,6 @@
-//! End-to-end test suite: drives the fully-assembled [`edgetak::app::App`]
+//! End-to-end test suite: drives the fully-assembled [`microtak_server::app::App`]
 //! (real CA, real registry, real enrollment HTTP endpoint, real plain-TCP
-//! and mTLS relays, all wired together exactly as `edgetakd` runs them) —
+//! and mTLS relays, all wired together exactly as `microtakd` runs them) —
 //! not any single module in isolation.
 //!
 //! Every test here enrolls devices through the real HTTP endpoint (not by
@@ -21,8 +21,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use edgetak::app::{App, AppConfig};
-use edgetak::pki;
+use microtak_server::app::{App, AppConfig};
+use microtak_server::pki;
 use reqwest::header::CONTENT_TYPE;
 use rustls::pki_types::{PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
@@ -32,7 +32,7 @@ use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
-const SERVER_NAME: &str = "edgetak-server";
+const SERVER_NAME: &str = "microtak-server";
 
 static TEST_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -43,7 +43,7 @@ static TEST_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// mission files at once).
 fn unique_temp_dir() -> std::path::PathBuf {
     let n = TEST_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!("edgetak-e2e-{}-{n}", std::process::id()))
+    std::env::temp_dir().join(format!("microtak-e2e-{}-{n}", std::process::id()))
 }
 
 fn test_config() -> AppConfig {
@@ -120,7 +120,7 @@ async fn connect_mtls(
 /// which (unlike enrollment) requires a client cert per request. Since the
 /// server cert's SAN is the fixed name `SERVER_NAME`, not an IP,
 /// `.resolve()` is used to point that hostname at the real loopback address
-/// so hostname verification succeeds against `https://edgetak-server:<port>/...`
+/// so hostname verification succeeds against `https://microtak-server:<port>/...`
 /// URLs (the port in the URL is what's actually used to connect --
 /// `resolve()`'s own port is ignored per its documented behavior).
 fn mtls_reqwest_client(
@@ -216,7 +216,7 @@ async fn e2e_enroll_then_connect_via_mtls_and_relay_across_transports() {
 /// up and runs it against real, live-growing files.
 #[tokio::test]
 async fn e2e_backup_mirrors_live_server_state_to_disk() {
-    use edgetak::app::BackupConfig;
+    use microtak_server::app::BackupConfig;
 
     let backup_dir = unique_temp_dir();
     let mut config = test_config();

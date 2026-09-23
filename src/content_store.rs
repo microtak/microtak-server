@@ -147,7 +147,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "edgetak-content-{label}-{}-{n}",
+            "microtak-content-{label}-{}-{n}",
             std::process::id()
         ))
     }

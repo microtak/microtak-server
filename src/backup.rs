@@ -35,8 +35,8 @@ pub enum BackupError {
 }
 
 /// An external command that ships the local backup directory elsewhere,
-/// e.g. `["rsync", "-a", "{src}/", "user@host:/backups/edgetak/"]` or
-/// `["aws", "s3", "sync", "{src}", "s3://bucket/edgetak/"]`. Every
+/// e.g. `["rsync", "-a", "{src}/", "user@host:/backups/microtak/"]` or
+/// `["aws", "s3", "sync", "{src}", "s3://bucket/microtak/"]`. Every
 /// occurrence of the literal `{src}` in any argument is replaced with the
 /// local backup directory's path before running.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,7 +204,7 @@ mod tests {
 
     fn temp_dir(label: &str) -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("edgetak-backup-{label}-{}-{n}", std::process::id()))
+        std::env::temp_dir().join(format!("microtak-backup-{label}-{}-{n}", std::process::id()))
     }
 
     #[test]

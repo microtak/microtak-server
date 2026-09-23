@@ -1,10 +1,10 @@
 //! Cursor-on-Target (CoT) event model: XML parsing/serialization.
 //!
 //! Covers the `<event>` envelope, `<point>`, and the `<detail>` sub-elements
-//! EdgeTAK actually understands and acts on (contact identity, GeoChat,
+//! MicroTAK actually understands and acts on (contact identity, GeoChat,
 //! individual addressing) as defined in
 //! `wiki/ATAK-Communications-Architecture.md` (§1/§4). See
-//! `wiki/EdgeTAK-Test-Plan.md` for the full CoT test-case catalog this
+//! `wiki/MicroTAK-Test-Plan.md` for the full CoT test-case catalog this
 //! module is meant to satisfy.
 //!
 //! **Known simplification (TC-COT-10)**: `detail` models only the
@@ -111,7 +111,7 @@ pub struct Chat {
 /// `hierarchy` sub-tag alongside `chatgrp`. A confirmed real bug in a
 /// reference TAK server implementation traced *partial* GeoChat delivery
 /// (some recipients get a message, others silently don't) to exactly this
-/// field being missing from its model — EdgeTAK doesn't model `hierarchy`
+/// field being missing from its model — MicroTAK doesn't model `hierarchy`
 /// either yet, and routes purely off `chatgrp`'s `uidN` attributes. Worth
 /// revisiting against a real multi-hop ATAK team-chat configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,8 +139,8 @@ impl ChatGroup {
 
 /// Individual-addressing block (`<marti><dest .../></marti>`).
 ///
-/// **Known simplification**: EdgeTAK's routing only acts on `Dest::uid`,
-/// not `Dest::callsign` — `uid` is the identity EdgeTAK tracks robustly
+/// **Known simplification**: MicroTAK's routing only acts on `Dest::uid`,
+/// not `Dest::callsign` — `uid` is the identity MicroTAK tracks robustly
 /// (bound at the device registry level for authenticated connections);
 /// callsign is arbitrary free text with no uniqueness guarantee or
 /// registry backing. A real ATAK client addressing an individual chat
@@ -170,7 +170,7 @@ impl Event {
     /// Parse a single `<event>...</event>` XML document.
     ///
     /// Does NOT handle stream framing (multiple concatenated events with no
-    /// separator) — that's the transport layer's job (see `wiki/EdgeTAK-Test-Plan.md`
+    /// separator) — that's the transport layer's job (see `wiki/MicroTAK-Test-Plan.md`
     /// §Transport, TC-COT-STREAM-*). This only parses one already-isolated event.
     pub fn from_xml(xml: &str) -> Result<Self, CotError> {
         Ok(quick_xml::de::from_str(xml)?)
@@ -316,9 +316,9 @@ mod tests {
     #[test]
     fn accepts_stale_before_time() {
         // The official server does not appear to reject this at parse time
-        // per wiki/EdgeTAK-Test-Plan.md TC-COT-VALID-03 — `stale` is a
+        // per wiki/MicroTAK-Test-Plan.md TC-COT-VALID-03 — `stale` is a
         // client-side display hint, not a server-enforced ordering rule.
-        // EdgeTAK's parser mirrors that: parsing succeeds, and any policy
+        // MicroTAK's parser mirrors that: parsing succeeds, and any policy
         // decision about "already-stale on arrival" belongs to a later
         // validation/acceptance layer, not this module.
         let xml = r#"<event version="2.0" uid="TEST-UID-4" type="a-f-G-U-C" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2020-01-01T00:00:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/></event>"#;

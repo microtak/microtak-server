@@ -1,14 +1,14 @@
-# EdgeTAK
+# MicroTAK
 
 A lightweight TAK (Team Awareness Kit) server, written in Rust, designed to
-run on modest/edge infrastructure and to **federate with other EdgeTAK
+run on modest/edge infrastructure and to **federate with other MicroTAK
 instances over heterogeneous, often low-bandwidth transports** (MeshCore LoRa
 mesh, Reticulum/LXMF, Starlink, potentially AX.25 packet radio) — built for
 grid-down "island" scenarios where instances may be cut off from each other
 for extended periods and need to resync opportunistically once a link
 reappears.
 
-**Status: early but functional.** `edgetakd` runs a real server today: CoT
+**Status: early but functional.** `microtakd` runs a real server today: CoT
 parsing, a plain-TCP and an mTLS CoT relay sharing one cross-transport
 broadcast bus and one live connected-client registry, a certificate
 authority with CSR signing, a device registry with identity binding and
@@ -32,7 +32,7 @@ compatibility targets and as a "don't repeat this bug" checklist. See
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — design decisions, protocol
-  notes, and how EdgeTAK relates to existing TAK servers.
+  notes, and how MicroTAK relates to existing TAK servers.
 - [docs/TEST-PLAN.md](docs/TEST-PLAN.md) — the full test-case catalog every
   feature is expected to satisfy before being considered done.
 
@@ -48,17 +48,17 @@ the same running instance); everything else is tested at the module level.
 cargo build
 cargo test               # unit + module-level integration tests
 cargo test --test e2e    # end-to-end suite against the assembled server
-cargo run --bin edgetakd # starts a real server on the default ports
+cargo run --bin microtakd # starts a real server on the default ports
 ```
 
-Config is optional: `$EDGETAK_CONFIG`, or `./edgetak.toml` if unset (see
+Config is optional: `$MICROTAK_CONFIG`, or `./microtak.toml` if unset (see
 [docs/TEST-PLAN.md](docs/TEST-PLAN.md) §10). A missing file falls back to
 defaults. CA, device registry, mission store, and uploaded DataSync content
 persist under `data_dir` (default `./data`) and reload on the next start.
 Periodic backup is off by default; enable it with `backup_enabled = true`
 plus `backup_interval_seconds`, `backup_dir`, and an optional
 `backup_offsite_command` (e.g.
-`["rsync", "-a", "{src}/", "user@host:/backups/edgetak/"]`) — see
+`["rsync", "-a", "{src}/", "user@host:/backups/microtak/"]`) — see
 [docs/TEST-PLAN.md](docs/TEST-PLAN.md) §14.
 
 ## Project layout
@@ -84,7 +84,7 @@ src/
   transport/connections.rs — shared live connected-client registry
   transport/tcp.rs       — plain-TCP CoT relay
   transport/tls.rs       — mTLS-authenticated CoT relay
-  main.rs                — edgetakd entrypoint
+  main.rs                — microtakd entrypoint
 tests/
   e2e.rs                 — end-to-end suite against the assembled server
 ```

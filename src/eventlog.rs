@@ -1,5 +1,5 @@
 //! Generic append-only, replayable event log — the durability and audit
-//! mechanism for EdgeTAK's administrative state ([`crate::registry`],
+//! mechanism for MicroTAK's administrative state ([`crate::registry`],
 //! [`crate::missions`]).
 //!
 //! Each mutation appends one fsync'd JSON-Lines record instead of
@@ -168,7 +168,7 @@ mod tests {
 
     fn unique_temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "edgetak-eventlog-test-{label}-{}.jsonl",
+            "microtak-eventlog-test-{label}-{}.jsonl",
             std::process::id()
         ))
     }
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn creates_a_missing_parent_directory() {
         let dir = std::env::temp_dir().join(format!(
-            "edgetak-eventlog-test-parentdir-{}",
+            "microtak-eventlog-test-parentdir-{}",
             std::process::id()
         ));
         std::fs::remove_dir_all(&dir).ok(); // must not exist yet

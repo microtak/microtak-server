@@ -317,8 +317,8 @@ mod tests {
     }
 
     fn build_fixture() -> Fixture {
-        let ca = CertificateAuthority::generate("EdgeTAK Test CA").unwrap();
-        let (server_csr, server_key) = build_server_csr("edgetak-server", "edgetak-server");
+        let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
+        let (server_csr, server_key) = build_server_csr("microtak-server", "microtak-server");
         let signed = ca.sign_csr(&server_csr, Duration::days(365)).unwrap();
         let server_cert_der = pem_to_der(&signed.cert_pem);
         let ca_cert_der = pem_to_der(&ca.ca_cert_pem());
@@ -375,7 +375,7 @@ mod tests {
         let connector = client_tls_connector(fixture, cn);
         let tcp = TcpStream::connect(addr).await.unwrap();
         connector
-            .connect(ServerName::try_from("edgetak-server").unwrap(), tcp)
+            .connect(ServerName::try_from("microtak-server").unwrap(), tcp)
             .await
             .unwrap_or_else(|e| panic!("handshake for {cn} should succeed against the trusted CA: {e}"))
     }
@@ -457,7 +457,7 @@ mod tests {
         let connector = untrusted_client_tls_connector(&fixture);
         let tcp = TcpStream::connect(addr).await.unwrap();
         let connect_result = connector
-            .connect(ServerName::try_from("edgetak-server").unwrap(), tcp)
+            .connect(ServerName::try_from("microtak-server").unwrap(), tcp)
             .await;
 
         let mut stream = match connect_result {
@@ -480,7 +480,7 @@ mod tests {
     /// TC-TLS-05 (connect-time revocation check): a device revoked in the
     /// registry is disconnected immediately after a handshake that would
     /// otherwise succeed (its cert is still validly signed by the CA --
-    /// revocation is enforced by EdgeTAK's own registry, not the TLS layer).
+    /// revocation is enforced by MicroTAK's own registry, not the TLS layer).
     #[tokio::test]
     async fn tc_tls_05_disconnects_revoked_device_at_connect_time() {
         let fixture = build_fixture();
@@ -507,7 +507,7 @@ mod tests {
         let connector = client_tls_connector(&fixture, "device-revoked");
         let tcp = TcpStream::connect(addr).await.unwrap();
         let mut new_stream = connector
-            .connect(ServerName::try_from("edgetak-server").unwrap(), tcp)
+            .connect(ServerName::try_from("microtak-server").unwrap(), tcp)
             .await
             .expect("TLS handshake itself still succeeds -- the cert is validly signed");
 

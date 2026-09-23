@@ -36,7 +36,7 @@ pub struct Config {
     pub backup_interval_seconds: u64,
     pub backup_dir: PathBuf,
     /// An external command shipping the local backup elsewhere, e.g.
-    /// `["rsync", "-a", "{src}/", "user@host:/backups/edgetak/"]`. Empty
+    /// `["rsync", "-a", "{src}/", "user@host:/backups/microtak/"]`. Empty
     /// means local-only backup, no offsite shipping.
     pub backup_offsite_command: Vec<String>,
 }
@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn missing_file_falls_back_to_defaults() {
         let path = std::env::temp_dir().join(format!(
-            "edgetak-config-test-missing-{}.toml",
+            "microtak-config-test-missing-{}.toml",
             std::process::id()
         ));
         let config = Config::load_or_default(&path).unwrap();
@@ -158,15 +158,15 @@ mod tests {
     #[test]
     fn partial_toml_overrides_only_named_fields() {
         let dir = std::env::temp_dir().join(format!(
-            "edgetak-config-test-partial-{}",
+            "microtak-config-test-partial-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("edgetak.toml");
-        std::fs::write(&path, "data_dir = \"/var/lib/edgetak\"\nmtls_port = 9999\n").unwrap();
+        let path = dir.join("microtak.toml");
+        std::fs::write(&path, "data_dir = \"/var/lib/microtak\"\nmtls_port = 9999\n").unwrap();
 
         let config = Config::load_or_default(&path).unwrap();
-        assert_eq!(config.data_dir, PathBuf::from("/var/lib/edgetak"));
+        assert_eq!(config.data_dir, PathBuf::from("/var/lib/microtak"));
         assert_eq!(config.mtls_port, 9999);
         // Untouched fields keep their defaults.
         assert_eq!(config.bind_host, "0.0.0.0");
@@ -178,11 +178,11 @@ mod tests {
     #[test]
     fn invalid_toml_syntax_is_a_hard_error() {
         let dir = std::env::temp_dir().join(format!(
-            "edgetak-config-test-badsyntax-{}",
+            "microtak-config-test-badsyntax-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("edgetak.toml");
+        let path = dir.join("microtak.toml");
         std::fs::write(&path, "this is not valid toml [[[").unwrap();
 
         let result = Config::load_or_default(&path);
@@ -195,11 +195,11 @@ mod tests {
     #[test]
     fn out_of_range_port_is_rejected_at_parse_time() {
         let dir = std::env::temp_dir().join(format!(
-            "edgetak-config-test-badport-{}",
+            "microtak-config-test-badport-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("edgetak.toml");
+        let path = dir.join("microtak.toml");
         std::fs::write(&path, "mtls_port = 99999\n").unwrap(); // > u16::MAX
 
         let result = Config::load_or_default(&path);
@@ -246,17 +246,17 @@ mod tests {
     #[test]
     fn backup_settings_round_trip_from_toml() {
         let dir = std::env::temp_dir().join(format!(
-            "edgetak-config-test-backup-{}",
+            "microtak-config-test-backup-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("edgetak.toml");
+        let path = dir.join("microtak.toml");
         std::fs::write(
             &path,
             r#"
             backup_enabled = true
             backup_interval_seconds = 900
-            backup_dir = "/var/backups/edgetak"
+            backup_dir = "/var/backups/microtak"
             backup_offsite_command = ["rsync", "-a", "{src}/", "user@host:/backups/"]
             "#,
         )
@@ -268,7 +268,7 @@ mod tests {
         assert_eq!(app_config.backup.interval, std::time::Duration::from_secs(900));
         assert_eq!(
             app_config.backup.backup_dir,
-            PathBuf::from("/var/backups/edgetak")
+            PathBuf::from("/var/backups/microtak")
         );
         assert_eq!(
             app_config.backup.offsite_command,

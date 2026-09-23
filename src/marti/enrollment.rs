@@ -55,7 +55,7 @@ pub fn router(state: Arc<EnrollmentState>) -> Router {
 /// **Known simplification**: returns the bare PEM certificate rather than
 /// the real Marti API's `certificateConfig` XML schema — this project
 /// could not confirm that schema's exact field names from an authoritative
-/// source (see `docs/TEST-PLAN.md` §4), so this is EdgeTAK's own minimal
+/// source (see `docs/TEST-PLAN.md` §4), so this is MicroTAK's own minimal
 /// contract for now, not a verified compatibility target.
 async fn get_config(State(state): State<Arc<EnrollmentState>>) -> impl IntoResponse {
     (
@@ -188,7 +188,7 @@ mod tests {
 
     fn test_state() -> Arc<EnrollmentState> {
         Arc::new(EnrollmentState {
-            ca: CertificateAuthority::generate("EdgeTAK Test CA").unwrap(),
+            ca: CertificateAuthority::generate("MicroTAK Test CA").unwrap(),
             registry: Arc::new(DeviceRegistry::in_memory()),
             cert_validity: Duration::days(365),
         })

@@ -9,7 +9,7 @@
 //! [`super::MtlsHttpServer`], which also injects the connecting cert's CN
 //! as a [`super::PeerIdentity`] request extension. Every handler that
 //! accepts a `creatorUid`/`actorUid`/`uid` claim in the request rejects
-//! (403) if it doesn't match the authenticated [`PeerIdentity`] — EdgeTAK's
+//! (403) if it doesn't match the authenticated [`PeerIdentity`] — MicroTAK's
 //! policy: an HTTP API caller's identity *is* its cert's CN, so a caller
 //! can't act as any identity it merely claims in a request body/query
 //! param, closing the gap this module used to have.
@@ -17,7 +17,7 @@
 //! **`PUT` vs `PATCH` (TC-MARTI-02/12)**: `PUT /missions/:name` is
 //! strict-create-only (409 if the name is already taken); updates go
 //! through `PATCH /missions/:name` and only touch the fields provided.
-//! This is EdgeTAK's own, deliberately stricter contract — a real reference
+//! This is MicroTAK's own, deliberately stricter contract — a real reference
 //! implementation's `PUT` silently merges into an existing mission with no
 //! way for the caller to distinguish "created" from "updated," which this
 //! design avoids by construction rather than replicating.
@@ -67,7 +67,7 @@ fn error_response(status: StatusCode, message: String) -> Response {
 
 /// TC-MARTI-10's residual gap, closed: reject a request whose claimed
 /// identity (`creatorUid`/`actorUid`/`uid`) doesn't match the
-/// authenticated connection's own cert CN. EdgeTAK's policy is that an
+/// authenticated connection's own cert CN. MicroTAK's policy is that an
 /// HTTP API caller's identity *is* its cert's CN — the same identity
 /// enrollment issued it — so this needs no prior CoT-relay interaction,
 /// unlike checking against a `registry`-bound `uid` would.

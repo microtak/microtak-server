@@ -3,7 +3,7 @@
 //!
 //! A real reference implementation was found to return a static/hardcoded
 //! empty list for this endpoint regardless of who was actually connected —
-//! this handler exists specifically so EdgeTAK's answer is never that.
+//! this handler exists specifically so MicroTAK's answer is never that.
 
 use axum::extract::State;
 use axum::routing::get;

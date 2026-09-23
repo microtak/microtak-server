@@ -2,7 +2,7 @@
 //!
 //! Implements the server side of the enrollment flow described in
 //! `docs/TEST-PLAN.md` §4 — a client submits a CSR, this module signs it
-//! against EdgeTAK's own CA. Does not implement the Marti
+//! against MicroTAK's own CA. Does not implement the Marti
 //! `/Marti/api/tls/*` HTTP contract itself (Content-Type strictness,
 //! per-client response shaping, etc. — see TC-ENROLL-02/03/07) — that's a
 //! thin HTTP layer on top of [`CertificateAuthority::sign_csr`], not yet
@@ -192,14 +192,14 @@ mod tests {
 
     #[test]
     fn generates_a_self_signed_ca() {
-        let ca = CertificateAuthority::generate("EdgeTAK Test CA").unwrap();
+        let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
         assert!(ca.ca_cert_pem().contains("BEGIN CERTIFICATE"));
         assert!(ca.ca_key_pem().contains("PRIVATE KEY"));
     }
 
     #[test]
     fn signs_a_valid_csr() {
-        let ca = CertificateAuthority::generate("EdgeTAK Test CA").unwrap();
+        let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
         let (csr_pem, _key) = build_csr("device-alpha").unwrap();
 
         let signed = ca.sign_csr(&csr_pem, Duration::days(365)).unwrap();
@@ -209,14 +209,14 @@ mod tests {
 
     #[test]
     fn tc_enroll_06_rejects_malformed_csr() {
-        let ca = CertificateAuthority::generate("EdgeTAK Test CA").unwrap();
+        let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
         let result = ca.sign_csr("not a csr at all", Duration::days(365));
         assert!(matches!(result, Err(PkiError::CsrParse(_))));
     }
 
     #[test]
     fn signing_two_csrs_produces_different_certificates() {
-        let ca = CertificateAuthority::generate("EdgeTAK Test CA").unwrap();
+        let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
         let (csr_a, _key_a) = build_csr("device-a").unwrap();
         let (csr_b, _key_b) = build_csr("device-b").unwrap();
 
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn ca_survives_a_reload_round_trip_and_can_still_sign() {
-        let ca = CertificateAuthority::generate("EdgeTAK Test CA").unwrap();
+        let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
         let cert_pem = ca.ca_cert_pem();
         let key_pem = ca.ca_key_pem();
 
@@ -252,7 +252,7 @@ mod tests {
     fn signed_certificate_is_cryptographically_verifiable_against_the_ca() {
         use x509_parser::prelude::{FromDer, X509Certificate};
 
-        let ca = CertificateAuthority::generate("EdgeTAK Test CA").unwrap();
+        let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
         let (csr_pem, _key) = build_csr("device-verify").unwrap();
         let signed = ca.sign_csr(&csr_pem, Duration::days(365)).unwrap();
 
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn rejects_csr_with_no_common_name() {
-        let ca = CertificateAuthority::generate("EdgeTAK Test CA").unwrap();
+        let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
         let key = KeyPair::generate().unwrap();
         // `CertificateParams::new` defaults to a placeholder CN -- remove it
         // to exercise a CSR whose subject genuinely has none.

@@ -1,11 +1,11 @@
-//! EdgeTAK core library.
+//! MicroTAK core library.
 //!
 //! Architecture, design decisions, and the full test-case catalog live in
-//! this monorepo's wiki: `wiki/EdgeTAK.md` and `wiki/EdgeTAK-Test-Plan.md`.
+//! this monorepo's wiki: `wiki/MicroTAK.md` and `wiki/MicroTAK-Test-Plan.md`.
 //! Read those before extending this crate — this is a from-scratch,
 //! compatibility-minded reimplementation of TAK server behavior, and the
 //! wiki documents which behaviors are confirmed-compatible targets vs.
-//! EdgeTAK's own design decisions where no authoritative spec exists.
+//! MicroTAK's own design decisions where no authoritative spec exists.
 
 pub mod app;
 pub mod backup;

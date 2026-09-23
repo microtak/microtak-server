@@ -17,7 +17,7 @@
 //! [`MtlsHttpServer`] injects the connecting cert's Common Name into every
 //! request as a [`PeerIdentity`] extension — [`missions`] uses this to
 //! reject a request whose claimed `creatorUid`/`actorUid` doesn't match the
-//! authenticated connection's own identity (EdgeTAK's policy: an HTTP API
+//! authenticated connection's own identity (MicroTAK's policy: an HTTP API
 //! caller's identity *is* its cert's CN, the same identity enrollment
 //! issued it — this doesn't require any prior CoT-relay interaction, so it
 //! works for HTTP-only callers like a web frontend that never streams raw

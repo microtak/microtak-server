@@ -102,7 +102,7 @@ struct MissionRecord {
 /// left as-is, matching PATCH's "only touch what's provided" semantics
 /// (contrast with a reference implementation's `PUT`-as-merge behavior,
 /// documented as a real, confirmed gap in `docs/TEST-PLAN.md` TC-MARTI-12 —
-/// EdgeTAK's own `PUT`, by contrast, is strict-create-only; see
+/// MicroTAK's own `PUT`, by contrast, is strict-create-only; see
 /// `marti::missions`).
 #[derive(Debug, Default)]
 pub struct MissionUpdate {
@@ -211,7 +211,7 @@ impl MissionStore {
         Ok(missions.get(name).unwrap().mission.clone().unwrap())
     }
 
-    /// TC-MARTI-12: EdgeTAK's own answer — a partial update (only the
+    /// TC-MARTI-12: MicroTAK's own answer — a partial update (only the
     /// provided fields change), not the full-replace semantics `PUT` would
     /// otherwise invite ambiguity about.
     pub fn update(
@@ -673,7 +673,7 @@ mod tests {
 
     #[test]
     fn persists_across_reload() {
-        let dir = std::env::temp_dir().join(format!("edgetak-missions-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("microtak-missions-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("missions.log");
 
@@ -695,7 +695,7 @@ mod tests {
     /// operations that deliberately appended no event.
     #[test]
     fn replay_reconstructs_a_realistic_mutation_sequence_exactly() {
-        let dir = std::env::temp_dir().join(format!("edgetak-missions-replay-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("microtak-missions-replay-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("missions.log");
 
