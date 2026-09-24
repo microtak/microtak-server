@@ -4,11 +4,15 @@ services:
     image: microtak-server:latest
     restart: unless-stopped
     ports:
-      # host:container -- enrollment, Marti API (mTLS), plain-TCP CoT, mTLS CoT.
-      - "8446:8446"
-      - "8443:8443"
-      - "8087:8087"
-      - "8089:8089"
+      # host:container -- enrollment, Marti API (mTLS), plain-TCP CoT, mTLS
+      # CoT. Host-side ports are overridable via .env (see .env.example) for
+      # deployments that need to avoid colliding with other services on the
+      # same host -- container-side ports stay fixed, matching the app's own
+      # defaults (see src/app.rs).
+      - "${MICROTAK_ENROLLMENT_HOST_PORT:-8446}:8446"
+      - "${MICROTAK_MARTI_API_HOST_PORT:-8443}:8443"
+      - "${MICROTAK_PLAIN_TCP_HOST_PORT:-8087}:8087"
+      - "${MICROTAK_MTLS_HOST_PORT:-8089}:8089"
     volumes:
       - microtak-data:/var/lib/microtak-server/data
       - microtak-backup:/var/lib/microtak-server/backup

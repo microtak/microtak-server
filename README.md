@@ -98,6 +98,23 @@ Data and backups live in Docker volumes so they survive container restarts.
 To customize settings, drop a `microtak.toml` next to `docker-compose.yml`
 and uncomment the volume mount for it.
 
+Deploying alongside other services on a shared host? Host-side ports are
+overridable via a `.env` file (copy `.env.example`), and
+`docker-compose.proxy.yml` is an optional overlay that fronts the
+certificate-enrollment endpoint with an existing Traefik reverse proxy for a
+real TLS certificate (e.g. via Let's Encrypt) instead of raw HTTP:
+
+```sh
+cp .env.example .env   # fill in your real domain/ports; .env is gitignored
+docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d
+```
+
+The Marti API and both CoT relay ports are deliberately left out of that
+overlay — they do their own TLS (and, for the mTLS ones, client-cert
+authentication) at the application layer, so they're published directly to
+the host rather than routed through a reverse proxy that would just add a
+redundant (or actively broken) second TLS layer in front.
+
 A [Helm chart](charts/microtak-server) is also available for Kubernetes
 deployments. See [docs/PACKAGING.md](docs/PACKAGING.md) for the plan to add
 apt, Nix, and AUR packages on top of these.

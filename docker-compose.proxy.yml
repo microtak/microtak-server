@@ -1,0 +1,38 @@
+# Optional overlay: front the plain-HTTP enrollment endpoint with a Traefik
+# reverse proxy for a real, browser/ATAK-trusted TLS certificate (e.g. via
+# Let's Encrypt), instead of exposing it as raw HTTP.
+#
+# Usage:
+#   cp .env.example .env   # fill in the real values -- .env is gitignored,
+#                           # never commit it (see .env.example's own notes)
+#   docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d
+#
+# This assumes a Traefik instance *already running elsewhere* on the same
+# Docker host (its own compose/stack, not part of this repo), attached to an
+# external Docker network, with a certificate resolver already configured.
+# This file only adds this container to that network and labels it --
+# it does not run Traefik itself.
+#
+# Deliberately NOT included here: the Marti API (mTLS) and both CoT relay
+# ports. Those terminate their own TLS (and, for the mTLS ones, client-cert
+# auth) at the application layer -- a reverse proxy terminating TLS in front
+# of them would either break client-cert auth outright or add nothing but a
+# second, redundant TLS handshake. They stay published directly to the host
+# via docker-compose.yml's own `ports:` (see .env.example for those).
+services:
+  microtak-server:
+    networks:
+      - default
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.microtak-enroll.rule=Host(`${MICROTAK_DOMAIN}`)"
+      - "traefik.http.routers.microtak-enroll.entrypoints=${TRAEFIK_ENROLLMENT_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.microtak-enroll.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}"
+      - "traefik.http.routers.microtak-enroll.service=microtak-enroll"
+      - "traefik.http.services.microtak-enroll.loadbalancer.server.port=8446"
+
+networks:
+  proxy:
+    name: ${TRAEFIK_NETWORK:-web}
+    external: true
