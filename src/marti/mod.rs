@@ -11,12 +11,21 @@
 //! - [`content`]: DataSync file content upload/download by hash
 //!   (`/Marti/api/sync/*`, TC-MARTI-07/08), on top of
 //!   [`crate::content_store::ContentStore`].
-//! - [`admin`]: mint/list/revoke enrollment invite tokens
-//!   (`/Marti/api/admin/*`), gated by a configured admin cert Common Name
-//!   on top of the usual mTLS auth -- see its own doc comment for the
+//! - [`admin`]: mint/list/revoke enrollment invite tokens and user
+//!   accounts, plus certificate-admin lookups (`/Marti/api/admin/*`,
+//!   `/Marti/api/certadmin/*`), gated by a configured admin cert Common
+//!   Name on top of the usual mTLS auth -- see its own doc comment for the
 //!   bootstrap order this implies.
+//! - [`oauth`]: `POST /oauth/token`, real TAK-Server/CloudTAK-compatible
+//!   password-grant login (plain HTTP, same listener as [`enrollment`]).
+//! - [`discovery`]: small version/config probe endpoints
+//!   (`/Marti/api/version`, `/Marti/api/version/config`,
+//!   `/files/api/config`) real clients use to confirm a working connection.
+//! - [`contacts`]: `GET /Marti/api/contacts/all`, mapped from the same live
+//!   connection registry [`client_endpoints`] uses.
+//! - [`groups`]: `GET /Marti/api/groups/all`, a real, honestly-empty stub.
 //!
-//! Not yet implemented: groups, device profiles.
+//! Not yet implemented: real groups/channels, device profiles.
 //!
 //! [`MtlsHttpServer`] injects the connecting cert's Common Name into every
 //! request as a [`PeerIdentity`] extension — [`missions`] uses this to
@@ -41,9 +50,13 @@ use tracing::warn;
 
 pub mod admin;
 pub mod client_endpoints;
+pub mod contacts;
 pub mod content;
+pub mod discovery;
 pub mod enrollment;
+pub mod groups;
 pub mod missions;
+pub mod oauth;
 
 /// The authenticated identity of an mTLS-connected caller — the connecting
 /// client certificate's Common Name. Injected as a request extension by

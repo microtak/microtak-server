@@ -147,6 +147,19 @@ pub fn cert_pem_to_der(pem_str: &str) -> Result<CertificateDer<'static>, PkiErro
     Ok(CertificateDer::from(parsed.contents().to_vec()))
 }
 
+/// The SHA-256 fingerprint of a PEM-encoded certificate's DER bytes,
+/// formatted as uppercase colon-separated hex (`AA:BB:CC:...`) — matching
+/// Node's `crypto.X509Certificate.fingerprint256`, since that's what a real
+/// `node-tak` client computes locally and sends us for a
+/// `GET /Marti/api/certadmin/cert/:hash` lookup (see `marti::admin`).
+pub fn fingerprint_sha256_colon_hex(cert_pem: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let der = cert_pem_to_der(cert_pem).ok()?;
+    let digest = Sha256::digest(der.as_ref());
+    let hex_pairs: Vec<String> = digest.iter().map(|byte| format!("{byte:02X}")).collect();
+    Some(hex_pairs.join(":"))
+}
+
 /// Extract the Common Name from a DER-encoded certificate, e.g. an mTLS
 /// peer certificate presented during a handshake. Shared by
 /// `transport::tls` and `marti::MtlsHttpServer` — one identity-extraction
@@ -269,6 +282,25 @@ mod tests {
                 .is_ok(),
             "leaf certificate's signature must verify against the CA's public key"
         );
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_distinguishes_different_certs() {
+        let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
+        let (csr_a, _key_a) = build_csr("device-a").unwrap();
+        let (csr_b, _key_b) = build_csr("device-b").unwrap();
+        let signed_a = ca.sign_csr(&csr_a, Duration::days(365)).unwrap();
+        let signed_b = ca.sign_csr(&csr_b, Duration::days(365)).unwrap();
+
+        let fp_a1 = fingerprint_sha256_colon_hex(&signed_a.cert_pem).unwrap();
+        let fp_a2 = fingerprint_sha256_colon_hex(&signed_a.cert_pem).unwrap();
+        let fp_b = fingerprint_sha256_colon_hex(&signed_b.cert_pem).unwrap();
+
+        assert_eq!(fp_a1, fp_a2, "the same cert must always fingerprint the same");
+        assert_ne!(fp_a1, fp_b);
+        assert_eq!(fp_a1.len(), 32 * 3 - 1, "32 hex-pair groups joined by colons");
+        assert!(fp_a1.chars().all(|c| c.is_ascii_hexdigit() || c == ':'));
+        assert_eq!(fp_a1, fp_a1.to_uppercase());
     }
 
     #[test]

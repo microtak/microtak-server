@@ -52,6 +52,14 @@ perimeter), set `enrollment_mode = "open"` to disable the lockdown
 permanently — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the
 reasoning behind the two modes.
 
+For clients that expect real TAK-Server-style username/password login
+(e.g. [CloudTAK](https://github.com/dfpc-coe/CloudTAK)) rather than a bare
+invite token, mint a password account the same way — `POST
+/Marti/api/admin/users` (or the CLI's `user mint` command) — and that
+account can log in via `POST /oauth/token` and self-enroll a device cert
+via `Authorization: Basic` on the enrollment endpoint, bypassing the
+invite-token gate entirely.
+
 ## System requirements
 
 MicroTAK is deliberately lightweight — it's built to run on the kind of

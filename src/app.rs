@@ -22,8 +22,8 @@ use crate::enrollment_tokens::{EnrollmentTokenError, EnrollmentTokenStore};
 use crate::marti::admin::AdminState;
 use crate::marti::enrollment::EnrollmentState;
 use crate::marti::{
-    admin, client_endpoints, content as content_api, enrollment, missions as missions_api,
-    MtlsHttpServer, PlainHttpServer,
+    admin, client_endpoints, contacts, content as content_api, discovery, enrollment, groups,
+    missions as missions_api, oauth, MtlsHttpServer, PlainHttpServer,
 };
 use crate::missions::{MissionError, MissionStore};
 use crate::pki::{self, CertificateAuthority, PkiError};
@@ -32,6 +32,7 @@ use crate::transport::connections::ConnectedClients;
 use crate::transport::hub::RelayHub;
 use crate::transport::tcp::TcpRelay;
 use crate::transport::tls::{self, TlsRelay, TlsSetupError};
+use crate::users::UserStore;
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -155,6 +156,8 @@ pub enum AppError {
     Missions(#[from] MissionError),
     #[error("enrollment token store setup failed: {0}")]
     EnrollmentTokens(#[from] EnrollmentTokenError),
+    #[error("user store setup failed: {0}")]
+    Users(#[from] crate::users::UserError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -199,6 +202,7 @@ impl App {
         let enrollment_tokens = Arc::new(EnrollmentTokenStore::load_or_create(
             config.data_dir.join("enrollment_tokens.log"),
         )?);
+        let users = Arc::new(UserStore::load_or_create(config.data_dir.join("users.log"))?);
         let hub = RelayHub::new();
         let clients = ConnectedClients::new();
 
@@ -229,21 +233,24 @@ impl App {
             tokens: Arc::clone(&enrollment_tokens),
             enrollment_mode: config.enrollment_mode,
             admin_common_name: config.admin_common_name.clone(),
+            users: Arc::clone(&users),
         });
 
-        let enrollment = PlainHttpServer::bind(
-            config.enrollment_addr,
-            enrollment::router(enrollment_state),
-        )
-        .await?;
+        let plain_router = enrollment::router(enrollment_state).merge(oauth::router(Arc::clone(&users)));
+        let enrollment = PlainHttpServer::bind(config.enrollment_addr, plain_router).await?;
         let admin_state = AdminState {
             tokens: enrollment_tokens,
+            users,
+            registry: Arc::clone(&registry),
             admin_common_name: config.admin_common_name.clone(),
         };
         let marti_router = missions_api::router(Arc::clone(&missions))
             .merge(client_endpoints::router(clients.clone()))
             .merge(content_api::router(Arc::clone(&content_store)))
-            .merge(admin::router(admin_state));
+            .merge(admin::router(admin_state))
+            .merge(discovery::router())
+            .merge(contacts::router(clients.clone()))
+            .merge(groups::router());
         let marti_api =
             MtlsHttpServer::bind(config.marti_api_addr, Arc::clone(&tls_server_config), marti_router)
                 .await?;

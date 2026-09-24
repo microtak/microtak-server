@@ -1,5 +1,7 @@
 //! Admin API: mint/list/revoke enrollment invite tokens
-//! (`/Marti/api/admin/enrollmentTokens`).
+//! (`/Marti/api/admin/enrollmentTokens`) and user accounts
+//! (`/Marti/api/admin/users`), plus a real TAK-Server-compatible
+//! certificate-admin lookup (`/Marti/api/certadmin/cert/:hash`).
 //!
 //! mTLS-authenticated like the rest of the Marti API (served via
 //! [`super::MtlsHttpServer`]), but with an additional identity check on top:
@@ -31,10 +33,15 @@ use time::OffsetDateTime;
 
 use super::PeerIdentity;
 use crate::enrollment_tokens::{EnrollmentTokenError, EnrollmentTokenStore};
+use crate::pki;
+use crate::registry::DeviceRegistry;
+use crate::users::UserStore;
 
 #[derive(Clone)]
 pub struct AdminState {
     pub tokens: Arc<EnrollmentTokenStore>,
+    pub users: Arc<UserStore>,
+    pub registry: Arc<DeviceRegistry>,
     /// `None` means the admin API is unreachable by anyone.
     pub admin_common_name: Option<String>,
 }
@@ -49,6 +56,12 @@ pub fn router(state: AdminState) -> Router {
             "/Marti/api/admin/enrollmentTokens/:token",
             axum::routing::delete(revoke_token),
         )
+        .route("/Marti/api/admin/users", post(mint_user).get(list_users))
+        .route(
+            "/Marti/api/admin/users/:username",
+            axum::routing::delete(revoke_user),
+        )
+        .route("/Marti/api/certadmin/cert/:hash", axum::routing::get(get_cert_by_hash))
         .with_state(state)
 }
 
@@ -146,6 +159,117 @@ async fn revoke_token(
     }
 }
 
+fn user_error_response(error: crate::users::UserError) -> Response {
+    match error {
+        crate::users::UserError::NotFound => {
+            error_response(StatusCode::NOT_FOUND, "unknown user".to_string())
+        }
+        crate::users::UserError::AlreadyExists => {
+            error_response(StatusCode::CONFLICT, "user already exists".to_string())
+        }
+        other => error_response(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct MintUserRequest {
+    username: String,
+    /// If omitted, a random password is generated and returned once --
+    /// same ergonomics as an enrollment token's own single-reveal value.
+    #[serde(default)]
+    password: Option<String>,
+}
+
+async fn mint_user(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    let request: MintUserRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(StatusCode::BAD_REQUEST, format!("invalid request body: {error}"))
+        }
+    };
+    let password = request.password.unwrap_or_else(random_password);
+    match state.users.mint(&request.username, &password, now_unix()) {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "username": request.username, "password": password })),
+        )
+            .into_response(),
+        Err(error) => user_error_response(error),
+    }
+}
+
+async fn list_users(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    Json(state.users.list()).into_response()
+}
+
+async fn revoke_user(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(username): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    match state.users.revoke(&username) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => user_error_response(error),
+    }
+}
+
+fn random_password() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("OS RNG must be available");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `GET /Marti/api/certadmin/cert/:hash` -- confirmed from real client
+/// source (`dfpc-coe/node-tak`'s `lib/api/certificate.ts`'s `validate()`/
+/// `get()`): a real client looks up a certificate by the SHA-256
+/// fingerprint (colon-separated uppercase hex) it computed locally from its
+/// own copy of the cert, to check whether the server still considers it
+/// valid (known, not revoked). O(n) scan over the device registry
+/// computing each stored cert's fingerprint on the fly -- simple, and fine
+/// at this project's scale (see `pki::fingerprint_sha256_colon_hex`).
+async fn get_cert_by_hash(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(hash): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    let Some(record) = state.registry.all().into_iter().find(|record| {
+        pki::fingerprint_sha256_colon_hex(&record.cert_pem).as_deref() == Some(hash.as_str())
+    }) else {
+        return error_response(StatusCode::NOT_FOUND, "unknown certificate".to_string());
+    };
+    Json(serde_json::json!({
+        "version": "3",
+        "type": "TakCert",
+        "data": {
+            "hash": hash,
+            "subjectDn": format!("CN={}", record.common_name),
+            "userDn": format!("CN={}", record.common_name),
+            "clientUid": record.common_name,
+            "revocationDate": if record.revoked { Some("revoked") } else { None },
+        },
+    }))
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,13 +277,19 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    fn app_with_admin(admin_cn: Option<&str>) -> (Router, Arc<EnrollmentTokenStore>) {
+    fn app_with_admin(
+        admin_cn: Option<&str>,
+    ) -> (Router, Arc<EnrollmentTokenStore>, Arc<UserStore>, Arc<DeviceRegistry>) {
         let tokens = Arc::new(EnrollmentTokenStore::in_memory());
+        let users = Arc::new(UserStore::in_memory());
+        let registry = Arc::new(DeviceRegistry::in_memory());
         let state = AdminState {
             tokens: Arc::clone(&tokens),
+            users: Arc::clone(&users),
+            registry: Arc::clone(&registry),
             admin_common_name: admin_cn.map(str::to_string),
         };
-        (router(state), tokens)
+        (router(state), tokens, users, registry)
     }
 
     async fn request_as(
@@ -183,7 +313,7 @@ mod tests {
     /// up in the list, and it can then be revoked.
     #[tokio::test]
     async fn admin_can_mint_list_and_revoke_a_token() {
-        let (mut app, _tokens) = app_with_admin(Some("jz-admin"));
+        let (mut app, _tokens, _users, _registry) = app_with_admin(Some("jz-admin"));
 
         let mint_response = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/enrollmentTokens", "{}").await;
         assert_eq!(mint_response.status(), StatusCode::CREATED);
@@ -214,7 +344,7 @@ mod tests {
     /// just because it's a valid mTLS connection.
     #[tokio::test]
     async fn non_admin_identity_is_rejected() {
-        let (mut app, tokens) = app_with_admin(Some("jz-admin"));
+        let (mut app, tokens, _users, _registry) = app_with_admin(Some("jz-admin"));
         let response = request_as(&mut app, "some-other-device", "POST", "/Marti/api/admin/enrollmentTokens", "{}").await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(tokens.list().is_empty(), "the rejected request must not have minted anything");
@@ -224,14 +354,14 @@ mod tests {
     /// not "open by default."
     #[tokio::test]
     async fn no_configured_admin_rejects_every_caller() {
-        let (mut app, _tokens) = app_with_admin(None);
+        let (mut app, _tokens, _users, _registry) = app_with_admin(None);
         let response = request_as(&mut app, "anyone", "GET", "/Marti/api/admin/enrollmentTokens", "").await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
     async fn revoking_unknown_token_is_404() {
-        let (mut app, _tokens) = app_with_admin(Some("jz-admin"));
+        let (mut app, _tokens, _users, _registry) = app_with_admin(Some("jz-admin"));
         let response = request_as(
             &mut app,
             "jz-admin",
@@ -245,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn mint_accepts_expiry_and_note() {
-        let (mut app, tokens) = app_with_admin(Some("jz-admin"));
+        let (mut app, tokens, _users, _registry) = app_with_admin(Some("jz-admin"));
         let response = request_as(
             &mut app,
             "jz-admin",
@@ -262,5 +392,133 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert!(list[0].expires_at_unix.is_some());
         assert_eq!(list[0].note.as_deref(), Some("for jz_pixel"));
+    }
+
+    #[tokio::test]
+    async fn admin_can_mint_list_and_revoke_a_user() {
+        let (mut app, _tokens, users, _registry) = app_with_admin(Some("jz-admin"));
+
+        let mint_response = request_as(
+            &mut app,
+            "jz-admin",
+            "POST",
+            "/Marti/api/admin/users",
+            r#"{"username": "alice", "password": "correct horse battery staple"}"#,
+        )
+        .await;
+        assert_eq!(mint_response.status(), StatusCode::CREATED);
+        assert!(users.authenticate("alice", "correct horse battery staple"));
+
+        let list_response = request_as(&mut app, "jz-admin", "GET", "/Marti/api/admin/users", "").await;
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX).await.unwrap();
+        let list: Vec<serde_json::Value> = serde_json::from_slice(&list_body).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["username"], "alice");
+
+        let revoke_response = request_as(&mut app, "jz-admin", "DELETE", "/Marti/api/admin/users/alice", "").await;
+        assert_eq!(revoke_response.status(), StatusCode::NO_CONTENT);
+        assert!(!users.authenticate("alice", "correct horse battery staple"));
+    }
+
+    /// Omitting a password auto-generates one and returns it once --
+    /// mirrors an enrollment token's own single-reveal ergonomics.
+    #[tokio::test]
+    async fn mint_user_without_a_password_generates_one() {
+        let (mut app, _tokens, users, _registry) = app_with_admin(Some("jz-admin"));
+        let response = request_as(
+            &mut app,
+            "jz-admin",
+            "POST",
+            "/Marti/api/admin/users",
+            r#"{"username": "bob"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let generated_password = body["password"].as_str().unwrap();
+        assert!(!generated_password.is_empty());
+        assert!(users.authenticate("bob", generated_password));
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_manage_users() {
+        let (mut app, _tokens, users, _registry) = app_with_admin(Some("jz-admin"));
+        let response = request_as(
+            &mut app,
+            "some-other-device",
+            "POST",
+            "/Marti/api/admin/users",
+            r#"{"username": "alice", "password": "hunter2"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(users.list().is_empty(), "the rejected request must not have minted anything");
+    }
+
+    #[tokio::test]
+    async fn certadmin_lookup_finds_an_enrolled_devices_real_fingerprint() {
+        let (mut app, _tokens, _users, registry) = app_with_admin(Some("jz-admin"));
+        let ca = crate::pki::CertificateAuthority::generate("Test CA").unwrap();
+        let (csr_pem, _key) = crate::pki::build_csr("device-a").unwrap();
+        let signed = ca.sign_csr(&csr_pem, time::Duration::days(365)).unwrap();
+        registry.enroll("device-a", &signed.cert_pem, 1_000).unwrap();
+        let hash = crate::pki::fingerprint_sha256_colon_hex(&signed.cert_pem).unwrap();
+
+        let response = request_as(
+            &mut app,
+            "jz-admin",
+            "GET",
+            &format!("/Marti/api/certadmin/cert/{hash}"),
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["data"]["clientUid"], "device-a");
+        assert!(body["data"]["revocationDate"].is_null());
+    }
+
+    #[tokio::test]
+    async fn certadmin_lookup_reports_revocation_status() {
+        let (mut app, _tokens, _users, registry) = app_with_admin(Some("jz-admin"));
+        let ca = crate::pki::CertificateAuthority::generate("Test CA").unwrap();
+        let (csr_pem, _key) = crate::pki::build_csr("device-revoked").unwrap();
+        let signed = ca.sign_csr(&csr_pem, time::Duration::days(365)).unwrap();
+        registry.enroll("device-revoked", &signed.cert_pem, 1_000).unwrap();
+        registry.revoke("device-revoked").unwrap();
+        let hash = crate::pki::fingerprint_sha256_colon_hex(&signed.cert_pem).unwrap();
+
+        let response = request_as(
+            &mut app,
+            "jz-admin",
+            "GET",
+            &format!("/Marti/api/certadmin/cert/{hash}"),
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(!body["data"]["revocationDate"].is_null());
+    }
+
+    #[tokio::test]
+    async fn certadmin_lookup_of_unknown_hash_is_404() {
+        let (mut app, _tokens, _users, _registry) = app_with_admin(Some("jz-admin"));
+        let response = request_as(
+            &mut app,
+            "jz-admin",
+            "GET",
+            "/Marti/api/certadmin/cert/00:11:22",
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -228,6 +228,20 @@ Added 2026-09-23, closing the second half of the permissions/enrollment discussi
 
 **Not yet implemented**: role hierarchy beyond the two flat roles (no `MISSION_READONLY` or per-content-item permissions); group/channel-scoped visibility (a mission's `list`/`get` are still open to any authenticated device regardless of role, a deliberate v1 scope boundary — see `docs/ARCHITECTURE.md`'s "Mission roles" section).
 
+## 18. Real TAK-Server / CloudTAK wire compatibility (new modules, not part of the original catalog)
+
+Added 2026-09-24, prompted by wanting real CloudTAK to work against MicroTAK unmodified. Unlike most of this project's earlier design work, this has a real, confirmed authoritative source: `dfpc-coe/node-tak`'s actual client library, fetched directly from GitHub — CloudTAK's own real code, not a guess or a mock. So tracked with plain descriptions (the exact wire contract is cited in `docs/ARCHITECTURE.md`'s own section, not duplicated here).
+
+**Implemented** (`src/users.rs`, `src/marti/oauth.rs`, `src/marti/discovery.rs`, `src/marti/contacts.rs`, `src/marti/groups.rs`, plus additions to `src/marti/enrollment.rs` and `src/marti/admin.rs`), each with a passing unit or module test: a new `UserStore` (event-log-backed, Argon2-hashed passwords, mint/list/revoke via the admin API) backs `POST /oauth/token` (real password-grant login) and a new `Authorization: Basic` path on `signClient/v2` (real password-authenticated cert issuance, bypassing the invite-token gate, with the CSR's CN checked against the authenticated username). `GET /Marti/api/tls/config` now serves the real `certificateConfig` XML instead of the bare CA PEM it used to (moved to a new `GET /Marti/api/tls/ca.pem`). `signClient/v2`'s response now strips PEM armor from `signedCert`/`ca0`, matching the real wire format — a breaking change from the previous, unconfirmed full-PEM guess, which also required fixing `microtak-admin-cli`'s and `microtak-admin-web`'s own parsing (both assumed full PEM). New mTLS discovery endpoints (`/Marti/api/version`, `/Marti/api/version/config`, `/files/api/config`, `/Marti/api/contacts/all` — mapped from the live connection registry, not a stub — `/Marti/api/groups/all` — an honest empty stub) and a real `GET /Marti/api/certadmin/cert/:hash` lookup keyed by SHA-256 fingerprint against the device registry's actual revocation status.
+
+**Mutation-tested** per this project's own red-team methodology: the CSR-Common-Name-must-match-authenticated-username check, and the invalid-Basic-Auth-must-hard-fail-not-fall-through-to-the-token-gate logic — both physically removed, confirmed the corresponding test fails, then reverted.
+
+**Verified for real against a live running instance**, not just the Rust test suite: started a real `microtakd`, then drove the exact request shapes confirmed from `node-tak`'s source with `curl` — form-encoded OAuth login, Basic-Auth `signClient/v2`, the real XML `tls/config` response, a `certadmin` lookup keyed by a fingerprint independently computed with `openssl x509 -fingerprint -sha256` (not just internally self-consistent) — end to end.
+
+**Not yet verified**: an actual running CloudTAK instance against MicroTAK — no Node/TypeScript environment was available in this pass. The CoT streaming/WebSocket layer should work unmodified (it's CloudTAK's own internal plumbing over the existing raw CoT relay) but that's inferred from reading CloudTAK's source, not confirmed live.
+
+**Not yet implemented**: resolving the real dialect differences a separate investigation found against a different real client (OmniTAK-iOS) — `/Marti/sync/*` vs `/Marti/api/sync/*` path prefixes, and a query-param vs. JSON-body mission-creation contract. One finding from that investigation *was* folded in (the CSR Content-Type allowlist now also accepts `text/plain`). See `docs/ARCHITECTURE.md`'s "Open questions" for the rest.
+
 ## Pending research
 
 - MeshCore throughput figures — needed to finalize TC-MESH-03/05's concrete bandwidth budget.

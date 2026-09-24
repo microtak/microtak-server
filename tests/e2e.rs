@@ -81,11 +81,20 @@ async fn enroll(base_url: &str, common_name: &str) -> (String, rcgen::KeyPair) {
         "enrollment should succeed for a fresh common name"
     );
     let body: serde_json::Value = response.json().await.unwrap();
-    let cert_pem = body["signedCert"]
+    let bare_cert = body["signedCert"]
         .as_str()
         .expect("enrollment response should carry signedCert")
         .to_string();
-    (cert_pem, key)
+    // Real Marti wire format: bare base64, no PEM armor -- a real client
+    // (`node-tak`'s `credentials.ts`) re-wraps this itself, so tests do the
+    // same rather than assuming full-PEM.
+    (wrap_pem(&bare_cert), key)
+}
+
+/// Re-armor a bare-base64 `signedCert`/`ca0` value into full PEM, the same
+/// way a real client does before using it.
+fn wrap_pem(bare_base64: &str) -> String {
+    format!("-----BEGIN CERTIFICATE-----\n{bare_base64}\n-----END CERTIFICATE-----\n")
 }
 
 fn mtls_connector(ca_cert_pem: &str, cert_pem: &str, key: rcgen::KeyPair) -> TlsConnector {
@@ -1046,7 +1055,7 @@ async fn e2e_enrollment_auto_mode_locks_down_the_moment_the_admin_enrolls() {
         .unwrap();
     assert_eq!(signed.status(), 200);
     let signed_body: serde_json::Value = signed.json().await.unwrap();
-    let device_cert = signed_body["signedCert"].as_str().unwrap().to_string();
+    let device_cert = wrap_pem(signed_body["signedCert"].as_str().unwrap());
 
     // The new cert actually works over mTLS -- not just "the server said
     // 200." for the enrollment call.

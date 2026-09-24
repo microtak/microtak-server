@@ -19,6 +19,7 @@ pub mod missions;
 pub mod pki;
 pub mod registry;
 pub mod transport;
+pub mod users;
 
 // Planned modules, not yet implemented (see docs/TEST-PLAN.md for the test
 // cases each will need to satisfy before being considered done):

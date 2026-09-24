@@ -1,14 +1,19 @@
 //! Marti-compatible certificate enrollment HTTP endpoint.
 //!
 //! Implements the enrollment half of `docs/TEST-PLAN.md` §4: `GET
-//! /Marti/api/tls/config` (no auth, CA info) and `POST
-//! /Marti/api/tls/signClient/v2` (CSR submission, TC-ENROLL-02/03/06/07). A
-//! successfully-signed device is recorded in the [`DeviceRegistry`].
-//! `v1` (`POST /Marti/api/tls/signClient/`, no suffix) is deliberately not
-//! implemented — research found no authoritative source for its real
-//! behavior, and at least one reference implementation's `v1` is a
-//! non-functional stub; guessing at it risked shipping a fabricated
-//! contract, so it's left unimplemented rather than faked.
+//! /Marti/api/tls/config` (no auth, CSR subject naming hints -- real
+//! `certificateConfig` XML, confirmed from `dfpc-coe/node-tak`'s real
+//! client source), `GET /Marti/api/tls/ca.pem` (no auth, MicroTAK's own
+//! addition for CA cert distribution), and `POST
+//! /Marti/api/tls/signClient/v2` (CSR submission, TC-ENROLL-02/03/06/07,
+//! plus a real-password-authenticated path for CloudTAK/TAK-Server-style
+//! clients -- see that handler's own comment). A successfully-signed
+//! device is recorded in the [`DeviceRegistry`]. `v1` (`POST
+//! /Marti/api/tls/signClient/`, no suffix) is deliberately not implemented
+//! — research found no authoritative source for its real behavior, and at
+//! least one reference implementation's `v1` is a non-functional stub;
+//! guessing at it risked shipping a fabricated contract, so it's left
+//! unimplemented rather than faked.
 //!
 //! **Known simplification**: served over plain HTTP for now, not wrapped
 //! in TLS. The real Marti spec serves enrollment over HTTPS with
@@ -28,6 +33,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
@@ -37,6 +43,7 @@ use crate::app::EnrollmentMode;
 use crate::enrollment_tokens::EnrollmentTokenStore;
 use crate::pki::CertificateAuthority;
 use crate::registry::DeviceRegistry;
+use crate::users::UserStore;
 
 pub struct EnrollmentState {
     pub ca: CertificateAuthority,
@@ -50,6 +57,11 @@ pub struct EnrollmentState {
     /// `marti::admin::AdminState` uses, kept here too since this handler
     /// needs to check the registry for it independently.
     pub admin_common_name: Option<String>,
+    /// Real TAK-Server-compatible password auth: a request presenting a
+    /// valid `Authorization: Basic` credential on `signClient/v2` is
+    /// accepted regardless of `enrollment_mode` -- see that handler's own
+    /// comment for why.
+    pub users: Arc<UserStore>,
 }
 
 impl EnrollmentState {
@@ -73,19 +85,37 @@ impl EnrollmentState {
 pub fn router(state: Arc<EnrollmentState>) -> Router {
     Router::new()
         .route("/Marti/api/tls/config", get(get_config))
+        .route("/Marti/api/tls/ca.pem", get(get_ca_pem))
         .route("/Marti/api/tls/signClient/v2", post(sign_client_v2))
         .with_state(state)
 }
 
-/// TC-ENROLL-01: reachable with no client cert / no auth of any kind,
-/// returns the CA's certificate so a client can build its truststore.
+/// TC-ENROLL-01: reachable with no client cert / no auth of any kind.
 ///
-/// **Known simplification**: returns the bare PEM certificate rather than
-/// the real Marti API's `certificateConfig` XML schema — this project
-/// could not confirm that schema's exact field names from an authoritative
-/// source (see `docs/TEST-PLAN.md` §4), so this is MicroTAK's own minimal
-/// contract for now, not a verified compatibility target.
-async fn get_config(State(state): State<Arc<EnrollmentState>>) -> impl IntoResponse {
+/// Real Marti/TAK-Server contract, confirmed from `dfpc-coe/node-tak`'s
+/// real client source (`lib/api/credentials.ts`'s `config()`/`generate()`):
+/// an XML `certificateConfig` document naming the `O`/`OU` values a client
+/// should embed in its CSR subject -- **not** the CA certificate itself
+/// (an earlier "known simplification" here served the bare CA PEM from
+/// this same path instead, before this schema had been confirmed from an
+/// authoritative source; see [`get_ca_pem`] for where that moved).
+async fn get_config() -> impl IntoResponse {
+    const NAME_ENTRIES_XML: &str = "<ns2:certificateConfig><nameEntries>\
+        <nameEntry name=\"O\" value=\"MicroTAK\"/>\
+        <nameEntry name=\"OU\" value=\"MicroTAK\"/>\
+        </nameEntries></ns2:certificateConfig>";
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/xml")],
+        NAME_ENTRIES_XML,
+    )
+}
+
+/// MicroTAK's own addition (no real Marti path defines this): the bare CA
+/// certificate, for a client/operator that needs to build a truststore --
+/// what `/Marti/api/tls/config` used to serve before it was fixed to match
+/// the real `certificateConfig` XML schema instead (see [`get_config`]).
+async fn get_ca_pem(State(state): State<Arc<EnrollmentState>>) -> impl IntoResponse {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/x-pem-file")],
@@ -145,29 +175,68 @@ async fn sign_client_v2(
         }
     };
 
-    // Secure-by-default gate (see EnrollmentMode's own doc comment): a
-    // valid, unused, unexpired token must accompany the CSR once the
-    // configured admin device has actually enrolled (Auto mode; Open never
-    // requires one). Checked *after* signing (so we know the real
-    // common_name to record the token as consumed-by) but *before*
-    // recording the device or returning the cert -- a rejected request
-    // neither registers the device nor learns its own cert, even though
-    // the CA already did the (side-effect-free) work of signing it.
-    if state.is_locked_down() {
-        let token = match &query.token {
-            Some(token) => token.as_str(),
-            None => {
-                warn!(common_name = %signed.common_name, "enrollment rejected: no token provided");
-                return error_response(StatusCode::FORBIDDEN, "a valid enrollment token is required");
+    // Real password-authenticated identity (the real TAK-Server /
+    // CloudTAK `Credentials.generate()` path: `Authorization: Basic
+    // username:password`) is its own trust path, independent of --
+    // and, when presented, taking priority over -- the invite-token gate
+    // below. Presenting *invalid* credentials is a hard failure: it does
+    // not silently fall through to the token gate just because that gate
+    // might have allowed the request anyway (e.g. in `Open` mode).
+    match basic_auth_credentials(&headers) {
+        Some((username, password)) => {
+            if !state.users.authenticate(&username, &password) {
+                warn!(%username, "signClient/v2 rejected: invalid username or password");
+                return error_response(StatusCode::UNAUTHORIZED, "invalid username or password");
             }
-        };
-        if let Err(error) =
-            state
-                .tokens
-                .validate_and_consume(token, &signed.common_name, OffsetDateTime::now_utc().unix_timestamp())
-        {
-            warn!(common_name = %signed.common_name, %error, "enrollment rejected: invalid token");
-            return error_response(StatusCode::FORBIDDEN, &format!("invalid enrollment token: {error}"));
+            // The CSR's CN is the identity being requested -- without this
+            // check, any authenticated user could mint a cert for any
+            // other identity just by asking, defeating the point of
+            // requiring authentication at all.
+            if signed.common_name != username {
+                warn!(
+                    %username,
+                    requested_cn = %signed.common_name,
+                    "signClient/v2 rejected: CSR Common Name must match the authenticated username"
+                );
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    "CSR Common Name must match the authenticated username",
+                );
+            }
+        }
+        None => {
+            // Secure-by-default gate (see EnrollmentMode's own doc
+            // comment): a valid, unused, unexpired token must accompany
+            // the CSR once the configured admin device has actually
+            // enrolled (Auto mode; Open never requires one). Checked
+            // *after* signing (so we know the real common_name to record
+            // the token as consumed-by) but *before* recording the device
+            // or returning the cert -- a rejected request neither
+            // registers the device nor learns its own cert, even though
+            // the CA already did the (side-effect-free) work of signing it.
+            if state.is_locked_down() {
+                let token = match &query.token {
+                    Some(token) => token.as_str(),
+                    None => {
+                        warn!(common_name = %signed.common_name, "enrollment rejected: no token provided");
+                        return error_response(
+                            StatusCode::FORBIDDEN,
+                            "a valid enrollment token is required",
+                        );
+                    }
+                };
+                if let Err(error) = state.tokens.validate_and_consume(
+                    token,
+                    &signed.common_name,
+                    OffsetDateTime::now_utc().unix_timestamp(),
+                ) {
+                    warn!(common_name = %signed.common_name, %error, "enrollment rejected: invalid token");
+                    return error_response(
+                        StatusCode::FORBIDDEN,
+                        &format!("invalid enrollment token: {error}"),
+                    );
+                }
+            }
         }
     }
 
@@ -181,12 +250,46 @@ async fn sign_client_v2(
     }
 
     info!(common_name = %signed.common_name, "device enrolled");
-    shaped_success_response(&headers, &signed.cert_pem)
+    shaped_success_response(&headers, &signed.cert_pem, &state.ca.ca_cert_pem())
+}
+
+/// Decode an `Authorization: Basic base64(username:password)` header, if
+/// present. Returns `None` for a missing header, a non-Basic scheme, or a
+/// malformed value -- all treated as "no credentials presented," not an
+/// error, since Basic Auth here is optional (an alternative to the invite
+/// token, not a requirement).
+fn basic_auth_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let encoded = value.strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (username, password) = decoded.split_once(':')?;
+    Some((username.to_string(), password.to_string()))
+}
+
+/// Strip PEM armor (`-----BEGIN/END...-----` lines), leaving just the
+/// base64 body -- the real Marti wire format for a `signedCert`/`ca0`
+/// field, confirmed from `node-tak`'s real client (`credentials.ts`'s
+/// `generate()` hardcodes re-wrapping this itself:
+/// `'-----BEGIN CERTIFICATE-----\n' + res.signedCert + '\n-----END CERTIFICATE-----'`).
+fn strip_pem_armor(cert_pem: &str) -> String {
+    cert_pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn is_acceptable_csr_content_type(content_type: &str) -> bool {
     let base = content_type.split(';').next().unwrap_or("").trim();
-    matches!(base, "application/octet-stream" | "application/pkcs10" | "")
+    // `text/plain` added after finding a real client (OmniTAK-iOS, a
+    // third-party TAK client) sends its base64 CSR body with this exact
+    // Content-Type unconditionally, with no way to configure otherwise --
+    // see wiki/OmniTAK-iOS.md.
+    matches!(
+        base,
+        "application/octet-stream" | "application/pkcs10" | "text/plain" | ""
+    )
 }
 
 /// Accept either a fully PEM-armored CSR or bare base64 with the
@@ -213,12 +316,18 @@ fn normalize_csr_body(body: &[u8]) -> Result<String, String> {
 /// `Accept` header, matching a real, deliberate quirk found in a reference
 /// implementation's enrollment endpoint (one real client expects a JSON
 /// body served under `Content-Type: text/plain`).
-fn shaped_success_response(headers: &HeaderMap, cert_pem: &str) -> Response {
+fn shaped_success_response(headers: &HeaderMap, cert_pem: &str, ca_cert_pem: &str) -> Response {
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let body = json!({ "signedCert": cert_pem });
+    // Bare base64, PEM armor stripped -- the real Marti wire format (see
+    // `strip_pem_armor`'s own doc comment). `ca0` is optional per the real
+    // client's own parsing (`if (res.ca0) chain.push(res.ca0)`), included
+    // here so a caller gets a real trust chain, not just the leaf.
+    let bare_cert = strip_pem_armor(cert_pem);
+    let bare_ca = strip_pem_armor(ca_cert_pem);
+    let body = json!({ "signedCert": bare_cert, "ca0": bare_ca });
 
     if accept.contains("text/plain") {
         (
@@ -231,7 +340,7 @@ fn shaped_success_response(headers: &HeaderMap, cert_pem: &str) -> Response {
         (StatusCode::OK, Json(body)).into_response()
     } else {
         let xml = format!(
-            "<enrollmentResponse><signedCert><![CDATA[{cert_pem}]]></signedCert></enrollmentResponse>"
+            "<enrollmentResponse><signedCert><![CDATA[{bare_cert}]]></signedCert><ca0><![CDATA[{bare_ca}]]></ca0></enrollmentResponse>"
         );
         (StatusCode::OK, [(header::CONTENT_TYPE, "application/xml")], xml).into_response()
     }
@@ -255,6 +364,7 @@ mod tests {
             tokens: Arc::new(EnrollmentTokenStore::in_memory()),
             enrollment_mode: EnrollmentMode::Open,
             admin_common_name: None,
+            users: Arc::new(UserStore::in_memory()),
         })
     }
 
@@ -267,14 +377,39 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// TC-ENROLL-01: reachable with no auth, returns CA cert info.
+    /// Re-armor a bare-base64 `signedCert`/`ca0` value into full PEM, the
+    /// same way a real client (`node-tak`'s `credentials.ts`) does before
+    /// using it -- for tests that need to actually parse the result.
+    fn wrap_pem(bare_base64: &str) -> String {
+        format!("-----BEGIN CERTIFICATE-----\n{bare_base64}\n-----END CERTIFICATE-----\n")
+    }
+
+    /// TC-ENROLL-01: reachable with no auth, returns real CSR-naming XML
+    /// (not the CA cert -- see [`get_ca_pem`] for that).
     #[tokio::test]
     async fn tc_enroll_01_config_endpoint_requires_no_auth() {
+        let state = test_state();
+        let base_url = spawn_server(state).await;
+
+        let response = reqwest::get(format!("{base_url}/Marti/api/tls/config"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("certificateConfig"));
+        assert!(body.contains("name=\"O\""));
+        assert!(body.contains("name=\"OU\""));
+    }
+
+    /// MicroTAK's own CA-distribution endpoint: no auth required, returns
+    /// the real, full-PEM CA certificate.
+    #[tokio::test]
+    async fn ca_pem_endpoint_requires_no_auth_and_returns_the_real_ca() {
         let state = test_state();
         let ca_pem = state.ca.ca_cert_pem();
         let base_url = spawn_server(state).await;
 
-        let response = reqwest::get(format!("{base_url}/Marti/api/tls/config"))
+        let response = reqwest::get(format!("{base_url}/Marti/api/tls/ca.pem"))
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -308,15 +443,19 @@ mod tests {
         assert_eq!(response.status(), 200);
         let body: serde_json::Value = response.json().await.unwrap();
         let signed_cert = body["signedCert"].as_str().unwrap();
-        assert!(signed_cert.contains("BEGIN CERTIFICATE"));
+        // Real Marti wire format: bare base64, no PEM armor -- a real
+        // client (`node-tak`'s `credentials.ts`) re-wraps this itself.
+        assert!(!signed_cert.contains("BEGIN CERTIFICATE"));
+        assert!(!body["ca0"].as_str().unwrap().is_empty(), "expected a CA chain cert too");
 
         // Cryptographically verify the returned cert against the CA --
         // proves the enrollment endpoint's output is actually usable, not
-        // just "the server said 200."
+        // just "the server said 200." Re-armor it first, matching what a
+        // real client does with this same bare value.
         use x509_parser::prelude::{FromDer, X509Certificate};
         let ca_der = pem::parse(&ca_pem).unwrap();
         let (_, ca_x509) = X509Certificate::from_der(ca_der.contents()).unwrap();
-        let leaf_der = pem::parse(signed_cert).unwrap();
+        let leaf_der = pem::parse(wrap_pem(signed_cert)).unwrap();
         let (_, leaf_x509) = X509Certificate::from_der(leaf_der.contents()).unwrap();
         assert!(leaf_x509
             .verify_signature(Some(ca_x509.public_key()))
@@ -345,6 +484,30 @@ mod tests {
         assert_eq!(response.status(), 400);
         let body: serde_json::Value = response.json().await.unwrap();
         assert!(body["error"].as_str().unwrap().contains("Content-Type"));
+    }
+
+    /// A real client (OmniTAK-iOS) sends its raw base64 CSR body under
+    /// `Content-Type: text/plain`, unconditionally, with no way to
+    /// configure otherwise -- must be accepted, not treated like the
+    /// form-encoded case above.
+    #[tokio::test]
+    async fn accepts_csr_submitted_as_text_plain() {
+        let state = test_state();
+        let base_url = spawn_server(state).await;
+
+        let (csr_pem, _key) = build_csr("device-omnitak").unwrap();
+        let bare_base64: String = csr_pem.lines().filter(|line| !line.starts_with("-----")).collect();
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(bare_base64)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
     }
 
     /// TC-ENROLL-06: a malformed/non-CSR payload is rejected cleanly.
@@ -393,7 +556,7 @@ mod tests {
         let body_text = response.text().await.unwrap();
         // Still a JSON *body*, just served with a text/plain Content-Type.
         let parsed: serde_json::Value = serde_json::from_str(&body_text).unwrap();
-        assert!(parsed["signedCert"].as_str().unwrap().contains("BEGIN CERTIFICATE"));
+        assert!(!parsed["signedCert"].as_str().unwrap().is_empty());
     }
 
     /// A successfully enrolled device is recorded in the registry.
@@ -434,6 +597,7 @@ mod tests {
             tokens: Arc::new(EnrollmentTokenStore::in_memory()),
             enrollment_mode: EnrollmentMode::Auto,
             admin_common_name: Some("test-admin".to_string()),
+            users: Arc::new(UserStore::in_memory()),
         })
     }
 
@@ -562,6 +726,7 @@ mod tests {
             tokens: Arc::new(EnrollmentTokenStore::in_memory()),
             enrollment_mode: EnrollmentMode::Open,
             admin_common_name: Some("open-mode-admin".to_string()),
+            users: Arc::new(UserStore::in_memory()),
         });
         let base_url = spawn_server(state).await;
 
@@ -575,5 +740,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
+    }
+
+    /// Real password-authenticated enrollment (the CloudTAK/`node-tak`
+    /// `Credentials.generate()` path) bypasses the invite-token gate
+    /// entirely, even while locked down -- a valid password credential is
+    /// its own trust path, not conditional on `enrollment_mode`.
+    #[tokio::test]
+    async fn basic_auth_enrollment_bypasses_the_token_gate_even_when_locked_down() {
+        let state = test_state_requiring_tokens();
+        state.users.mint("device-with-password", "hunter2", 0).unwrap();
+        let registry_check = Arc::clone(&state);
+        let base_url = spawn_server(state).await;
+
+        let (csr_pem, _key) = build_csr("device-with-password").unwrap();
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
+            .basic_auth("device-with-password", Some("hunter2"))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(csr_pem)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(!body["signedCert"].as_str().unwrap().is_empty());
+        assert!(registry_check.registry.find("device-with-password").is_some());
+    }
+
+    /// Presenting *wrong* Basic-Auth credentials is a hard failure -- it
+    /// must not silently fall through to the (in this case, wide-open)
+    /// token gate just because that gate would have allowed the request
+    /// anyway.
+    #[tokio::test]
+    async fn basic_auth_with_wrong_password_is_rejected_even_in_open_mode() {
+        let state = test_state(); // Open mode: no token would be required at all.
+        state.users.mint("device-with-password", "hunter2", 0).unwrap();
+        let registry_check = Arc::clone(&state);
+        let base_url = spawn_server(state).await;
+
+        let (csr_pem, _key) = build_csr("device-with-password").unwrap();
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
+            .basic_auth("device-with-password", Some("wrong-password"))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(csr_pem)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 401);
+        assert!(registry_check.registry.find("device-with-password").is_none());
+    }
+
+    /// An authenticated user can't mint a cert for a *different* identity
+    /// just by asking -- the CSR's Common Name must match who actually
+    /// authenticated.
+    #[tokio::test]
+    async fn basic_auth_rejects_csr_cn_not_matching_authenticated_username() {
+        let state = test_state();
+        state.users.mint("alice", "correct horse battery staple", 0).unwrap();
+        let registry_check = Arc::clone(&state);
+        let base_url = spawn_server(state).await;
+
+        let (csr_pem, _key) = build_csr("bob").unwrap();
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
+            .basic_auth("alice", Some("correct horse battery staple"))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(csr_pem)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 403);
+        assert!(registry_check.registry.find("bob").is_none());
     }
 }

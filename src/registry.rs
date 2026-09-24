@@ -131,6 +131,14 @@ impl DeviceRegistry {
         self.devices.read().unwrap().get(common_name).cloned()
     }
 
+    /// Every enrolled device, in no particular order. Used by
+    /// `marti::admin`'s certificate-admin lookup, which needs to scan for
+    /// a matching cert fingerprint -- fine at this project's scale (see
+    /// this module's own doc comment).
+    pub fn all(&self) -> Vec<DeviceRecord> {
+        self.devices.read().unwrap().values().cloned().collect()
+    }
+
     pub fn is_revoked(&self, common_name: &str) -> bool {
         self.devices
             .read()
@@ -260,6 +268,18 @@ mod tests {
 
         let found = registry.find("device-a").unwrap();
         assert_eq!(found, record);
+    }
+
+    #[test]
+    fn all_lists_every_enrolled_device() {
+        let registry = DeviceRegistry::in_memory();
+        assert!(registry.all().is_empty());
+        registry.enroll("device-a", "cert-a", 1_000).unwrap();
+        registry.enroll("device-b", "cert-b", 1_100).unwrap();
+
+        let mut names: Vec<_> = registry.all().into_iter().map(|d| d.common_name).collect();
+        names.sort();
+        assert_eq!(names, vec!["device-a", "device-b"]);
     }
 
     #[test]
