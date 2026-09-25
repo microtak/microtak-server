@@ -137,6 +137,10 @@ cargo run --release --bin microtakd
 Config is optional — MicroTAK reads `$MICROTAK_CONFIG`, or `./microtak.toml`
 if that's unset, and falls back to sensible defaults if neither exists.
 
+`scripts/build.sh` runs the same build/test/clippy steps CI does (add
+`--nix` for `nix flake check`, `--docker` to build the image locally); see
+`scripts/build.sh --help`.
+
 ## The MicroTAK ecosystem
 
 - **microtak-server** (this repo) — the server itself.
