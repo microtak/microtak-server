@@ -56,10 +56,10 @@ impl EnrollmentToken {
         if self.used {
             return Err(EnrollmentTokenError::AlreadyUsed);
         }
-        if let Some(expires_at) = self.expires_at_unix {
-            if now_unix >= expires_at {
-                return Err(EnrollmentTokenError::Expired);
-            }
+        if let Some(expires_at) = self.expires_at_unix
+            && now_unix >= expires_at
+        {
+            return Err(EnrollmentTokenError::Expired);
         }
         Ok(())
     }

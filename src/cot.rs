@@ -199,10 +199,10 @@ impl Event {
         if let Some(marti) = &detail.marti {
             uids.extend(marti.dest.iter().filter_map(|d| d.uid.as_deref()));
         }
-        if let Some(chat) = &detail.chat {
-            if let Some(chatgrp) = &chat.chatgrp {
-                uids.extend(chatgrp.member_uids());
-            }
+        if let Some(chat) = &detail.chat
+            && let Some(chatgrp) = &chat.chatgrp
+        {
+            uids.extend(chatgrp.member_uids());
         }
 
         if uids.is_empty() {

@@ -166,13 +166,12 @@ pub fn fingerprint_sha256_colon_hex(cert_pem: &str) -> Option<String> {
 /// implementation, not two.
 pub fn common_name_from_cert_der(der: &[u8]) -> Option<String> {
     let (_, parsed) = x509_parser::parse_x509_certificate(der).ok()?;
-    let cn = parsed
+    parsed
         .subject()
         .iter_common_name()
         .next()
         .and_then(|cn| cn.as_str().ok())
-        .map(str::to_string);
-    cn
+        .map(str::to_string)
 }
 
 /// Build a PEM-encoded CSR for the given Common Name, for use in tests and

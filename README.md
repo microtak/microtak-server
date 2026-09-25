@@ -80,7 +80,7 @@ hardware other TAK servers can't touch.
   release binaries currently target `x86_64-linux` (glibc). ARM builds (for
   a Pi) aren't packaged yet — see
   [docs/PACKAGING.md](docs/PACKAGING.md) — so an ARM device today means
-  building from source with a stable Rust toolchain (edition 2021).
+  building from source with a stable Rust toolchain (edition 2024).
 - **Network**: MicroTAK needs four ports reachable by your clients (see the
   table below) — no other services or databases required. It has no
   external runtime dependencies beyond what's in the Docker image.
