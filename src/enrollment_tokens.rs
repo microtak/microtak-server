@@ -31,6 +31,8 @@ pub enum EnrollmentTokenError {
     Revoked,
     #[error("enrollment token has expired")]
     Expired,
+    #[error("enrollment token is for '{bound}', not '{requested}'")]
+    WrongIdentity { bound: String, requested: String },
     #[error("event log error: {0}")]
     EventLog(#[from] EventLogError),
 }
@@ -42,6 +44,10 @@ pub struct EnrollmentToken {
     /// `None` means it never expires.
     pub expires_at_unix: Option<i64>,
     pub note: Option<String>,
+    /// If set, the token can only enroll this identity (TC-ENROLL-14) --
+    /// what a QR code minted for one specific device carries.
+    #[serde(default)]
+    pub common_name: Option<String>,
     pub used: bool,
     pub used_by_common_name: Option<String>,
     pub used_at_unix: Option<i64>,
@@ -73,6 +79,9 @@ enum TokenEvent {
         created_at_unix: i64,
         expires_at_unix: Option<i64>,
         note: Option<String>,
+        /// Absent in logs written before bindings existed.
+        #[serde(default)]
+        common_name: Option<String>,
     },
     Consumed {
         token: String,
@@ -119,6 +128,18 @@ impl EnrollmentTokenStore {
         note: Option<String>,
         now_unix: i64,
     ) -> Result<String, EnrollmentTokenError> {
+        self.mint_bound(expires_in_secs, note, None, now_unix)
+    }
+
+    /// Like [`Self::mint`], optionally binding the token to the one
+    /// identity (`common_name`) it may enroll.
+    pub fn mint_bound(
+        &self,
+        expires_in_secs: Option<i64>,
+        note: Option<String>,
+        common_name: Option<String>,
+        now_unix: i64,
+    ) -> Result<String, EnrollmentTokenError> {
         let token = random_token();
         let mut tokens = self.tokens.write().unwrap();
         let event = TokenEvent::Minted {
@@ -126,6 +147,7 @@ impl EnrollmentTokenStore {
             created_at_unix: now_unix,
             expires_at_unix: expires_in_secs.map(|secs| now_unix + secs),
             note,
+            common_name,
         };
         if let Some(log) = &self.log {
             log.append(&event)?;
@@ -148,6 +170,14 @@ impl EnrollmentTokenStore {
         let mut tokens = self.tokens.write().unwrap();
         let existing = tokens.get(token).ok_or(EnrollmentTokenError::NotFound)?;
         existing.is_usable_at(now_unix)?;
+        if let Some(bound) = &existing.common_name
+            && bound != common_name
+        {
+            return Err(EnrollmentTokenError::WrongIdentity {
+                bound: bound.clone(),
+                requested: common_name.to_string(),
+            });
+        }
 
         let event = TokenEvent::Consumed {
             token: token.to_string(),
@@ -190,6 +220,7 @@ fn apply_event(tokens: &mut HashMap<String, EnrollmentToken>, event: &TokenEvent
             created_at_unix,
             expires_at_unix,
             note,
+            common_name,
         } => {
             tokens.insert(
                 token.clone(),
@@ -198,6 +229,7 @@ fn apply_event(tokens: &mut HashMap<String, EnrollmentToken>, event: &TokenEvent
                     created_at_unix: *created_at_unix,
                     expires_at_unix: *expires_at_unix,
                     note: note.clone(),
+                    common_name: common_name.clone(),
                     used: false,
                     used_by_common_name: None,
                     used_at_unix: None,
@@ -242,6 +274,49 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TC-ENROLL-14: a token minted for one identity can't enroll another,
+    /// and a refused attempt doesn't spend it.
+    #[test]
+    fn tc_enroll_14_a_bound_token_only_enrolls_its_own_identity() {
+        let store = EnrollmentTokenStore::in_memory();
+        let token = store
+            .mint_bound(None, None, Some("device-a".to_string()), 1_000)
+            .unwrap();
+        assert!(matches!(
+            store.validate_and_consume(&token, "device-b", 1_001),
+            Err(EnrollmentTokenError::WrongIdentity { .. })
+        ));
+        assert!(!store.list()[0].used);
+        store.validate_and_consume(&token, "device-a", 1_002).unwrap();
+        assert_eq!(store.list()[0].common_name.as_deref(), Some("device-a"));
+    }
+
+    #[test]
+    fn a_tokens_binding_survives_a_reload_and_old_logs_still_load() {
+        let dir = std::env::temp_dir().join(format!("microtak-tokens-bound-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("enrollment_tokens.log");
+        std::fs::remove_file(&path).ok();
+        // A line as written before bindings existed (no `common_name` field).
+        std::fs::write(
+            &path,
+            "{\"type\":\"Minted\",\"token\":\"old\",\"created_at_unix\":1,\"expires_at_unix\":null,\"note\":null}\n",
+        )
+        .unwrap();
+        let store = EnrollmentTokenStore::load_or_create(&path).unwrap();
+        let bound = store.mint_bound(None, None, Some("device-a".into()), 2).unwrap();
+        drop(store);
+
+        let reloaded = EnrollmentTokenStore::load_or_create(&path).unwrap();
+        let all = reloaded.list();
+        assert_eq!(all.iter().find(|t| t.token == "old").unwrap().common_name, None);
+        assert_eq!(
+            all.iter().find(|t| t.token == bound).unwrap().common_name.as_deref(),
+            Some("device-a")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn mints_a_usable_token() {

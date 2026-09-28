@@ -162,6 +162,14 @@ The enrollment port (8446, plus `/oauth/token` on the same listener) was plain H
 - **Reverse proxies** (`docs/proxy/README.md`): the proxy re-encrypts to MicroTAK. Traefik verifies MicroTAK's CA via a file-provider `serversTransport` (`docs/proxy/traefik-microtak-transport.yml`). Pangolin can only skip verification on that hop -- its generated Traefik config sets `insecureSkipVerify: true` whenever a TLS server name is set (read from `fosrl/pangolin`'s `getTraefikConfig.ts`) -- documented as a trade-off, not hidden. 8443/8089 stay raw TCP passthrough.
 - **Rate limiting behind a proxy**: `trusted_proxies` (IPs/CIDRs). Only for those peers is the client address taken from `X-Forwarded-For` -- the right-most entry that isn't itself a trusted proxy -- so one client's failures don't lock out everyone behind the proxy, and no other client can choose its own rate-limit bucket (`src/clientip.rs`).
 
+## QR enrollment — 2026-09-28
+
+Typing a host, port and password into a phone under stress is the real friction in the field. TAK clients understand a common enrollment QR code / deep link: `tak://com.atakmap.app/enroll?host=<host>&username=<user>&token=<token>` (ATAK; OmniTAK also accepts `port=`, `enrollmentport=`, `apiport=` -- confirmed from OmniTAK-iOS's `DeepLinkHandler.swift`). Scanning it makes the client enroll over HTTPS with `Authorization: Basic <username>:<token>`, trusting the endpoint on first contact.
+
+- **Token as Basic password** (TC-ENROLL-16): when the Basic username is *not* a password account, `signClient/v2` treats the secret as an invite (or, for the admin CN, bootstrap) token; the CSR's CN must equal the username. When the username *is* an account, the secret is only ever checked as that account's password -- a token never stands in for it.
+- **Tokens bound to a device name** (TC-ENROLL-14): `POST /Marti/api/admin/enrollmentTokens` accepts `commonName`; such a token only enrolls that identity, and a refused attempt doesn't spend it. The admin CN can't be bound (bootstrap token only). Old token logs load unchanged (the field defaults to unbound).
+- Rate limiting counts wrong tokens presented this way like wrong passwords.
+
 ## Mission roles — decided 2026-09-23
 
 The other half of the permissions discussion above: missions previously had zero authorization beyond identity-claim matching (a caller could only ever act *as itself*, but any authenticated device could delete or rewrite *any* mission's metadata, not just its own). Added `MissionRole` (`Owner`, `Subscriber`) to `src/missions.rs`'s data model — `Owner` assigned automatically to a mission's creator, `Subscriber` assigned automatically on subscribing and removed on unsubscribing (an `Owner` who subscribes/unsubscribes from their own mission keeps `Owner` regardless — subscription state never demotes an owner).

@@ -150,11 +150,18 @@ struct EnrollQuery {
 ///    re-enroll (rotate) an existing identity -- the one that proves it
 ///    owns that identity. Invalid credentials are a hard failure, never a
 ///    fall-through to the other paths.
-/// 2. **The admin CN** is reserved: only the one-time bootstrap token
-///    (`?token=`) can enroll it, in every mode.
+/// 2. **The admin CN** is reserved: only the one-time bootstrap token can
+///    enroll it, in every mode.
 /// 3. **Everything else** may only ever create a *new* identity: an
 ///    already-enrolled CN is refused with 409 before any token is spent.
 ///    In `Auto` mode a valid invite token is required; `Open` needs none.
+///    A token bound to a CN at mint time only enrolls that CN.
+///
+/// Tokens (invite or bootstrap) arrive as `?token=`, or -- the way TAK
+/// clients send the `token` of a `tak://…/enroll` QR code -- as
+/// `Authorization: Basic <CN>:<token>` for a username that is *not* a
+/// password account. For an existing account the secret is only ever
+/// checked as its password.
 ///
 /// Failed credential checks count against the client's address (and, for
 /// passwords, the username) in [`AuthLimiter`]; once exhausted, requests
@@ -210,7 +217,32 @@ async fn sign_client_v2(
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let ip_key = peer.limit_key();
 
-    let enrolled = match basic_auth_credentials(&headers) {
+    // `Authorization: Basic` is a password login when the username is a
+    // password account -- and only then. Otherwise it's how a TAK client
+    // presents an invite token from a `tak://…/enroll` QR code (TC-ENROLL-16):
+    // the username must equal the CSR's CN and the "password" is the token.
+    let mut presented_token = query.token.clone();
+    let password_login = match basic_auth_credentials(&headers) {
+        Some((username, password)) if state.users.exists(&username) => Some((username, password)),
+        Some((username, token)) => {
+            if common_name != username {
+                warn!(
+                    %username,
+                    requested_cn = %common_name,
+                    "signClient/v2 rejected: CSR Common Name must match the username presented with the token"
+                );
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    "CSR Common Name must match the authenticated username",
+                );
+            }
+            presented_token = Some(token);
+            None
+        }
+        None => None,
+    };
+
+    let enrolled = match password_login {
         Some((username, password)) => {
             let user_key = user_key(&username);
             if state.limiter.is_blocked(&ip_key) || state.limiter.is_blocked(&user_key) {
@@ -246,7 +278,7 @@ async fn sign_client_v2(
             state.registry.enroll(common_name, &signed.cert_pem, now)
         }
         None if state.is_admin_cn(common_name) => {
-            let Some(token) = query.token.as_deref() else {
+            let Some(token) = presented_token.as_deref() else {
                 warn!(common_name, "admin enrollment rejected: no bootstrap token");
                 return admin_requires_bootstrap();
             };
@@ -274,7 +306,7 @@ async fn sign_client_v2(
                 return already_enrolled(common_name);
             }
             if state.is_locked_down() {
-                let Some(token) = query.token.as_deref() else {
+                let Some(token) = presented_token.as_deref() else {
                     warn!(common_name, "enrollment rejected: no token provided");
                     return error_response(
                         StatusCode::FORBIDDEN,
@@ -1112,6 +1144,107 @@ mod tests {
         assert_eq!(response.status(), 403);
         assert!(check.registry.find("test-admin").is_none());
         assert!(check.bootstrap.is_outstanding());
+    }
+
+    async fn post_csr_basic(base_url: &str, user: &str, secret: &str, cn: &str) -> reqwest::Response {
+        let (csr_pem, _key) = build_csr(cn).unwrap();
+        test_client()
+            .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
+            .basic_auth(user, Some(secret))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(csr_pem)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// TC-ENROLL-16: the credential shape a `tak://…/enroll` QR code makes
+    /// OmniTAK/ATAK send -- `Basic(username, invite-token)` -- enrolls via
+    /// the token path when `username` is not a password account; the CN
+    /// must equal the username and the token is spent.
+    #[tokio::test]
+    async fn tc_enroll_16_basic_auth_with_an_invite_token_as_the_password_enrolls() {
+        let state = test_state_requiring_tokens();
+        let tokens = Arc::clone(&state.tokens);
+        let check = Arc::clone(&state);
+        let base_url = spawn_server(state).await;
+        let token = tokens.mint_bound(None, None, Some("device-qr".into()), 1).unwrap();
+
+        let wrong_cn = post_csr_basic(&base_url, "device-qr", &token, "device-other").await;
+        assert_eq!(wrong_cn.status(), 403);
+        assert!(!tokens.list()[0].used);
+
+        let response = post_csr_basic(&base_url, "device-qr", &token, "device-qr").await;
+        assert_eq!(response.status(), 200);
+        assert!(check.registry.find("device-qr").is_some());
+        assert!(tokens.list()[0].used);
+
+        let reuse = post_csr_basic(&base_url, "device-qr", &token, "device-qr").await;
+        assert_ne!(reuse.status(), 200);
+    }
+
+    /// With `Basic(username, token)`, the username names the identity even
+    /// for an *unbound* token: a CSR for a different CN is refused, and the
+    /// token isn't spent.
+    #[tokio::test]
+    async fn basic_token_login_requires_the_csr_cn_to_match_even_for_an_unbound_token() {
+        let state = test_state_requiring_tokens();
+        let tokens = Arc::clone(&state.tokens);
+        let check = Arc::clone(&state);
+        let base_url = spawn_server(state).await;
+        let token = tokens.mint(None, None, 1).unwrap();
+
+        let response = post_csr_basic(&base_url, "device-a", &token, "device-b").await;
+        assert_eq!(response.status(), 403);
+        assert!(check.registry.find("device-b").is_none());
+        assert!(!tokens.list()[0].used);
+    }
+
+    /// TC-ENROLL-14 over HTTP: a token bound to one name can't enroll
+    /// another, even when presented as `?token=`.
+    #[tokio::test]
+    async fn tc_enroll_14_a_bound_token_cannot_enroll_a_different_identity() {
+        let state = test_state_requiring_tokens();
+        let tokens = Arc::clone(&state.tokens);
+        let base_url = spawn_server(state).await;
+        let token = tokens.mint_bound(None, None, Some("device-a".into()), 1).unwrap();
+
+        let (csr_pem, _key) = build_csr("device-b").unwrap();
+        let response = post_csr(&base_url, &format!("?token={token}"), csr_pem).await;
+        assert_eq!(response.status(), 403);
+        assert!(!tokens.list()[0].used);
+    }
+
+    /// If the username *is* a password account, the secret is only ever
+    /// checked as that account's password -- a valid invite token doesn't
+    /// stand in for it (no way to reach an account's identity with a token).
+    #[tokio::test]
+    async fn an_invite_token_is_not_accepted_as_an_existing_accounts_password() {
+        let state = test_state_requiring_tokens();
+        state.users.mint("alice", "real-password", 0).unwrap();
+        let tokens = Arc::clone(&state.tokens);
+        let base_url = spawn_server(state).await;
+        let token = tokens.mint(None, None, 1).unwrap();
+
+        let response = post_csr_basic(&base_url, "alice", &token, "alice").await;
+        assert_eq!(response.status(), 401);
+        assert!(!tokens.list()[0].used);
+    }
+
+    /// Wrong invite tokens presented via Basic auth count toward the rate
+    /// limit, like wrong passwords.
+    #[tokio::test]
+    async fn wrong_tokens_via_basic_auth_are_rate_limited() {
+        let state = test_state_requiring_tokens();
+        let base_url = spawn_server(state).await;
+        let mut last = 0;
+        for _ in 0..11 {
+            last = post_csr_basic(&base_url, "device-guess", "not-a-token", "device-guess")
+                .await
+                .status()
+                .as_u16();
+        }
+        assert_eq!(last, 429);
     }
 
     /// The password path is the one way to rotate an existing identity's
