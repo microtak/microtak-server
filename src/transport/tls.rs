@@ -64,6 +64,40 @@ pub fn server_config(
         .map_err(TlsSetupError::InvalidServerCert)
 }
 
+/// Like [`server_config`], but with the server certificate chosen by
+/// `resolver`, so it can be swapped at runtime (e.g. re-issued when the
+/// server's addresses change -- see `crate::servernames`).
+pub fn server_config_with_resolver(
+    ca_cert_der: CertificateDer<'static>,
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+) -> Result<ServerConfig, TlsSetupError> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(ca_cert_der)
+        .map_err(TlsSetupError::InvalidCaCert)?;
+    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(TlsSetupError::VerifierBuild)?;
+    Ok(ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(resolver))
+}
+
+/// Build a server TLS config for the enrollment listener: server
+/// authentication only, **no** client certificate requested (a device
+/// enrolling has none yet), certificate chosen by `resolver` so it can be
+/// swapped at runtime (see [`crate::certsource`]). Advertises HTTP/2 and
+/// HTTP/1.1 via ALPN; the listener serves either.
+pub fn server_auth_only_config(
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+) -> ServerConfig {
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TlsSetupError {
     #[error("invalid CA certificate: {0}")]

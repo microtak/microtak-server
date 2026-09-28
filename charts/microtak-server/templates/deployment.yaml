@@ -55,20 +55,22 @@ spec:
               containerPort: {{ .Values.service.ports.plainTcp }}
             - name: mtls
               containerPort: {{ .Values.service.ports.mtls }}
-          # The enrollment endpoint is plain, unauthenticated HTTP by design
-          # (a device has no cert yet) -- GET /Marti/api/tls/config is a
-          # real, cheap, always-available route on it, so it doubles as a
-          # health check without needing a dedicated one.
+          # The enrollment endpoint is HTTPS without client-cert auth (a
+          # device has no cert yet) -- GET /Marti/api/tls/config is a real,
+          # cheap, always-available route on it, so it doubles as a health
+          # check. The kubelet doesn't verify certificates for HTTPS probes.
           livenessProbe:
             httpGet:
               path: /Marti/api/tls/config
               port: enrollment
+              scheme: HTTPS
             initialDelaySeconds: 5
             periodSeconds: 15
           readinessProbe:
             httpGet:
               path: /Marti/api/tls/config
               port: enrollment
+              scheme: HTTPS
             initialDelaySeconds: 2
             periodSeconds: 10
           volumeMounts:

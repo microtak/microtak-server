@@ -116,9 +116,11 @@ impl CertificateAuthority {
     }
 
     /// Like [`Self::sign_csr`], but issuing a *server* certificate: EKU
-    /// `serverAuth`, with exactly the given DNS SANs (taken from the
-    /// server's own configuration, never from the CSR). Only for MicroTAK's
-    /// own listener certificates -- never reachable from enrollment.
+    /// `serverAuth`, with exactly the given names as SANs (taken from the
+    /// server's own configuration, never from the CSR) -- each an IP
+    /// address SAN if it parses as one, a DNS SAN otherwise. Only for
+    /// MicroTAK's own listener certificates -- never reachable from
+    /// enrollment.
     pub fn sign_server_csr(
         &self,
         csr_pem: &str,
@@ -159,11 +161,13 @@ impl CertificateAuthority {
                 params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
                 params.subject_alt_names = dns_names
                     .iter()
-                    .map(|name| {
-                        name.clone()
+                    .map(|name| match name.parse::<std::net::IpAddr>() {
+                        Ok(ip) => Ok(SanType::IpAddress(ip)),
+                        Err(_) => name
+                            .clone()
                             .try_into()
                             .map(SanType::DnsName)
-                            .map_err(PkiError::Params)
+                            .map_err(PkiError::Params),
                     })
                     .collect::<Result<_, _>>()?;
             }
@@ -506,6 +510,42 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["microtak-server".to_string()]);
+    }
+
+    /// TC-TLS-09: configured names that are IP addresses become IP SANs
+    /// (what a client connecting to a bare LAN IP checks against), the
+    /// rest DNS SANs.
+    #[test]
+    fn server_cert_names_become_ip_or_dns_sans() {
+        use x509_parser::extensions::{GeneralName, ParsedExtension};
+        use x509_parser::prelude::{FromDer, X509Certificate};
+
+        let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
+        let (csr, _key) = build_csr("microtak-server").unwrap();
+        let signed = ca
+            .sign_server_csr(
+                &csr,
+                &["microtak-server".to_string(), "192.168.1.10".to_string(), "fd00::1".to_string()],
+                Duration::days(1),
+            )
+            .unwrap();
+        let der = parse_leaf(&signed.cert_pem);
+        let (_, cert) = X509Certificate::from_der(&der).unwrap();
+        let sans: Vec<String> = cert
+            .extensions()
+            .iter()
+            .filter_map(|ext| match ext.parsed_extension() {
+                ParsedExtension::SubjectAlternativeName(san) => Some(san),
+                _ => None,
+            })
+            .flat_map(|san| san.general_names.iter())
+            .map(|name| match name {
+                GeneralName::DNSName(dns) => format!("dns:{dns}"),
+                GeneralName::IPAddress(bytes) => format!("ip:{}", bytes.len()),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(sans, vec!["dns:microtak-server", "ip:4", "ip:16"]);
     }
 
     #[test]

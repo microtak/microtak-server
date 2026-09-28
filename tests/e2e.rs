@@ -69,11 +69,25 @@ fn event_xml(uid: &str) -> String {
     )
 }
 
+/// A client for the enrollment port the way a real device first meets it:
+/// it has no CA to verify against yet, so it accepts the server's
+/// certificate on first contact (OmniTAK's default, and the QR flow) and
+/// pins the CA it receives in the enrollment response from then on. Strict
+/// verification of the enrollment certificate itself is covered by
+/// `e2e_enrollment_port_is_https_only_with_a_cert_from_the_servers_ca`.
+fn enrollment_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .no_proxy()
+        .build()
+        .unwrap()
+}
+
 /// Enroll a device against the real, running enrollment HTTP endpoint --
 /// the same request shape a real ATAK client would send.
 async fn enroll(base_url: &str, common_name: &str) -> (String, rcgen::KeyPair) {
     let (csr_pem, key) = pki::build_csr(common_name).unwrap();
-    let client = reqwest::Client::new();
+    let client = enrollment_client();
     let response = client
         .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
         .header(CONTENT_TYPE, "application/octet-stream")
@@ -175,7 +189,7 @@ async fn e2e_enroll_then_connect_via_mtls_and_relay_across_transports() {
     let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
 
-    let base_url = format!("http://{enrollment_addr}");
+    let base_url = format!("https://{enrollment_addr}");
     let (cert_a, key_a) = enroll(&base_url, "device-a").await;
     let (cert_b, key_b) = enroll(&base_url, "device-b").await;
 
@@ -249,7 +263,7 @@ async fn e2e_backup_mirrors_live_server_state_to_disk() {
     let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
 
-    let base_url = format!("http://{enrollment_addr}");
+    let base_url = format!("https://{enrollment_addr}");
     let (cert, key) = enroll(&base_url, "backup-client").await;
     let client = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
     let upload_url = format!(
@@ -302,7 +316,7 @@ async fn e2e_missions_api_full_lifecycle() {
     let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
 
-    let enrollment_base_url = format!("http://{enrollment_addr}");
+    let enrollment_base_url = format!("https://{enrollment_addr}");
     let (cert, key) = enroll(&enrollment_base_url, "missions-client").await;
     let client = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
 
@@ -411,7 +425,7 @@ async fn e2e_mission_roles_enforce_owner_and_subscriber_authorization() {
     let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
 
-    let enrollment_base_url = format!("http://{enrollment_addr}");
+    let enrollment_base_url = format!("https://{enrollment_addr}");
     let (owner_cert, owner_key) = enroll(&enrollment_base_url, "mission-owner").await;
     let (subscriber_cert, subscriber_key) = enroll(&enrollment_base_url, "mission-subscriber").await;
     let (outsider_cert, outsider_key) = enroll(&enrollment_base_url, "mission-outsider").await;
@@ -545,7 +559,7 @@ async fn e2e_datasync_content_upload_download_round_trip() {
     let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
 
-    let enrollment_base_url = format!("http://{enrollment_addr}");
+    let enrollment_base_url = format!("https://{enrollment_addr}");
     let (cert, key) = enroll(&enrollment_base_url, "content-client").await;
     let client = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
     let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
@@ -637,7 +651,7 @@ async fn e2e_missions_api_rejects_creatoruid_not_matching_authenticated_cert() {
     let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
 
-    let enrollment_base_url = format!("http://{enrollment_addr}");
+    let enrollment_base_url = format!("https://{enrollment_addr}");
     let (cert, key) = enroll(&enrollment_base_url, "real-identity").await;
     let client = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
     let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
@@ -703,7 +717,7 @@ async fn e2e_fanout_to_multiple_clients_across_mixed_transports() {
     let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
 
-    let base_url = format!("http://{enrollment_addr}");
+    let base_url = format!("https://{enrollment_addr}");
     let (cert_b, key_b) = enroll(&base_url, "fanout-b").await;
     let (cert_c, key_c) = enroll(&base_url, "fanout-c").await;
 
@@ -758,7 +772,7 @@ async fn e2e_client_endpoints_reflects_real_connections() {
     let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
 
-    let base_url = format!("http://{enrollment_addr}");
+    let base_url = format!("https://{enrollment_addr}");
     let (cert, key) = enroll(&base_url, "endpoints-client").await;
     let (viewer_cert, viewer_key) = enroll(&base_url, "endpoints-viewer").await;
 
@@ -840,7 +854,7 @@ async fn e2e_rejects_cross_device_uid_spoofing_after_http_enrollment() {
     let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
 
-    let base_url = format!("http://{enrollment_addr}");
+    let base_url = format!("https://{enrollment_addr}");
     let (cert_a, key_a) = enroll(&base_url, "spoof-target").await;
     let (cert_spoofer, key_spoofer) = enroll(&base_url, "spoof-attacker").await;
 
@@ -893,7 +907,7 @@ async fn e2e_revoked_device_rejected_on_new_connection() {
     let registry = Arc::clone(&app.registry);
     tokio::spawn(app.run());
 
-    let base_url = format!("http://{enrollment_addr}");
+    let base_url = format!("https://{enrollment_addr}");
     let (cert, key) = enroll(&base_url, "revoke-me").await;
 
     registry.revoke("revoke-me").unwrap();
@@ -1009,9 +1023,9 @@ async fn e2e_auto_mode_is_locked_from_the_start_and_the_admin_bootstraps_with_a_
         .to_string();
     tokio::spawn(app.run());
 
-    let enrollment_base_url = format!("http://{enrollment_addr}");
+    let enrollment_base_url = format!("https://{enrollment_addr}");
     let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
-    let plain_client = reqwest::Client::new();
+    let plain_client = enrollment_client();
     let post = |query: String, csr: String| {
         plain_client
             .post(format!("{enrollment_base_url}/Marti/api/tls/signClient/v2{query}"))
@@ -1127,8 +1141,8 @@ async fn e2e_csr_requesting_ca_status_cannot_forge_the_admin_identity() {
         .unwrap()
         .pem()
         .unwrap();
-    let response = reqwest::Client::new()
-        .post(format!("http://{enrollment_addr}/Marti/api/tls/signClient/v2"))
+    let response = enrollment_client()
+        .post(format!("https://{enrollment_addr}/Marti/api/tls/signClient/v2"))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(csr_pem)
         .send()
@@ -1168,4 +1182,66 @@ async fn e2e_csr_requesting_ca_status_cannot_forge_the_admin_identity() {
             response.status()
         ),
     }
+}
+
+/// TC-TLS-08/09, end to end: the enrollment port speaks TLS only -- a plain
+/// HTTP request gets no HTTP response at all -- and its certificate chains
+/// to the server's own CA and names the configured server names, so a
+/// client that *does* verify (with the CA from `ca-cert.pem`, e.g. the
+/// admin CLI during bootstrap) succeeds.
+#[tokio::test]
+async fn e2e_enrollment_port_is_https_only_with_a_cert_from_the_servers_ca() {
+    let config = AppConfig {
+        server_names: vec!["tak.example.com".to_string()],
+        server_names_from_interfaces: false,
+        ..test_config()
+    };
+    let app = App::bind(config).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    tokio::spawn(app.run());
+
+    // Plain HTTP: the handshake fails, no HTTP response comes back.
+    let plain = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{enrollment_addr}/Marti/api/tls/config"))
+        .send()
+        .await;
+    assert!(plain.is_err(), "plain HTTP must not get an HTTP response: {plain:?}");
+
+    // HTTPS, strictly verified against the server's CA, under both the
+    // common name and a configured extra name.
+    for name in [SERVER_NAME, "tak.example.com"] {
+        let strict = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(ca_cert_pem.as_bytes()).unwrap())
+            .tls_built_in_root_certs(false)
+            .resolve(name, SocketAddr::new(enrollment_addr.ip(), 0))
+            .no_proxy()
+            .build()
+            .unwrap();
+        let response = strict
+            .get(format!("https://{name}:{}/Marti/api/tls/config", enrollment_addr.port()))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("strict HTTPS to {name} failed: {error}"));
+        assert_eq!(response.status(), 200);
+    }
+
+    // A name the certificate doesn't carry is refused by a verifying client.
+    let wrong_name = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_cert_pem.as_bytes()).unwrap())
+        .tls_built_in_root_certs(false)
+        .resolve("not-this-server.example", SocketAddr::new(enrollment_addr.ip(), 0))
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!(
+            "https://not-this-server.example:{}/Marti/api/tls/config",
+            enrollment_addr.port()
+        ))
+        .send()
+        .await;
+    assert!(wrong_name.is_err());
 }

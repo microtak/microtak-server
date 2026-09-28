@@ -12,13 +12,15 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rustls::pki_types::PrivateKeyDer;
 use rustls::ServerConfig;
 use time::Duration;
 use tracing::info;
 
 use crate::backup::{BackupRunner, OffsiteTarget};
 use crate::bootstrap::{BootstrapToken, BOOTSTRAP_TOKEN_FILE};
+use crate::certsource::{self, CertLoadError, CertSource, SwappableCert};
+use crate::clientip::TrustedProxies;
+use crate::servernames::{self, ServerCertError};
 use crate::ratelimit::AuthLimiter;
 use crate::content_store::ContentStore;
 use crate::enrollment_tokens::{EnrollmentTokenError, EnrollmentTokenStore};
@@ -26,7 +28,7 @@ use crate::marti::admin::AdminState;
 use crate::marti::enrollment::EnrollmentState;
 use crate::marti::{
     admin, client_endpoints, contacts, content as content_api, discovery, enrollment, groups,
-    missions as missions_api, oauth, MtlsHttpServer, PlainHttpServer,
+    missions as missions_api, oauth, MtlsHttpServer, TlsHttpServer,
 };
 use crate::missions::{MissionError, MissionStore};
 use crate::pki::{self, CertificateAuthority, PkiError};
@@ -62,6 +64,24 @@ pub struct AppConfig {
     /// itself does -- clients trust the CA and the SAN hostname, not a
     /// pinned exact server certificate).
     pub server_common_name: String,
+    /// Extra names (IP addresses or DNS names) clients reach this server
+    /// by, added as SANs to the server certificate alongside
+    /// `server_common_name` -- e.g. the LAN IP devices enroll against.
+    /// Clients that verify the enrollment endpoint's hostname (rather than
+    /// trusting it on first contact) need their address listed here.
+    pub server_names: Vec<String>,
+    /// Also name every non-loopback interface address in the server
+    /// certificate, re-checked every minute and re-issued live when the
+    /// set changes (LAN, Starlink, Wi-Fi links coming and going). On by
+    /// default. See `src/servernames.rs`.
+    pub server_names_from_interfaces: bool,
+    /// Reverse proxies (Traefik, Pangolin) in front of the enrollment
+    /// listener, whose `X-Forwarded-For` is trusted for rate limiting --
+    /// see `src/clientip.rs`. Empty (the default): the header is ignored.
+    pub trusted_proxies: TrustedProxies,
+    /// Where the enrollment listener's TLS certificate comes from -- see
+    /// [`CertSource`]. The mTLS listeners always use the internal one.
+    pub enrollment_cert: CertSource,
     /// Validity period for certificates this CA issues.
     pub cert_validity: Duration,
     /// Directory holding persistent state: `ca-cert.pem`/`ca-key.pem`, plus
@@ -151,6 +171,10 @@ impl Default for AppConfig {
             mtls_addr: "0.0.0.0:8089".parse().unwrap(),
             ca_common_name: "MicroTAK CA".to_string(),
             server_common_name: "microtak-server".to_string(),
+            server_names: Vec::new(),
+            server_names_from_interfaces: true,
+            trusted_proxies: TrustedProxies::default(),
+            enrollment_cert: CertSource::Internal,
             cert_validity: Duration::days(365),
             backup: BackupConfig::default(),
             data_dir: PathBuf::from("./data"),
@@ -174,6 +198,10 @@ pub enum AppError {
     EnrollmentTokens(#[from] EnrollmentTokenError),
     #[error("user store setup failed: {0}")]
     Users(#[from] crate::users::UserError),
+    #[error("server certificate: {0}")]
+    ServerCert(#[from] ServerCertError),
+    #[error("enrollment TLS certificate: {0}")]
+    EnrollmentCert(#[from] CertLoadError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -196,11 +224,27 @@ pub struct App {
     pub registry: Arc<DeviceRegistry>,
     pub missions: Arc<MissionStore>,
     pub content_store: Arc<ContentStore>,
-    enrollment: PlainHttpServer,
+    enrollment: TlsHttpServer,
     marti_api: MtlsHttpServer,
     tcp: Option<TcpRelay>,
     tls: TlsRelay,
     bootstrap: Arc<BootstrapToken>,
+    /// Set in [`CertSource::Files`] mode: the live enrollment certificate
+    /// and the files to watch for replacements.
+    enrollment_cert_watch: Option<(Arc<SwappableCert>, PathBuf, PathBuf)>,
+    /// Set when `server_names_from_interfaces` is on.
+    interface_watch: Option<InterfaceWatch>,
+}
+
+/// What the background task re-issuing the server cert on address changes
+/// needs -- see [`servernames::watch_interfaces`].
+struct InterfaceWatch {
+    ca: CertificateAuthority,
+    target: Arc<SwappableCert>,
+    common_name: String,
+    configured: Vec<String>,
+    validity: Duration,
+    current: Vec<String>,
 }
 
 impl App {
@@ -243,27 +287,60 @@ impl App {
 
         // The mTLS listener's own server identity, issued by the same CA a
         // client would enroll against.
-        let (server_csr, server_key) = pki::build_csr_with_san(
+        // The server's own identity, issued by the same CA clients enroll
+        // against, naming every address it's reachable by (see
+        // `src/servernames.rs`). One swappable cert shared by every listener
+        // that uses the internal identity, so an address change is picked up
+        // everywhere at once.
+        let detected = if config.server_names_from_interfaces {
+            servernames::interface_addresses()
+        } else {
+            Vec::new()
+        };
+        let server_names =
+            servernames::collect(&config.server_common_name, &config.server_names, &detected);
+        let (server_cert, _, _) = servernames::issue_server_cert(
+            &ca,
             &config.server_common_name,
-            vec![config.server_common_name.clone()],
-        )?;
-        let signed_server_cert = ca.sign_server_csr(
-            &server_csr,
-            std::slice::from_ref(&config.server_common_name),
+            &server_names,
             config.cert_validity,
         )?;
-        let server_cert_der = pki::cert_pem_to_der(&signed_server_cert.cert_pem)?;
+        info!(names = ?server_names, "server certificate issued");
+        let internal_cert = Arc::new(SwappableCert::new(server_cert));
+        let interface_watch = config.server_names_from_interfaces.then(|| InterfaceWatch {
+            ca: CertificateAuthority::from_pem(&ca.ca_cert_pem(), &ca.ca_key_pem())
+                .expect("the CA just loaded must reload from its own PEM"),
+            target: Arc::clone(&internal_cert),
+            common_name: config.server_common_name.clone(),
+            configured: config.server_names.clone(),
+            validity: config.cert_validity,
+            current: server_names,
+        });
+
         let ca_cert_der = pki::cert_pem_to_der(&ca_cert_pem)?;
         // Shared between the CoT mTLS relay and the Marti API's mTLS HTTP
         // listener -- same server identity, same CA-based client
-        // verification policy, no reason to issue a second server cert or
-        // build a second ServerConfig for what is otherwise a second
-        // protocol on a second port.
-        let tls_server_config: Arc<ServerConfig> = Arc::new(tls::server_config(
+        // verification policy.
+        let tls_server_config: Arc<ServerConfig> = Arc::new(tls::server_config_with_resolver(
             ca_cert_der,
-            vec![server_cert_der],
-            PrivateKeyDer::from(server_key),
+            Arc::clone(&internal_cert) as Arc<dyn rustls::server::ResolvesServerCert>,
         )?);
+
+        // The enrollment listener: TLS only, no client cert. Internal mode
+        // reuses the same server identity as the mTLS listeners.
+        let (enrollment_cert, enrollment_cert_watch) = match &config.enrollment_cert {
+            CertSource::Internal => (Arc::clone(&internal_cert), None),
+            CertSource::Files { cert_file, key_file } => {
+                let cert = Arc::new(SwappableCert::new(certsource::load_files(
+                    cert_file, key_file,
+                )?));
+                info!(cert_file = %cert_file.display(), "enrollment TLS certificate loaded from files");
+                (
+                    Arc::clone(&cert),
+                    Some((cert, cert_file.clone(), key_file.clone())),
+                )
+            }
+        };
 
         let enrollment_state = Arc::new(EnrollmentState {
             ca,
@@ -278,8 +355,14 @@ impl App {
         });
 
         let plain_router = enrollment::router(enrollment_state)
-            .merge(oauth::router(Arc::clone(&users), limiter));
-        let enrollment = PlainHttpServer::bind(config.enrollment_addr, plain_router).await?;
+            .merge(oauth::router(Arc::clone(&users), limiter))
+            .layer(axum::Extension(Arc::new(config.trusted_proxies.clone())));
+        let enrollment = TlsHttpServer::bind(
+            config.enrollment_addr,
+            Arc::new(tls::server_auth_only_config(enrollment_cert)),
+            plain_router,
+        )
+        .await?;
         let admin_state = AdminState {
             tokens: enrollment_tokens,
             users,
@@ -326,6 +409,8 @@ impl App {
             tcp,
             tls,
             bootstrap,
+            enrollment_cert_watch,
+            interface_watch,
         })
     }
 
@@ -370,8 +455,29 @@ impl App {
             marti_api,
             tcp,
             tls,
+            enrollment_cert_watch,
+            interface_watch,
             ..
         } = self;
+        if let Some(watch) = interface_watch {
+            tokio::spawn(servernames::watch_interfaces(
+                watch.ca,
+                watch.target,
+                watch.common_name,
+                watch.configured,
+                watch.validity,
+                std::time::Duration::from_secs(60),
+                watch.current,
+            ));
+        }
+        if let Some((cert, cert_file, key_file)) = enrollment_cert_watch {
+            tokio::spawn(certsource::watch_files(
+                cert,
+                cert_file,
+                key_file,
+                std::time::Duration::from_secs(60),
+            ));
+        }
         let tcp = async {
             match tcp {
                 Some(tcp) => tcp.run().await,

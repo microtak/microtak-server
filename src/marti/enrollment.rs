@@ -15,15 +15,14 @@
 //! guessing at it risked shipping a fabricated contract, so it's left
 //! unimplemented rather than faked.
 //!
-//! **Known simplification**: served over plain HTTP for now, not wrapped
-//! in TLS. The real Marti spec serves enrollment over HTTPS with
-//! `clientAuth=false` specifically to prevent a MITM from substituting a
-//! different CA/response in transit. Neither the CSR nor the signed cert
-//! are secrets (only the private key, which never leaves the client), so
-//! the confidentiality impact of plain HTTP here is low, but the integrity
-//! concern (a MITM swapping in an attacker's own CA) is real. Production
-//! deployments should front this with TLS (reverse proxy, or a future
-//! direct TLS listener here) until that gap is closed.
+//! Served over **HTTPS only** by [`super::TlsHttpServer`] -- no plain-HTTP
+//! fallback -- with no client certificate required (a device has none
+//! yet), matching the real Marti `clientAuth="false"` enrollment port. The
+//! certificate is MicroTAK's own CA-issued server cert by default, which a
+//! device trusts on first contact and then pins via the CA returned in the
+//! enrollment response; or a publicly-trusted one (see
+//! [`crate::certsource`]). Before 2026-09-28 this endpoint was plain HTTP,
+//! so password credentials crossed the network in cleartext.
 
 use std::sync::Arc;
 
@@ -451,13 +450,46 @@ mod tests {
         })
     }
 
+    /// Serve `router(state)` the way `App` does: HTTPS only.
     async fn spawn_server(state: Arc<EnrollmentState>) -> String {
-        let server = super::super::PlainHttpServer::bind("127.0.0.1:0".parse().unwrap(), router(state))
-            .await
+        spawn_router(router(state)).await
+    }
+
+    async fn spawn_router(app: Router) -> String {
+        let ca = CertificateAuthority::generate("Listener Test CA").unwrap();
+        let (csr, key) = build_csr("microtak-server").unwrap();
+        let signed = ca
+            .sign_server_csr(&csr, &["microtak-server".to_string()], Duration::days(1))
             .unwrap();
+        let cert = crate::certsource::certified_key(
+            vec![crate::pki::cert_pem_to_der(&signed.cert_pem).unwrap()],
+            rustls::pki_types::PrivateKeyDer::from(key),
+        )
+        .unwrap();
+        let tls = crate::transport::tls::server_auth_only_config(Arc::new(
+            crate::certsource::SwappableCert::new(cert),
+        ));
+        let server = super::super::TlsHttpServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(tls),
+            app,
+        )
+        .await
+        .unwrap();
         let addr = server.local_addr().unwrap();
         tokio::spawn(server.run());
-        format!("http://{addr}")
+        format!("https://{addr}")
+    }
+
+    /// These tests exercise handler logic, not certificate trust (that's
+    /// covered end to end in `tests/e2e.rs`), so the client accepts the
+    /// test server's certificate without verifying it.
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .no_proxy()
+            .build()
+            .unwrap()
     }
 
     /// Re-armor a bare-base64 `signedCert`/`ca0` value into full PEM, the
@@ -474,7 +506,7 @@ mod tests {
         let state = test_state();
         let base_url = spawn_server(state).await;
 
-        let response = reqwest::get(format!("{base_url}/Marti/api/tls/config"))
+        let response = test_client().get(format!("{base_url}/Marti/api/tls/config")).send()
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -492,7 +524,7 @@ mod tests {
         let ca_pem = state.ca.ca_cert_pem();
         let base_url = spawn_server(state).await;
 
-        let response = reqwest::get(format!("{base_url}/Marti/api/tls/ca.pem"))
+        let response = test_client().get(format!("{base_url}/Marti/api/tls/ca.pem")).send()
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -514,7 +546,7 @@ mod tests {
             .filter(|line| !line.starts_with("-----"))
             .collect();
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let response = client
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
             .header(CONTENT_TYPE, "application/octet-stream")
@@ -555,7 +587,7 @@ mod tests {
 
         let (csr_pem, _key) = build_csr("device-form").unwrap();
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let response = client
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -581,7 +613,7 @@ mod tests {
         let (csr_pem, _key) = build_csr("device-omnitak").unwrap();
         let bare_base64: String = csr_pem.lines().filter(|line| !line.starts_with("-----")).collect();
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let response = client
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
             .header(CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -599,7 +631,7 @@ mod tests {
         let state = test_state();
         let base_url = spawn_server(state).await;
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let response = client
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
             .header(CONTENT_TYPE, "application/octet-stream")
@@ -621,7 +653,7 @@ mod tests {
 
         let (csr_pem, _key) = build_csr("device-quirk").unwrap();
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let response = client
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
             .header(CONTENT_TYPE, "application/octet-stream")
@@ -650,7 +682,7 @@ mod tests {
         let base_url = spawn_server(state).await;
 
         let (csr_pem, _key) = build_csr("device-registry-check").unwrap();
-        let client = reqwest::Client::new();
+        let client = test_client();
         let response = client
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
             .header(CONTENT_TYPE, "application/octet-stream")
@@ -699,7 +731,7 @@ mod tests {
         let base_url = spawn_server(state).await;
 
         let (csr_pem, _key) = build_csr("device-no-token").unwrap();
-        let client = reqwest::Client::new();
+        let client = test_client();
         let response = client
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
             .header(CONTENT_TYPE, "application/octet-stream")
@@ -722,7 +754,7 @@ mod tests {
 
         let token = tokens.mint(None, None, 1_000).unwrap();
         let (csr_pem, _key) = build_csr("device-with-token").unwrap();
-        let client = reqwest::Client::new();
+        let client = test_client();
         let response = client
             .post(format!(
                 "{base_url}/Marti/api/tls/signClient/v2?token={token}"
@@ -749,7 +781,7 @@ mod tests {
         let base_url = spawn_server(state).await;
 
         let token = tokens.mint(None, None, 1_000).unwrap();
-        let client = reqwest::Client::new();
+        let client = test_client();
 
         let (csr_a, _key_a) = build_csr("device-a").unwrap();
         let first = client
@@ -784,7 +816,7 @@ mod tests {
         tokens.revoke(&token).unwrap();
 
         let (csr_pem, _key) = build_csr("device-revoked-token").unwrap();
-        let client = reqwest::Client::new();
+        let client = test_client();
         let response = client
             .post(format!("{base_url}/Marti/api/tls/signClient/v2?token={token}"))
             .header(CONTENT_TYPE, "application/octet-stream")
@@ -818,7 +850,7 @@ mod tests {
         let base_url = spawn_server(state).await;
 
         let (csr_pem, _key) = build_csr("device-still-open").unwrap();
-        let client = reqwest::Client::new();
+        let client = test_client();
         let response = client
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
             .header(CONTENT_TYPE, "application/octet-stream")
@@ -841,7 +873,7 @@ mod tests {
         let base_url = spawn_server(state).await;
 
         let (csr_pem, _key) = build_csr("device-with-password").unwrap();
-        let client = reqwest::Client::new();
+        let client = test_client();
         let response = client
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
             .basic_auth("device-with-password", Some("hunter2"))
@@ -869,7 +901,7 @@ mod tests {
         let base_url = spawn_server(state).await;
 
         let (csr_pem, _key) = build_csr("device-with-password").unwrap();
-        let client = reqwest::Client::new();
+        let client = test_client();
         let response = client
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
             .basic_auth("device-with-password", Some("wrong-password"))
@@ -884,7 +916,7 @@ mod tests {
     }
 
     async fn post_csr(base_url: &str, query: &str, csr_pem: String) -> reqwest::Response {
-        reqwest::Client::new()
+        test_client()
             .post(format!("{base_url}/Marti/api/tls/signClient/v2{query}"))
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(csr_pem)
@@ -1093,7 +1125,7 @@ mod tests {
         let base_url = spawn_server(state).await;
 
         let (csr_pem, _key) = build_csr("device-rotating").unwrap();
-        let response = reqwest::Client::new()
+        let response = test_client()
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
             .basic_auth("device-rotating", Some("hunter2"))
             .header(CONTENT_TYPE, "application/octet-stream")
@@ -1115,7 +1147,7 @@ mod tests {
         let base_url = spawn_server(state).await;
 
         let (csr_pem, _key) = build_csr("test-admin").unwrap();
-        let response = reqwest::Client::new()
+        let response = test_client()
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
             .basic_auth("test-admin", Some("hunter2"))
             .header(CONTENT_TYPE, "application/octet-stream")
@@ -1160,7 +1192,7 @@ mod tests {
         let state = test_state();
         state.users.mint("device-with-password", "hunter2", 0).unwrap();
         let base_url = spawn_server(state).await;
-        let client = reqwest::Client::new();
+        let client = test_client();
 
         let mut statuses = Vec::new();
         for _ in 0..12 {
@@ -1190,6 +1222,49 @@ mod tests {
         assert_eq!(response.status(), 429);
     }
 
+    /// TC-LIMIT-08 behind a reverse proxy: with the proxy trusted, clients
+    /// are told apart by `X-Forwarded-For`, so one client burning its
+    /// attempts doesn't lock out another arriving through the same proxy.
+    #[tokio::test]
+    async fn behind_a_trusted_proxy_rate_limiting_is_per_forwarded_client() {
+        let state = test_state();
+        state.users.mint("device-a", "right-a", 0).unwrap();
+        state.users.mint("device-b", "right-b", 0).unwrap();
+        let app = router(state).layer(axum::Extension(Arc::new(
+            crate::clientip::TrustedProxies::parse(&["127.0.0.1".to_string()]).unwrap(),
+        )));
+        let base_url = spawn_router(app).await;
+        let client = test_client();
+
+        let attempt = |user: &'static str, password: &'static str, forwarded: &'static str| {
+            let client = client.clone();
+            let base_url = base_url.clone();
+            async move {
+                let (csr_pem, _key) = build_csr(user).unwrap();
+                client
+                    .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
+                    .basic_auth(user, Some(password))
+                    .header("x-forwarded-for", forwarded)
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(csr_pem)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }
+        };
+        for _ in 0..10 {
+            attempt("device-a", "wrong", "198.51.100.1").await;
+        }
+        assert_eq!(attempt("device-a", "wrong", "198.51.100.1").await, 429);
+        assert_eq!(
+            attempt("device-b", "right-b", "198.51.100.2").await,
+            200,
+            "a different client behind the same proxy is unaffected"
+        );
+    }
+
     /// TC-LIMIT-09: a request body far larger than any real CSR is refused
     /// before being buffered and parsed.
     #[tokio::test]
@@ -1212,7 +1287,7 @@ mod tests {
         let base_url = spawn_server(state).await;
 
         let (csr_pem, _key) = build_csr("bob").unwrap();
-        let client = reqwest::Client::new();
+        let client = test_client();
         let response = client
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
             .basic_auth("alice", Some("correct horse battery staple"))

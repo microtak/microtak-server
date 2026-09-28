@@ -58,6 +58,16 @@ config:
   caCommonName: "MicroTAK CA"
   serverCommonName: "microtak-server"
   certValidityDays: 365
+  # Extra IPs/DNS names for the server certificate (e.g. the LoadBalancer
+  # address or DNS name clients enroll against). Inside a pod, automatic
+  # interface detection only sees the pod IP, so list external names here.
+  serverNames: []
+  # Reverse proxies / ingress controllers whose X-Forwarded-For is trusted
+  # for rate limiting (IPs or CIDRs), e.g. the ingress controller's pod CIDR.
+  trustedProxies: []
+  # The plain-TCP CoT relay is unauthenticated cleartext -- off unless you
+  # run a trusted local bridge that needs it.
+  plainTcpEnabled: false
   backup:
     enabled: false
     intervalSeconds: 3600

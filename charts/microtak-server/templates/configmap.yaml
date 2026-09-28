@@ -14,6 +14,9 @@ data:
     marti_api_port = {{ .Values.service.ports.martiApi }}
     plain_tcp_port = {{ .Values.service.ports.plainTcp }}
     mtls_port = {{ .Values.service.ports.mtls }}
+    plain_tcp_enabled = {{ .Values.config.plainTcpEnabled }}
+    server_names = [{{ range $i, $name := .Values.config.serverNames }}{{ if $i }}, {{ end }}{{ $name | quote }}{{ end }}]
+    trusted_proxies = [{{ range $i, $proxy := .Values.config.trustedProxies }}{{ if $i }}, {{ end }}{{ $proxy | quote }}{{ end }}]
     # Fixed to the mounted volumes -- see values.yaml's `config` comment.
     data_dir = "/var/lib/microtak-server/data"
     backup_dir = "/var/lib/microtak-server/backup"

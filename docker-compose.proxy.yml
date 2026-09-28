@@ -1,6 +1,6 @@
-# Optional overlay: front the plain-HTTP enrollment endpoint with a Traefik
-# reverse proxy for a real, browser/ATAK-trusted TLS certificate (e.g. via
-# Let's Encrypt), instead of exposing it as raw HTTP.
+# Optional overlay: front the enrollment endpoint with an existing Traefik
+# reverse proxy that holds a real, publicly-trusted certificate (e.g. Let's
+# Encrypt) for MICROTAK_DOMAIN.
 #
 # Usage:
 #   cp .env.example .env   # fill in the real values -- .env is gitignored,
@@ -13,12 +13,23 @@
 # This file only adds this container to that network and labels it --
 # it does not run Traefik itself.
 #
-# Deliberately NOT included here: the Marti API (mTLS) and both CoT relay
-# ports. Those terminate their own TLS (and, for the mTLS ones, client-cert
-# auth) at the application layer -- a reverse proxy terminating TLS in front
-# of them would either break client-cert auth outright or add nothing but a
-# second, redundant TLS handshake. They stay published directly to the host
-# via docker-compose.yml's own `ports:` (see .env.example for those).
+# **No plaintext hop**: MicroTAK's enrollment port is HTTPS only, so Traefik
+# re-encrypts to it (`scheme=https`) and verifies MicroTAK's own CA through
+# a serversTransport -- which Traefik only accepts from its *file* provider,
+# not from Docker labels. Add docs/proxy/traefik-microtak-transport.yml to
+# Traefik's dynamic file configuration and mount MicroTAK's CA certificate
+# (data volume, `ca-cert.pem`) where that file points. See
+# docs/proxy/README.md.
+#
+# Also set `trusted_proxies` in microtak.toml to Traefik's address on the
+# proxy network, so rate limiting sees real client addresses instead of
+# Traefik's.
+#
+# Deliberately NOT routed here: the Marti API (8443) and the mTLS CoT relay
+# (8089). They authenticate clients by certificate at the TLS layer, so a
+# proxy terminating TLS in front of them would break client-cert auth; they
+# stay published directly (or via plain TCP passthrough) -- see
+# docs/proxy/README.md.
 services:
   microtak-server:
     networks:
@@ -31,6 +42,8 @@ services:
       - "traefik.http.routers.microtak-enroll.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-letsencrypt}"
       - "traefik.http.routers.microtak-enroll.service=microtak-enroll"
       - "traefik.http.services.microtak-enroll.loadbalancer.server.port=8446"
+      - "traefik.http.services.microtak-enroll.loadbalancer.server.scheme=https"
+      - "traefik.http.services.microtak-enroll.loadbalancer.serverstransport=${TRAEFIK_MICROTAK_TRANSPORT:-microtak@file}"
 
 networks:
   proxy:
