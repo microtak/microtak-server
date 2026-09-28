@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -29,12 +29,24 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 
+use super::PeerIp;
+use crate::ratelimit::{user_key, AuthLimiter};
 use crate::users::UserStore;
+use tracing::warn;
 
-pub fn router(users: Arc<UserStore>) -> Router {
+#[derive(Clone)]
+pub struct OAuthState {
+    pub users: Arc<UserStore>,
+    /// Shared with enrollment -- failed logins here and failed password
+    /// enrollments there count against the same per-IP/per-user budget.
+    pub limiter: Arc<AuthLimiter>,
+}
+
+pub fn router(users: Arc<UserStore>, limiter: Arc<AuthLimiter>) -> Router {
     Router::new()
         .route("/oauth/token", post(token))
-        .with_state(users)
+        .layer(DefaultBodyLimit::max(super::enrollment::MAX_REQUEST_BODY_BYTES))
+        .with_state(OAuthState { users, limiter })
 }
 
 #[derive(Deserialize)]
@@ -43,8 +55,31 @@ struct TokenRequest {
     password: String,
 }
 
-async fn token(State(users): State<Arc<UserStore>>, Form(request): Form<TokenRequest>) -> Response {
-    if !users.authenticate(&request.username, &request.password) {
+async fn token(
+    State(state): State<OAuthState>,
+    peer: PeerIp,
+    Form(request): Form<TokenRequest>,
+) -> Response {
+    let ip_key = peer.limit_key();
+    let user_key = user_key(&request.username);
+    if state.limiter.is_blocked(&ip_key) || state.limiter.is_blocked(&user_key) {
+        warn!(username = %request.username, "oauth login rate-limited after repeated failed attempts");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "invalid_grant",
+                "error_description": "Too many failed attempts, try again later",
+            })),
+        )
+            .into_response();
+    }
+    if !state
+        .limiter
+        .verify_password(&state.users, &request.username, &request.password)
+        .await
+    {
+        state.limiter.record_failure(&ip_key);
+        state.limiter.record_failure(&user_key);
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({
@@ -95,7 +130,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn app_with(users: Arc<UserStore>) -> Router {
-        router(users)
+        router(users, Arc::new(AuthLimiter::default()))
     }
 
     async fn post_token(app: Router, username: &str, password: &str) -> Response {
@@ -172,5 +207,25 @@ mod tests {
         let users = Arc::new(UserStore::in_memory());
         let response = post_token(app_with(users), "nobody", "whatever").await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// TC-LIMIT-08 for the login endpoint: after repeated wrong passwords
+    /// the account is refused with 429 -- even the right password -- for
+    /// the rest of the window.
+    #[tokio::test]
+    async fn repeated_wrong_passwords_are_rate_limited() {
+        let users = Arc::new(UserStore::in_memory());
+        users.mint("alice", "correct horse battery staple", 0).unwrap();
+        let app = router(
+            users,
+            Arc::new(AuthLimiter::new(3, std::time::Duration::from_secs(300), 100, 1)),
+        );
+
+        for _ in 0..3 {
+            let response = post_token(app.clone(), "alice", "wrong").await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = post_token(app.clone(), "alice", "correct horse battery staple").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

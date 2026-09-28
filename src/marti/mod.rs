@@ -65,6 +65,40 @@ pub mod oauth;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerIdentity(pub String);
 
+/// The connecting client's IP address, when the listener recorded one
+/// (every real listener does, via `into_make_service_with_connect_info`).
+/// Never rejects: a request without connection info (e.g. a router driven
+/// directly in a unit test) just yields `None`.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerIp(pub Option<std::net::IpAddr>);
+
+#[axum::async_trait]
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(PeerIp(
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                .map(|info| info.0.ip()),
+        ))
+    }
+}
+
+impl PeerIp {
+    /// Rate-limit key for this client -- see [`crate::ratelimit`].
+    pub fn limit_key(&self) -> String {
+        match self.0 {
+            Some(ip) => crate::ratelimit::ip_key(ip),
+            None => "ip:unknown".to_string(),
+        }
+    }
+}
+
 /// A plain-HTTP listener serving a pre-built [`Router`], following the same
 /// bind-then-`local_addr`-then-`run` shape as
 /// [`crate::transport::tcp::TcpRelay`] and [`crate::transport::tls::TlsRelay`]
@@ -90,7 +124,12 @@ impl PlainHttpServer {
 
     /// Serve until the process exits or the listener errors.
     pub async fn run(self) -> std::io::Result<()> {
-        axum::serve(self.listener, self.router).await
+        axum::serve(
+            self.listener,
+            self.router
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
     }
 }
 

@@ -21,13 +21,14 @@ still on the drawing board.
 
 ## What it does today
 
-- Real-time CoT relay over plain TCP and mutual-TLS, so ATAK/iTAK/WinTAK
-  clients see each other's positions and markers live.
+- Real-time CoT relay over mutual-TLS, so ATAK/iTAK/WinTAK clients see each
+  other's positions and markers live (plus an opt-in plain-TCP relay for
+  trusted local bridges).
 - Certificate-based device enrollment — a client requests a cert, the server
-  signs it with its own CA, done. Enrollment is **secure by default**: once
-  you've enrolled your own admin device, the server automatically locks
-  further enrollment behind one-time invite tokens. See "Enrollment &
-  access control" below.
+  signs it with its own CA, done. Enrollment is **secure by default**: locked
+  from the first start, with the admin device enrolling via a one-time
+  bootstrap token and every other device via an invite token or a password
+  account. See "Enrollment & access control" below.
 - Missions (Data Sync) — shared folders of markers and files that sync
   across devices, with Owner/Subscriber permissions so not everyone can
   delete or rewrite someone else's mission.
@@ -37,19 +38,42 @@ still on the drawing board.
 
 ## Enrollment & access control
 
-By default (`enrollment_mode = "auto"`), a brand-new MicroTAK server accepts
-any enrollment — there's no admin yet, so there's nothing to protect. The
-moment your configured admin device (`admin_common_name` in the config)
-actually enrolls, the server locks down live, no restart required: from then
-on, new devices need a one-time invite token to enroll. Mint, list, and
-revoke those tokens through the mTLS-authenticated admin API, or more
-conveniently with the companion CLI,
+By default (`enrollment_mode = "auto"`), enrollment is **locked from the
+very first start**. On first start the server writes a one-time
+**bootstrap token** to `data_dir/bootstrap-token` (readable by the server's
+own user only) and logs where it is. Enroll your admin device — the Common
+Name configured as `admin_common_name`, `"admin"` by default — with that
+token:
+
+```sh
+# Docker: read the token from the data volume
+docker compose exec microtak-server cat data/bootstrap-token
+
+microtak-admin-cli enroll --enrollment-url http://<server>:8446 \
+  --cn admin --token <bootstrap token>
+```
+
+The token works once, only for the admin identity, and the file is deleted
+after use. From then on, new devices need a one-time invite token (or a
+password account, below) minted by the admin through the mTLS-authenticated
+admin API, or more conveniently with the companion CLI,
 [microtak-admin-cli](https://github.com/microtak/microtak-admin-cli), which
 also prints enrollment QR codes for handing a device its token.
 
+Identity rules, enforced in every mode:
+
+- The admin identity can only ever be enrolled with the bootstrap token.
+- An invite token (or `Open` mode) can only create a **new** identity — it
+  can never re-enroll a device that already exists. Re-enrolling (rotating)
+  an existing identity requires that identity's own password account.
+- Issued client certificates always carry a fixed profile (client-auth
+  only, never a CA, no alternative names), whatever the device's CSR asks
+  for.
+- Repeated failed password/token attempts are rate-limited (HTTP 429).
+
 If you'd rather manage access some other way (e.g. a firewall/VPN
-perimeter), set `enrollment_mode = "open"` to disable the lockdown
-permanently — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the
+perimeter), set `enrollment_mode = "open"` to let any *new* identity
+enroll without a token (the identity rules above still apply) — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the
 reasoning behind the two modes.
 
 For clients that expect real TAK-Server-style username/password login
@@ -99,8 +123,13 @@ This builds the image and exposes the four ports MicroTAK listens on:
 |------|---------|
 | 8446 | Certificate enrollment (plain HTTP) |
 | 8443 | Marti API — missions, admin (mTLS) |
-| 8087 | CoT relay (plain TCP) |
+| 8087 | CoT relay (plain TCP) — **off by default**, see below |
 | 8089 | CoT relay (mTLS) |
+
+The plain-TCP relay on 8087 is unauthenticated and unencrypted — anyone who
+can reach it can read every position and inject events — so it only runs
+with `plain_tcp_enabled = true`. Enable it only for a trusted local bridge
+(e.g. an APRS or mesh gateway on the same host).
 
 Data and backups live in Docker volumes so they survive container restarts.
 To customize settings, drop a `microtak.toml` next to `docker-compose.yml`

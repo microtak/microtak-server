@@ -28,6 +28,8 @@ use crate::eventlog::{EventLog, EventLogError};
 pub enum RegistryError {
     #[error("no device found with common name '{0}'")]
     NotFound(String),
+    #[error("a device with common name '{0}' is already enrolled")]
+    AlreadyEnrolled(String),
     #[error("uid '{uid}' is already bound to a different device (common name '{owner}')")]
     UidOwnedByOtherDevice { uid: String, owner: String },
     #[error(
@@ -115,6 +117,35 @@ impl DeviceRegistry {
         now_unix: i64,
     ) -> Result<DeviceRecord, RegistryError> {
         let mut devices = self.devices.write().unwrap();
+        let event = RegistryEvent::Enrolled {
+            common_name: common_name.to_string(),
+            cert_pem: cert_pem.to_string(),
+            at_unix: now_unix,
+        };
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply_event(&mut devices, &event);
+        Ok(devices.get(common_name).unwrap().clone())
+    }
+
+    /// Enroll a *new* device, failing with
+    /// [`RegistryError::AlreadyEnrolled`] if the common name is already
+    /// taken -- checked and recorded under one write lock, so two
+    /// concurrent requests for the same new name can't both succeed. Used
+    /// by every enrollment path that doesn't prove ownership of an
+    /// existing identity (invite tokens, `Open` mode): those may only ever
+    /// create identities, never replace one (TC-ENROLL-13).
+    pub fn enroll_new(
+        &self,
+        common_name: &str,
+        cert_pem: &str,
+        now_unix: i64,
+    ) -> Result<DeviceRecord, RegistryError> {
+        let mut devices = self.devices.write().unwrap();
+        if devices.contains_key(common_name) {
+            return Err(RegistryError::AlreadyEnrolled(common_name.to_string()));
+        }
         let event = RegistryEvent::Enrolled {
             common_name: common_name.to_string(),
             cert_pem: cert_pem.to_string(),
@@ -257,6 +288,15 @@ fn apply_event(devices: &mut HashMap<String, DeviceRecord>, event: &RegistryEven
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enroll_new_refuses_an_existing_common_name_and_keeps_its_cert() {
+        let registry = DeviceRegistry::in_memory();
+        registry.enroll_new("device-a", "first-cert", 1).unwrap();
+        let result = registry.enroll_new("device-a", "second-cert", 2);
+        assert!(matches!(result, Err(RegistryError::AlreadyEnrolled(cn)) if cn == "device-a"));
+        assert_eq!(registry.find("device-a").unwrap().cert_pem, "first-cert");
+    }
 
     #[test]
     fn enrolls_and_finds_a_device() {

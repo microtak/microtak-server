@@ -11,15 +11,14 @@
 //! configured, the admin API is unreachable by anyone (fails closed, not
 //! open).
 //!
-//! **Bootstrap order, still real even with [`crate::app::EnrollmentMode::Auto`]'s
-//! live transition**: these endpoints are only reachable over mTLS using a
-//! cert enrollment already issued, so the admin's own device necessarily
-//! has to enroll first -- which it can, since `Auto` only locks enrollment
-//! down *after* that device exists in the registry (see
-//! `marti::enrollment::EnrollmentState::is_locked_down`). No restart is
-//! needed for this to happen, unlike the two-phase restart-based design
-//! this replaced: enroll the admin device, and enrollment is locked for
-//! everyone else from that same moment on, in the same running process.
+//! **Bootstrap order**: these endpoints are only reachable over mTLS with
+//! a cert enrollment already issued, so the admin device has to enroll
+//! first. Since 2026-09-28 it does so with the one-time bootstrap token the
+//! server writes to `data_dir/bootstrap-token` on first start (see
+//! `src/bootstrap.rs`) -- the admin CN is reserved and can't be enrolled
+//! any other way (not with an invite token, not with a password account,
+//! not in `Open` mode), which closes the old "whoever enrolls first under
+//! the admin CN becomes the admin" window.
 
 use std::sync::Arc;
 
@@ -194,6 +193,15 @@ async fn mint_user(
             return error_response(StatusCode::BAD_REQUEST, format!("invalid request body: {error}"))
         }
     };
+    // The admin identity is reserved for the bootstrap token -- a password
+    // account under that name would be a second way to obtain an admin
+    // cert (the enrollment endpoint refuses it too; defence in depth).
+    if state.admin_common_name.as_deref() == Some(request.username.as_str()) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "the admin identity can't have a password account".to_string(),
+        );
+    }
     let password = request.password.unwrap_or_else(random_password);
     match state.users.mint(&request.username, &password, now_unix()) {
         Ok(()) => (
@@ -441,6 +449,23 @@ mod tests {
         let generated_password = body["password"].as_str().unwrap();
         assert!(!generated_password.is_empty());
         assert!(users.authenticate("bob", generated_password));
+    }
+
+    /// A password account named after the admin CN would be a second way
+    /// to obtain an admin cert -- refused.
+    #[tokio::test]
+    async fn cannot_mint_a_password_account_for_the_admin_identity() {
+        let (mut app, _tokens, users, _registry) = app_with_admin(Some("jz-admin"));
+        let response = request_as(
+            &mut app,
+            "jz-admin",
+            "POST",
+            "/Marti/api/admin/users",
+            r#"{"username": "jz-admin", "password": "hunter2"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!users.authenticate("jz-admin", "hunter2"));
     }
 
     #[tokio::test]

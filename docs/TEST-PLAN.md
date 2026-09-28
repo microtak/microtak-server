@@ -242,6 +242,22 @@ Added 2026-09-24, prompted by wanting real CloudTAK to work against MicroTAK unm
 
 **Not yet implemented**: resolving the real dialect differences a separate investigation found against a different real client (OmniTAK-iOS) — `/Marti/sync/*` vs `/Marti/api/sync/*` path prefixes, and a query-param vs. JSON-body mission-creation contract. One finding from that investigation *was* folded in (the CSR Content-Type allowlist now also accepts `text/plain`). See `docs/ARCHITECTURE.md`'s "Open questions" for the rest.
 
+## 19. Enrollment security hardening (2026-09-28)
+
+From a security review during the first live deployment -- see `docs/ARCHITECTURE.md` "Enrollment security hardening". **All implemented**, written test-first (each reproduced the vulnerability before the fix), and mutation-tested: every check below was removed in turn and a specific test failed, with one noted exception.
+
+| ID | Case | Type | Test |
+|---|---|---|---|
+| TC-ENROLL-11 | A CSR requesting `CA:TRUE` gets a plain end-entity cert; end to end, a chain forged with whatever it got is refused by the mTLS listener | [HARDEN] | `pki::tc_enroll_11_12_issued_client_cert_ignores_requested_extensions`, `e2e_csr_requesting_ca_status_cannot_forge_the_admin_identity` |
+| TC-ENROLL-12 | Requested KeyUsage/EKU/SANs are ignored: client certs carry exactly `digitalSignature` + `clientAuth`, no SANs; server certs `serverAuth` + only the configured names; serials are random | [HARDEN] | `pki::tc_enroll_11_12_…`, `pki::server_cert_carries_server_auth_and_only_the_configured_names`, `pki::issued_certs_get_distinct_random_serials_even_for_the_same_key` |
+| TC-ENROLL-13 | An invite token, or `Open` mode, can't re-enroll an existing identity (incl. the admin) -- 409 before the token is spent; only the identity's own password credential can rotate it | [HARDEN] | `enrollment::tc_enroll_13_*`, `open_mode_cannot_re_enroll_an_existing_identity_without_credentials`, `basic_auth_can_re_enroll_its_own_existing_identity`, `registry::enroll_new_refuses_an_existing_common_name_and_keeps_its_cert`, e2e auto-mode test |
+| TC-ENROLL-15 | `Auto` is locked from the first start; the admin CN is enrollable only with the one-time bootstrap token (not an invite token, not a password account, not `Open` mode); the token is `0600`, single-use, survives a restart until used, and its file is removed after use | [HARDEN] | `enrollment::tc_enroll_15_*`, `auto_mode_is_locked_before_the_admin_has_enrolled`, `bootstrap_token_cannot_enroll_a_non_admin_identity`, `a_wrong_bootstrap_token_is_rejected`, `basic_auth_cannot_enroll_the_admin_identity`, `admin::cannot_mint_a_password_account_for_the_admin_identity`, `bootstrap::*`, `app::bootstrap_token_exists_until_the_admin_enrolls`, `e2e_auto_mode_is_locked_from_the_start_and_the_admin_bootstraps_with_a_token` |
+| TC-LIMIT-08 | Repeated failed password/token attempts per IP and per username are refused with 429 before any credential check, on both `signClient/v2` and `/oauth/token`; the tracked-key table is bounded | [HARDEN] | `enrollment::tc_limit_08_repeated_failed_basic_auth_is_rate_limited`, `oauth::repeated_wrong_passwords_are_rate_limited`, `ratelimit::*` |
+| TC-LIMIT-09 | Enrollment/OAuth request bodies over 64 KiB are refused (413) before parsing | [HARDEN] | `enrollment::tc_limit_09_oversized_enrollment_body_is_rejected` |
+| TC-CFG-PLAIN-TCP | The unauthenticated plain-TCP relay is off unless `plain_tcp_enabled = true` | [HARDEN] | `app::plain_tcp_relay_is_disabled_by_default`, `config::enrollment_mode_defaults_to_auto_not_open` |
+
+**Mutation-testing exception**: replacing the handler's atomic `enroll_new` with the overwriting `enroll` on the token/open path is *not* caught at the HTTP level -- the early "already enrolled?" check answers every request the tests can produce, and the remaining race window (two requests passing that check together) is too narrow for `concurrent_enrollments_of_one_new_identity_yield_exactly_one_cert` to hit reliably. The atomicity itself is covered by the registry-level test above.
+
 ## Pending research
 
 - MeshCore throughput figures — needed to finalize TC-MESH-03/05's concrete bandwidth budget.

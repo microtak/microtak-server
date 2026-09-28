@@ -9,6 +9,7 @@
 
 pub mod app;
 pub mod backup;
+pub mod bootstrap;
 pub mod config;
 pub mod content_store;
 pub mod cot;
@@ -17,6 +18,7 @@ pub mod eventlog;
 pub mod marti;
 pub mod missions;
 pub mod pki;
+pub mod ratelimit;
 pub mod registry;
 pub mod transport;
 pub mod users;

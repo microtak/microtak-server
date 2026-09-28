@@ -46,13 +46,19 @@ fn unique_temp_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("microtak-e2e-{}-{n}", std::process::id()))
 }
 
+/// Most tests here exercise relaying, missions, etc. -- not enrollment
+/// policy -- so they run in `Open` mode (any *new* identity may enroll)
+/// with the plain-TCP relay enabled. The enrollment-policy tests at the
+/// end of this file use the secure defaults explicitly.
 fn test_config() -> AppConfig {
     AppConfig {
         enrollment_addr: "127.0.0.1:0".parse().unwrap(),
         marti_api_addr: "127.0.0.1:0".parse().unwrap(),
         plain_tcp_addr: "127.0.0.1:0".parse().unwrap(),
+        plain_tcp_enabled: true,
         mtls_addr: "127.0.0.1:0".parse().unwrap(),
         data_dir: unique_temp_dir(),
+        enrollment_mode: microtak_server::app::EnrollmentMode::Open,
         ..AppConfig::default()
     }
 }
@@ -969,31 +975,24 @@ async fn e2e_rejects_client_cert_not_signed_by_this_servers_ca() {
     }
 }
 
-/// The secure-by-default `Auto` enrollment mode's live transition (see
-/// `docs/ARCHITECTURE.md` / `src/marti/admin.rs`): unlike the old
-/// restart-based two-phase design this replaced, everything here happens
-/// against *one* continuously-running server, no restart involved --
-/// enrolling the configured admin device is itself what flips enrollment
-/// from open to locked, live.
+/// The secure default end to end (`Auto` mode, admin CN configured):
 ///
-/// 1. Server starts with `admin_common_name` configured but no device
-///    enrolled yet under that name -- enrollment is still open (an
-///    unrelated device can enroll with no token at all).
-/// 2. The admin device itself enrolls, also with no token (it has to be
-///    able to bootstrap without one).
-/// 3. From that moment on, with no restart, a new device with no token is
-///    rejected.
-/// 4. The admin mints a token via the real admin API (now reachable, since
-///    the admin's own cert works over mTLS); a device enrolling with it
-///    succeeds and the cert actually works over mTLS; the token can't be
-///    reused by a second device.
+/// 1. From the very first start, a device with no token is rejected --
+///    there is no open window.
+/// 2. Nobody can claim the admin CN without the bootstrap token; the
+///    admin enrolls with the token the server wrote to `data_dir`, after
+///    which the file is gone and the token can't be used again.
+/// 3. The admin mints an invite token via the real admin API; a device
+///    enrolling with it succeeds and its cert works over mTLS; the token
+///    can't be reused, and can't be used to take over an existing
+///    identity.
 #[tokio::test]
-async fn e2e_enrollment_auto_mode_locks_down_the_moment_the_admin_enrolls() {
+async fn e2e_auto_mode_is_locked_from_the_start_and_the_admin_bootstraps_with_a_token() {
     let config = AppConfig {
-        admin_common_name: Some("jz-admin".to_string()),
-        // enrollment_mode defaults to Auto -- deliberately not set here,
-        // to also prove the *default* is what locks down, not an opt-in
-        // flag someone has to remember to flip.
+        admin_common_name: Some("admin".to_string()),
+        // enrollment_mode defaults to Auto -- deliberately not overridden
+        // from `AppConfig::default()`, to prove the *default* is locked.
+        enrollment_mode: AppConfig::default().enrollment_mode,
         ..test_config()
     };
     let app = App::bind(config).await.unwrap();
@@ -1001,38 +1000,48 @@ async fn e2e_enrollment_auto_mode_locks_down_the_moment_the_admin_enrolls() {
     let marti_api_addr = app.marti_api_addr().unwrap();
     let mtls_addr = app.mtls_addr().unwrap();
     let ca_cert_pem = app.ca_cert_pem.clone();
+    let bootstrap_path = app
+        .bootstrap_token_path()
+        .expect("a fresh server with an admin CN has a bootstrap token outstanding");
+    let bootstrap_token = std::fs::read_to_string(&bootstrap_path)
+        .unwrap()
+        .trim()
+        .to_string();
     tokio::spawn(app.run());
 
     let enrollment_base_url = format!("http://{enrollment_addr}");
     let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
     let plain_client = reqwest::Client::new();
+    let post = |query: String, csr: String| {
+        plain_client
+            .post(format!("{enrollment_base_url}/Marti/api/tls/signClient/v2{query}"))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(csr)
+            .send()
+    };
 
-    // Before the admin has enrolled, an unrelated device can enroll with
-    // no token at all -- still open.
-    let (before_cert, _before_key) = enroll(&enrollment_base_url, "device-before-admin").await;
-    assert!(before_cert.contains("BEGIN CERTIFICATE"));
+    // 1. Locked from the start: no token, no enrollment.
+    let (csr, _key) = pki::build_csr("device-early-bird").unwrap();
+    assert_eq!(post(String::new(), csr).await.unwrap().status(), 403);
 
-    // The admin device itself bootstraps the same way -- no token needed
-    // for this specific enrollment either, or there'd be no way in at all.
-    let (admin_cert, admin_key) = enroll(&enrollment_base_url, "jz-admin").await;
+    // 2. The admin CN can't be claimed without the bootstrap token...
+    let (csr, _key) = pki::build_csr("admin").unwrap();
+    assert_eq!(post(String::new(), csr).await.unwrap().status(), 403);
+    // ...but can with it, exactly once.
+    let (csr, admin_key) = pki::build_csr("admin").unwrap();
+    let response = post(format!("?token={bootstrap_token}"), csr).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let admin_cert = wrap_pem(body["signedCert"].as_str().unwrap());
+    assert!(!bootstrap_path.exists(), "the used bootstrap token file is deleted");
+    let (csr, _key) = pki::build_csr("admin").unwrap();
+    assert_eq!(
+        post(format!("?token={bootstrap_token}"), csr).await.unwrap().status(),
+        403
+    );
 
-    // From this exact point on, with the same server still running, a new
-    // device with no token is rejected -- the live transition.
-    let (no_token_csr, _key) = pki::build_csr("device-no-token").unwrap();
-    let rejected = plain_client
-        .post(format!(
-            "{enrollment_base_url}/Marti/api/tls/signClient/v2"
-        ))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(no_token_csr)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(rejected.status(), 403);
-
+    // 3. The admin mints a real invite token through the real admin API.
     let admin_client = mtls_reqwest_client(&ca_cert_pem, &admin_cert, admin_key, marti_api_addr);
-
-    // The admin mints a real token through the real admin API.
     let mint_response = admin_client
         .post(format!("{base_url}/Marti/api/admin/enrollmentTokens"))
         .send()
@@ -1040,39 +1049,123 @@ async fn e2e_enrollment_auto_mode_locks_down_the_moment_the_admin_enrolls() {
         .unwrap();
     assert_eq!(mint_response.status(), 201);
     let mint_body: serde_json::Value = mint_response.json().await.unwrap();
-    let token = mint_body["token"].as_str().unwrap();
+    let token = mint_body["token"].as_str().unwrap().to_string();
 
-    // A device enrolling with that token succeeds.
-    let (with_token_csr, device_key) = pki::build_csr("device-with-token").unwrap();
-    let signed = plain_client
-        .post(format!(
-            "{enrollment_base_url}/Marti/api/tls/signClient/v2?token={token}"
-        ))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(with_token_csr)
-        .send()
-        .await
-        .unwrap();
+    // An invite token can't take over the admin identity.
+    let (csr, _key) = pki::build_csr("admin").unwrap();
+    assert_eq!(post(format!("?token={token}"), csr).await.unwrap().status(), 403);
+
+    // A new device enrolling with it succeeds, and its cert works.
+    let (csr, device_key) = pki::build_csr("device-with-token").unwrap();
+    let signed = post(format!("?token={token}"), csr).await.unwrap();
     assert_eq!(signed.status(), 200);
     let signed_body: serde_json::Value = signed.json().await.unwrap();
     let device_cert = wrap_pem(signed_body["signedCert"].as_str().unwrap());
-
-    // The new cert actually works over mTLS -- not just "the server said
-    // 200." for the enrollment call.
     connect_mtls(mtls_addr, &ca_cert_pem, &device_cert, device_key)
         .await
         .expect("the token-enrolled device's cert should be accepted for mTLS");
 
-    // The now-consumed token can't be reused by a second device.
-    let (second_csr, _key2) = pki::build_csr("device-second").unwrap();
-    let reused = plain_client
-        .post(format!(
-            "{enrollment_base_url}/Marti/api/tls/signClient/v2?token={token}"
-        ))
+    // The consumed token can't be reused by a second device.
+    let (csr, _key) = pki::build_csr("device-second").unwrap();
+    assert_eq!(post(format!("?token={token}"), csr).await.unwrap().status(), 403);
+
+    // A fresh token can't re-enroll the existing device either.
+    let mint_body: serde_json::Value = admin_client
+        .post(format!("{base_url}/Marti/api/admin/enrollmentTokens"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second_token = mint_body["token"].as_str().unwrap();
+    let (csr, _key) = pki::build_csr("device-with-token").unwrap();
+    assert_eq!(
+        post(format!("?token={second_token}"), csr).await.unwrap().status(),
+        409
+    );
+}
+
+/// TC-ENROLL-11, end to end -- the full exploit chain, not just the
+/// issued cert's fields: a device enrolls with a CSR requesting CA
+/// status, uses whatever it got back to sign a forged leaf for the admin
+/// CN, and presents that chain to the admin API. It must not get in.
+/// (Enrolled in `Open` mode, so this holds even for deployments that keep
+/// enrollment open by choice.)
+#[tokio::test]
+async fn e2e_csr_requesting_ca_status_cannot_forge_the_admin_identity() {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
+        IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    };
+
+    let config = AppConfig {
+        admin_common_name: Some("admin".to_string()),
+        enrollment_mode: microtak_server::app::EnrollmentMode::Open,
+        ..test_config()
+    };
+    let app = App::bind(config).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    tokio::spawn(app.run());
+
+    // 1. Enroll with a CSR asking to be a CA.
+    let attacker_key = KeyPair::generate().unwrap();
+    let mut csr_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    csr_params.distinguished_name = DistinguishedName::new();
+    csr_params
+        .distinguished_name
+        .push(DnType::CommonName, "attacker");
+    csr_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    csr_params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let csr_pem = csr_params
+        .serialize_request(&attacker_key)
+        .unwrap()
+        .pem()
+        .unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("http://{enrollment_addr}/Marti/api/tls/signClient/v2"))
         .header(CONTENT_TYPE, "application/octet-stream")
-        .body(second_csr)
+        .body(csr_pem)
         .send()
         .await
         .unwrap();
-    assert_eq!(reused.status(), 403);
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let attacker_cert = wrap_pem(body["signedCert"].as_str().unwrap());
+
+    // 2. Use the issued cert as an issuer for a forged admin leaf.
+    let issuer = Issuer::from_ca_cert_pem(&attacker_cert, attacker_key).unwrap();
+    let forged_key = KeyPair::generate().unwrap();
+    let mut forged_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    forged_params.distinguished_name = DistinguishedName::new();
+    forged_params
+        .distinguished_name
+        .push(DnType::CommonName, "admin");
+    forged_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    forged_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let forged_cert = forged_params.signed_by(&forged_key, &issuer).unwrap().pem();
+
+    // 3. Present forged leaf + attacker "intermediate" to the admin API.
+    let chain_pem = format!("{forged_cert}{attacker_cert}");
+    let client = mtls_reqwest_client(&ca_cert_pem, &chain_pem, forged_key, marti_api_addr);
+    let result = client
+        .get(format!(
+            "https://{SERVER_NAME}:{}/Marti/api/admin/enrollmentTokens",
+            marti_api_addr.port()
+        ))
+        .send()
+        .await;
+
+    match result {
+        Err(_) => {} // TLS handshake refused the forged chain -- expected.
+        Ok(response) => panic!(
+            "forged admin chain was accepted by the TLS layer (status {})",
+            response.status()
+        ),
+    }
 }

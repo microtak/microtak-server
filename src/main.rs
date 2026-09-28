@@ -38,7 +38,7 @@ async fn main() -> std::io::Result<()> {
     tracing::info!(
         enrollment = %app.enrollment_addr()?,
         marti_api = %app.marti_api_addr()?,
-        plain_tcp = %app.plain_tcp_addr()?,
+        plain_tcp = ?app.plain_tcp_addr().ok(),
         mtls = %app.mtls_addr()?,
         backup_enabled,
         backup_dir = %backup_dir.display(),

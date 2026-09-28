@@ -319,7 +319,9 @@ mod tests {
     fn build_fixture() -> Fixture {
         let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
         let (server_csr, server_key) = build_server_csr("microtak-server", "microtak-server");
-        let signed = ca.sign_csr(&server_csr, Duration::days(365)).unwrap();
+        let signed = ca
+            .sign_server_csr(&server_csr, &["microtak-server".to_string()], Duration::days(365))
+            .unwrap();
         let server_cert_der = pem_to_der(&signed.cert_pem);
         let ca_cert_der = pem_to_der(&ca.ca_cert_pem());
 
