@@ -15,8 +15,11 @@ use std::sync::Arc;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::ServerConfig;
 use time::Duration;
+use tracing::info;
 
 use crate::backup::{BackupRunner, OffsiteTarget};
+use crate::bootstrap::{BootstrapToken, BOOTSTRAP_TOKEN_FILE};
+use crate::ratelimit::AuthLimiter;
 use crate::content_store::ContentStore;
 use crate::enrollment_tokens::{EnrollmentTokenError, EnrollmentTokenStore};
 use crate::marti::admin::AdminState;
@@ -40,8 +43,14 @@ pub struct AppConfig {
     pub enrollment_addr: SocketAddr,
     /// Where the Marti missions HTTP endpoint listens.
     pub marti_api_addr: SocketAddr,
-    /// Where the unauthenticated plain-TCP CoT relay listens.
+    /// Where the unauthenticated plain-TCP CoT relay listens, if enabled.
     pub plain_tcp_addr: SocketAddr,
+    /// Whether to run the plain-TCP CoT relay at all. **Off by default**:
+    /// it is cleartext and unauthenticated -- anyone who can reach it can
+    /// read every position and inject arbitrary CoT. Enable it only for a
+    /// trusted local bridge (e.g. an APRS or mesh gateway on the same host
+    /// or an isolated network).
+    pub plain_tcp_enabled: bool,
     /// Where the mTLS CoT relay listens.
     pub mtls_addr: SocketAddr,
     /// Common Name for a freshly-generated CA (ignored if a CA already
@@ -66,8 +75,11 @@ pub struct AppConfig {
     /// `src/backup.rs` for the local-mirror + optional-offsite-command
     /// design.
     pub backup: BackupConfig,
-    /// See `src/marti/admin.rs` -- `None` means the admin API
-    /// (enrollment-token minting) is unreachable by anyone.
+    /// The Common Name of the admin device -- the only identity allowed to
+    /// use the admin API (`src/marti/admin.rs`), and reserved at
+    /// enrollment: it can only be enrolled with the one-time bootstrap
+    /// token (`src/bootstrap.rs`). Defaults to `"admin"`. `None` makes the
+    /// admin API unreachable by anyone.
     pub admin_common_name: Option<String>,
     /// See `src/enrollment_tokens.rs` and [`EnrollmentMode`]'s own doc
     /// comment -- `Auto` by default: secure by default without requiring
@@ -76,17 +88,20 @@ pub struct AppConfig {
 }
 
 /// Whether `/Marti/api/tls/signClient/v2` requires a valid enrollment
-/// token. **Secure by default, without an insecure default**: `Auto`
-/// (the default) requires a token *only once an admin device actually
-/// exists* -- checked live against the device registry on every
-/// enrollment attempt, not a static flag decided once at startup. A fresh
-/// deployment with no `admin_common_name` configured yet (or one
-/// configured but not yet enrolled) stays open, so bootstrap needs no
-/// separate "temporarily open it, then lock it down and restart" dance --
-/// enrolling the admin device is itself what flips enrollment locked,
-/// live, no restart required. `Open` is an explicit, permanent override
-/// for a deployment that wants enrollment open regardless (e.g. one
-/// gating access at the network/firewall level instead).
+/// token from a client that presents no password credential.
+///
+/// - `Auto` (the default): **locked from the very first start**. A new
+///   device needs an invite token minted by the admin (or a password
+///   account). The admin device itself enrolls with the one-time bootstrap
+///   token the server writes to `data_dir` on first start (see
+///   `src/bootstrap.rs`) -- there is no open window in which whoever
+///   arrives first can claim the admin identity. (Before 2026-09-28, `Auto`
+///   stayed open until the admin enrolled; that window is closed.)
+/// - `Open`: an explicit override for deployments gating access some other
+///   way (e.g. network perimeter). Open for *new* identities only: an
+///   already-enrolled identity can't be re-enrolled without its own
+///   password credential, and the admin identity still needs the bootstrap
+///   token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EnrollmentMode {
@@ -132,13 +147,14 @@ impl Default for AppConfig {
             enrollment_addr: "0.0.0.0:8446".parse().unwrap(),
             marti_api_addr: "0.0.0.0:8443".parse().unwrap(),
             plain_tcp_addr: "0.0.0.0:8087".parse().unwrap(),
+            plain_tcp_enabled: false,
             mtls_addr: "0.0.0.0:8089".parse().unwrap(),
             ca_common_name: "MicroTAK CA".to_string(),
             server_common_name: "microtak-server".to_string(),
             cert_validity: Duration::days(365),
             backup: BackupConfig::default(),
             data_dir: PathBuf::from("./data"),
-            admin_common_name: None,
+            admin_common_name: Some("admin".to_string()),
             enrollment_mode: EnrollmentMode::default(),
         }
     }
@@ -182,8 +198,9 @@ pub struct App {
     pub content_store: Arc<ContentStore>,
     enrollment: PlainHttpServer,
     marti_api: MtlsHttpServer,
-    tcp: TcpRelay,
+    tcp: Option<TcpRelay>,
     tls: TlsRelay,
+    bootstrap: Arc<BootstrapToken>,
 }
 
 impl App {
@@ -203,6 +220,24 @@ impl App {
             config.data_dir.join("enrollment_tokens.log"),
         )?);
         let users = Arc::new(UserStore::load_or_create(config.data_dir.join("users.log"))?);
+        let bootstrap = Arc::new(match &config.admin_common_name {
+            Some(admin_cn) => {
+                let token = BootstrapToken::load_or_create(
+                    &config.data_dir.join(BOOTSTRAP_TOKEN_FILE),
+                    registry.find(admin_cn).is_some(),
+                )?;
+                if let Some(path) = token.path() {
+                    info!(
+                        admin_common_name = %admin_cn,
+                        path = %path.display(),
+                        "admin device not enrolled yet -- enroll it with the one-time bootstrap token in this file"
+                    );
+                }
+                token
+            }
+            None => BootstrapToken::none(),
+        });
+        let limiter = Arc::new(AuthLimiter::default());
         let hub = RelayHub::new();
         let clients = ConnectedClients::new();
 
@@ -212,7 +247,11 @@ impl App {
             &config.server_common_name,
             vec![config.server_common_name.clone()],
         )?;
-        let signed_server_cert = ca.sign_csr(&server_csr, config.cert_validity)?;
+        let signed_server_cert = ca.sign_server_csr(
+            &server_csr,
+            std::slice::from_ref(&config.server_common_name),
+            config.cert_validity,
+        )?;
         let server_cert_der = pki::cert_pem_to_der(&signed_server_cert.cert_pem)?;
         let ca_cert_der = pki::cert_pem_to_der(&ca_cert_pem)?;
         // Shared between the CoT mTLS relay and the Marti API's mTLS HTTP
@@ -234,9 +273,12 @@ impl App {
             enrollment_mode: config.enrollment_mode,
             admin_common_name: config.admin_common_name.clone(),
             users: Arc::clone(&users),
+            bootstrap: Arc::clone(&bootstrap),
+            limiter: Arc::clone(&limiter),
         });
 
-        let plain_router = enrollment::router(enrollment_state).merge(oauth::router(Arc::clone(&users)));
+        let plain_router = enrollment::router(enrollment_state)
+            .merge(oauth::router(Arc::clone(&users), limiter));
         let enrollment = PlainHttpServer::bind(config.enrollment_addr, plain_router).await?;
         let admin_state = AdminState {
             tokens: enrollment_tokens,
@@ -254,7 +296,11 @@ impl App {
         let marti_api =
             MtlsHttpServer::bind(config.marti_api_addr, Arc::clone(&tls_server_config), marti_router)
                 .await?;
-        let tcp = TcpRelay::bind(config.plain_tcp_addr, hub.clone(), clients.clone()).await?;
+        let tcp = if config.plain_tcp_enabled {
+            Some(TcpRelay::bind(config.plain_tcp_addr, hub.clone(), clients.clone()).await?)
+        } else {
+            None
+        };
         let tls = TlsRelay::bind(
             config.mtls_addr,
             tls_server_config,
@@ -279,6 +325,7 @@ impl App {
             marti_api,
             tcp,
             tls,
+            bootstrap,
         })
     }
 
@@ -290,8 +337,25 @@ impl App {
         self.marti_api.local_addr()
     }
 
+    /// Errors with [`std::io::ErrorKind::NotConnected`] if the plain-TCP
+    /// relay is disabled (the default -- see [`AppConfig::plain_tcp_enabled`]).
     pub fn plain_tcp_addr(&self) -> std::io::Result<SocketAddr> {
-        self.tcp.local_addr()
+        match &self.tcp {
+            Some(tcp) => tcp.local_addr(),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "the plain-TCP relay is disabled",
+            )),
+        }
+    }
+
+    /// Where the admin's one-time bootstrap token is, while one is
+    /// outstanding (admin configured but not yet enrolled).
+    pub fn bootstrap_token_path(&self) -> Option<PathBuf> {
+        self.bootstrap
+            .is_outstanding()
+            .then(|| self.bootstrap.path().map(PathBuf::from))
+            .flatten()
     }
 
     pub fn mtls_addr(&self) -> std::io::Result<SocketAddr> {
@@ -308,7 +372,13 @@ impl App {
             tls,
             ..
         } = self;
-        tokio::try_join!(enrollment.run(), marti_api.run(), tcp.run(), tls.run())?;
+        let tcp = async {
+            match tcp {
+                Some(tcp) => tcp.run().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::try_join!(enrollment.run(), marti_api.run(), tcp, tls.run())?;
         Ok(())
     }
 }
@@ -398,6 +468,48 @@ mod tests {
             Some(&b"persisted content"[..])
         );
 
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    /// TC-ENROLL-15, at the assembly level: a fresh server with an admin
+    /// CN configured writes a bootstrap token file; once the admin has
+    /// enrolled, a restart creates none and removes a stale one.
+    #[tokio::test]
+    async fn bootstrap_token_exists_until_the_admin_enrolls() {
+        let data_dir = unique_temp_dir("bootstrap");
+        let first = App::bind(ephemeral_config(data_dir.clone())).await.unwrap();
+        let path = first.bootstrap_token_path().expect("admin not enrolled yet");
+        assert_eq!(path, data_dir.join(BOOTSTRAP_TOKEN_FILE));
+        let token = std::fs::read_to_string(&path).unwrap();
+        first.registry.enroll("admin", "admin-cert-pem", 1).unwrap();
+        drop(first);
+
+        let second = App::bind(ephemeral_config(data_dir.clone())).await.unwrap();
+        assert!(second.bootstrap_token_path().is_none());
+        assert!(!path.exists(), "the stale token file is removed");
+        assert!(!token.is_empty());
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    /// The plain-TCP relay is off unless explicitly enabled.
+    #[tokio::test]
+    async fn plain_tcp_relay_is_disabled_by_default() {
+        assert!(!AppConfig::default().plain_tcp_enabled);
+        let data_dir = unique_temp_dir("plain-tcp");
+        let app = App::bind(ephemeral_config(data_dir.clone())).await.unwrap();
+        assert_eq!(
+            app.plain_tcp_addr().unwrap_err().kind(),
+            std::io::ErrorKind::NotConnected
+        );
+        drop(app);
+
+        let enabled = App::bind(AppConfig {
+            plain_tcp_enabled: true,
+            ..ephemeral_config(data_dir.clone())
+        })
+        .await
+        .unwrap();
+        assert!(enabled.plain_tcp_addr().is_ok());
         std::fs::remove_dir_all(&data_dir).ok();
     }
 

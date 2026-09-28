@@ -10,7 +10,8 @@
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
-    DnType, DnValue, Issuer, IsCa, KeyPair, KeyUsagePurpose,
+    DnType, DnValue, ExtendedKeyUsagePurpose, Issuer, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    SerialNumber,
 };
 use rustls::pki_types::CertificateDer;
 use thiserror::Error;
@@ -89,8 +90,19 @@ impl CertificateAuthority {
         self.issuer.key().serialize_pem()
     }
 
-    /// Sign a PEM-encoded PKCS#10 certificate signing request, issuing a
-    /// leaf certificate valid for `validity` from now.
+    /// Sign a PEM-encoded PKCS#10 certificate signing request from an
+    /// enrolling *client*, issuing a leaf certificate valid for `validity`
+    /// from now.
+    ///
+    /// Only two things are taken from the CSR: its public key (whose
+    /// possession the CSR's own signature proves -- `rcgen` verifies it
+    /// while parsing) and its subject Common Name, which becomes the
+    /// device's identity. **Everything else the CSR requests is ignored**
+    /// -- the issued cert always carries the fixed client profile below,
+    /// never a CA flag, certificate-signing key usage, server-auth EKU, or
+    /// SANs. Signing requested extensions as-is (the previous behaviour)
+    /// let any enrolling client obtain a subordinate CA and forge any
+    /// identity, the admin's included (TC-ENROLL-11/12).
     ///
     /// Returns [`PkiError::CsrParse`] for a malformed/non-CSR payload
     /// (TC-ENROLL-06) and [`PkiError::MissingCommonName`] if the CSR's
@@ -100,24 +112,90 @@ impl CertificateAuthority {
         csr_pem: &str,
         validity: Duration,
     ) -> Result<SignedCertificate, PkiError> {
-        let mut csr_params =
+        self.sign_with_profile(csr_pem, validity, CertProfile::Client)
+    }
+
+    /// Like [`Self::sign_csr`], but issuing a *server* certificate: EKU
+    /// `serverAuth`, with exactly the given DNS SANs (taken from the
+    /// server's own configuration, never from the CSR). Only for MicroTAK's
+    /// own listener certificates -- never reachable from enrollment.
+    pub fn sign_server_csr(
+        &self,
+        csr_pem: &str,
+        dns_names: &[String],
+        validity: Duration,
+    ) -> Result<SignedCertificate, PkiError> {
+        self.sign_with_profile(csr_pem, validity, CertProfile::Server(dns_names))
+    }
+
+    fn sign_with_profile(
+        &self,
+        csr_pem: &str,
+        validity: Duration,
+        profile: CertProfile<'_>,
+    ) -> Result<SignedCertificate, PkiError> {
+        let requested =
             CertificateSigningRequestParams::from_pem(csr_pem).map_err(PkiError::CsrParse)?;
 
-        let common_name = common_name_of(&csr_params.params.distinguished_name)
+        let common_name = common_name_of(&requested.params.distinguished_name)
             .ok_or(PkiError::MissingCommonName)?;
 
-        csr_params.params.not_before = OffsetDateTime::now_utc();
-        csr_params.params.not_after = OffsetDateTime::now_utc() + validity;
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name.as_str());
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.use_authority_key_identifier_extension = true;
+        params.serial_number = Some(random_serial_number());
+        params.not_before = OffsetDateTime::now_utc();
+        params.not_after = OffsetDateTime::now_utc() + validity;
+        match profile {
+            CertProfile::Client => {
+                params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+            }
+            CertProfile::Server(dns_names) => {
+                params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+                params.subject_alt_names = dns_names
+                    .iter()
+                    .map(|name| {
+                        name.clone()
+                            .try_into()
+                            .map(SanType::DnsName)
+                            .map_err(PkiError::Params)
+                    })
+                    .collect::<Result<_, _>>()?;
+            }
+        }
 
-        let cert = csr_params
-            .signed_by(&self.issuer)
-            .map_err(PkiError::Signing)?;
+        let issued = CertificateSigningRequestParams {
+            params,
+            public_key: requested.public_key,
+        };
+        let cert = issued.signed_by(&self.issuer).map_err(PkiError::Signing)?;
 
         Ok(SignedCertificate {
             cert_pem: cert.pem(),
             common_name,
         })
     }
+}
+
+enum CertProfile<'a> {
+    Client,
+    Server(&'a [String]),
+}
+
+/// A random, positive 128-bit serial number (RFC 5280 allows up to 20
+/// octets; the top bit is cleared so the DER INTEGER stays positive).
+/// Without this, `rcgen` derives the serial from the public key, so a
+/// device re-enrolling with the same key would get a duplicate serial.
+fn random_serial_number() -> SerialNumber {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("OS RNG must be available");
+    bytes[0] &= 0x7f;
+    SerialNumber::from_slice(&bytes)
 }
 
 /// The result of a successful CSR signing.
@@ -300,6 +378,134 @@ mod tests {
         assert_eq!(fp_a1.len(), 32 * 3 - 1, "32 hex-pair groups joined by colons");
         assert!(fp_a1.chars().all(|c| c.is_ascii_hexdigit() || c == ':'));
         assert_eq!(fp_a1, fp_a1.to_uppercase());
+    }
+
+    /// A CSR asking for everything a client cert must never carry: CA
+    /// status, certificate-signing key usage, server-auth EKU, and SANs.
+    fn malicious_csr(common_name: &str) -> String {
+        use rcgen::{ExtendedKeyUsagePurpose, SanType};
+        let key = KeyPair::generate().unwrap();
+        let mut params =
+            CertificateParams::new(vec!["evil.example".to_string()]).unwrap();
+        params.distinguished_name = DistinguishedName::new();
+        params.distinguished_name.push(DnType::CommonName, common_name);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress("10.0.0.1".parse().unwrap()));
+        params.serialize_request(&key).unwrap().pem().unwrap()
+    }
+
+    fn parse_leaf(cert_pem: &str) -> Vec<u8> {
+        pem::parse(cert_pem).unwrap().contents().to_vec()
+    }
+
+    /// TC-ENROLL-11/12: whatever a CSR requests, the issued client cert
+    /// carries only the fixed client profile -- a CSR asking for CA status
+    /// must never produce a subordinate CA (which could then mint a cert
+    /// for any identity, the admin included, or a server cert every
+    /// CA-pinned client would accept).
+    #[test]
+    fn tc_enroll_11_12_issued_client_cert_ignores_requested_extensions() {
+        use x509_parser::extensions::ParsedExtension;
+        use x509_parser::prelude::{FromDer, X509Certificate};
+
+        let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
+        let signed = ca
+            .sign_csr(&malicious_csr("device-evil"), Duration::days(365))
+            .unwrap();
+        assert_eq!(signed.common_name, "device-evil");
+
+        let der = parse_leaf(&signed.cert_pem);
+        let (_, cert) = X509Certificate::from_der(&der).unwrap();
+
+        let basic_constraints = cert.basic_constraints().unwrap().map(|bc| bc.value.ca);
+        assert_ne!(basic_constraints, Some(true), "a client cert must never be a CA");
+
+        let key_usage = cert.key_usage().unwrap().expect("client certs carry an explicit KeyUsage");
+        assert!(key_usage.value.digital_signature());
+        assert!(!key_usage.value.key_cert_sign(), "no certificate signing");
+        assert!(!key_usage.value.crl_sign());
+
+        let eku = cert
+            .extended_key_usage()
+            .unwrap()
+            .expect("client certs carry an explicit EKU");
+        assert!(eku.value.client_auth);
+        assert!(!eku.value.server_auth, "a client cert must not be usable as a server cert");
+        assert!(!eku.value.any);
+
+        let has_san = cert
+            .extensions()
+            .iter()
+            .any(|ext| matches!(ext.parsed_extension(), ParsedExtension::SubjectAlternativeName(_)));
+        assert!(!has_san, "client certs carry no SANs, whatever the CSR asked for");
+    }
+
+    /// Two certs issued for the same public key (e.g. a device re-enrolling
+    /// with its existing key) must still get distinct serial numbers.
+    #[test]
+    fn issued_certs_get_distinct_random_serials_even_for_the_same_key() {
+        use x509_parser::prelude::{FromDer, X509Certificate};
+
+        let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
+        let (csr_pem, _key) = build_csr("device-same-key").unwrap();
+        let first = ca.sign_csr(&csr_pem, Duration::days(365)).unwrap();
+        let second = ca.sign_csr(&csr_pem, Duration::days(365)).unwrap();
+
+        let first_der = parse_leaf(&first.cert_pem);
+        let second_der = parse_leaf(&second.cert_pem);
+        let (_, a) = X509Certificate::from_der(&first_der).unwrap();
+        let (_, b) = X509Certificate::from_der(&second_der).unwrap();
+        assert_ne!(a.raw_serial(), b.raw_serial());
+    }
+
+    /// The server profile carries `serverAuth` and exactly the configured
+    /// DNS names -- not SANs the CSR asked for, and never CA status.
+    #[test]
+    fn server_cert_carries_server_auth_and_only_the_configured_names() {
+        use x509_parser::extensions::{GeneralName, ParsedExtension};
+        use x509_parser::prelude::{FromDer, X509Certificate};
+
+        let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
+        let signed = ca
+            .sign_server_csr(
+                &malicious_csr("microtak-server"),
+                &["microtak-server".to_string()],
+                Duration::days(365),
+            )
+            .unwrap();
+        let der = parse_leaf(&signed.cert_pem);
+        let (_, cert) = X509Certificate::from_der(&der).unwrap();
+
+        assert_ne!(cert.basic_constraints().unwrap().map(|bc| bc.value.ca), Some(true));
+        let eku = cert.extended_key_usage().unwrap().unwrap();
+        assert!(eku.value.server_auth);
+        assert!(!eku.value.client_auth);
+
+        let names: Vec<String> = cert
+            .extensions()
+            .iter()
+            .filter_map(|ext| match ext.parsed_extension() {
+                ParsedExtension::SubjectAlternativeName(san) => Some(san),
+                _ => None,
+            })
+            .flat_map(|san| san.general_names.iter())
+            .map(|name| match name {
+                GeneralName::DNSName(dns) => dns.to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["microtak-server".to_string()]);
     }
 
     #[test]

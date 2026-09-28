@@ -25,6 +25,8 @@ pub struct Config {
     pub enrollment_port: u16,
     pub marti_api_port: u16,
     pub plain_tcp_port: u16,
+    /// Off by default -- see `AppConfig::plain_tcp_enabled`.
+    pub plain_tcp_enabled: bool,
     pub mtls_port: u16,
     pub ca_common_name: String,
     pub server_common_name: String,
@@ -39,18 +41,17 @@ pub struct Config {
     /// `["rsync", "-a", "{src}/", "user@host:/backups/microtak/"]`. Empty
     /// means local-only backup, no offsite shipping.
     pub backup_offsite_command: Vec<String>,
-    /// If set, only this cert Common Name may call the admin endpoints
-    /// (`/Marti/api/admin/*`) -- minting/listing/revoking enrollment
-    /// tokens. `None` (the default) means the admin endpoints reject every
-    /// caller; set this to your own enrolled device's CN to use them. See
-    /// `src/marti/admin.rs`.
+    /// The Common Name of the admin device -- the only identity allowed to
+    /// call the admin endpoints (`/Marti/api/admin/*`), and reserved at
+    /// enrollment: it can only be enrolled with the one-time bootstrap
+    /// token written to `data_dir/bootstrap-token` on first start. Defaults
+    /// to `"admin"`. See `src/marti/admin.rs` and `src/bootstrap.rs`.
     pub admin_common_name: Option<String>,
     /// `"auto"` (the default) or `"open"` -- see [`EnrollmentMode`]'s own
     /// doc comment. `"auto"` requires a valid enrollment token (`?token=...`)
-    /// on `/Marti/api/tls/signClient/v2` once, and only once, the
-    /// configured `admin_common_name` has actually enrolled -- secure by
-    /// default without an insecure-by-default flag, and without needing a
-    /// restart to flip it on.
+    /// or a password account on `/Marti/api/tls/signClient/v2` from the
+    /// very first start; `"open"` lets any *new* identity enroll without
+    /// one.
     pub enrollment_mode: EnrollmentMode,
 }
 
@@ -62,6 +63,7 @@ impl Default for Config {
             enrollment_port: defaults.enrollment_addr.port(),
             marti_api_port: defaults.marti_api_addr.port(),
             plain_tcp_port: defaults.plain_tcp_addr.port(),
+            plain_tcp_enabled: defaults.plain_tcp_enabled,
             mtls_port: defaults.mtls_addr.port(),
             ca_common_name: defaults.ca_common_name,
             server_common_name: defaults.server_common_name,
@@ -140,6 +142,7 @@ impl Config {
             enrollment_addr: SocketAddr::new(bind_ip, self.enrollment_port),
             marti_api_addr: SocketAddr::new(bind_ip, self.marti_api_port),
             plain_tcp_addr: SocketAddr::new(bind_ip, self.plain_tcp_port),
+            plain_tcp_enabled: self.plain_tcp_enabled,
             mtls_addr: SocketAddr::new(bind_ip, self.mtls_port),
             ca_common_name: self.ca_common_name.clone(),
             server_common_name: self.server_common_name.clone(),
@@ -320,14 +323,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Secure by default, without an insecure-by-default flag: with no
-    /// config at all, mode is `Auto` (not `Open`) -- see
-    /// `EnrollmentMode`'s own doc comment for why `Auto` alone, with no
-    /// admin enrolled yet, still behaves as open in practice.
+    /// Secure by default: with no config at all, mode is `Auto` (locked
+    /// from the first start), an admin CN is reserved for the bootstrap
+    /// token, and the unauthenticated plain-TCP relay is off.
     #[test]
     fn enrollment_mode_defaults_to_auto_not_open() {
         let app_config = Config::default().to_app_config().unwrap();
-        assert!(app_config.admin_common_name.is_none());
+        assert_eq!(app_config.admin_common_name.as_deref(), Some("admin"));
         assert_eq!(app_config.enrollment_mode, EnrollmentMode::Auto);
+        assert!(!app_config.plain_tcp_enabled, "plain TCP must be opt-in");
     }
 }
