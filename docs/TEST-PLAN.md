@@ -295,6 +295,21 @@ See `docs/ARCHITECTURE.md` "Device identity vs. authored content". Samples are s
 | TC-COT-10 | Relayed events arrive byte for byte as sent (unmodelled detail elements survive; XML declaration stripped) | [COMPAT] | `codec::decoded_events_carry_their_exact_original_xml`, `e2e_a_devices_chat_and_markers_are_relayed_intact` |
 | TC-CHAT-06 | `b-t-f` is chat; "All Chat Rooms" messages are broadcast; interleaved `<link>`s parse | [COMPAT] | `cot::*` |
 
+## 23. Groups ("channels") and mission scoping (2026-09-29)
+
+See `docs/ARCHITECTURE.md` "Groups". Mutation-tested: 8/8 caught (plus a deliberately harmless control edit that correctly survived).
+
+| ID | Case | Type | Test |
+|---|---|---|---|
+| TC-GROUP-01 | Delivery iff sender's active IN groups meet receiver's active OUT groups; OUT-only members receive but can't send; anonymous traffic stays anonymous | [COMPAT] | `hub::reaches_requires_a_shared_group`, `e2e_groups_decide_who_receives_what` |
+| TC-GROUP-02 | Identities without groups (and plain TCP) are `__ANON__` both ways | [COMPAT] | `groups::identities_without_memberships_are_anonymous_both_ways` |
+| TC-GROUP-03 | `groups/all` official shape; `useCache` returns IN+OUT with active flags, otherwise OUT only; admin sees all | [COMPAT] | `marti::groups::*` |
+| TC-GROUP-04 | `groups/active` and `activebits` switch channels live; at least one stays active; naming a foreign group doesn't join it | [COMPAT] | `marti::groups::*`, `groups::*`, e2e above |
+| TC-GROUP-05 | Admin-only group management; stable, never-reused bitpos; name validation; `__ANON__` protected; persistence | [DESIGN] | `admin::admin_manages_groups_and_members`, `admin::only_the_admin_can_manage_groups`, `groups::*` |
+| TC-GROUP-06 | Tokens/accounts carry `groups`/`groupsIn`/`groupsOut`, applied at enrollment; unknown groups refused at mint; a deleted group refuses enrollment unspent | [DESIGN] | `admin::tokens_and_accounts_carry_groups_*`, `enrollment::an_invite_tokens_groups_*`, `enrollment::an_accounts_groups_*`, `enrollment::a_token_whose_group_was_deleted_is_refused_unspent` |
+| TC-MARTI-13 | Missions visible only within their groups (404 outside), default creator's groups, non-admins can't use foreign groups, owner can move a mission between its groups, legacy missions are `__ANON__` | [COMPAT] | `marti::missions::missions_are_only_visible_within_their_groups`, `…creating_a_mission_in_foreign_or_unknown_groups_is_refused`, `…the_owner_can_move_a_mission_between_its_groups`, `missions::missions_from_before_groups_load_as_anonymous` |
+| TC-MARTI-14 | `MISSION_READONLY_SUBSCRIBER`: `defaultRole` read-only subscribers can read but not add content; official role names accepted | [COMPAT] | `marti::missions::a_readonly_default_role_lets_subscribers_read_but_not_write`, `missions::*` |
+
 ## Pending research
 
 - MeshCore throughput figures — needed to finalize TC-MESH-03/05's concrete bandwidth budget.

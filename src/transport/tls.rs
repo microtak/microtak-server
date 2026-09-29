@@ -36,6 +36,7 @@ use super::codec::{DecodedItem, StreamDecoder};
 use super::connections::{ClientEndpoint, ConnectedClients, Transport, UnregisterOnDrop};
 use super::hub::{Outbound, RelayHub};
 use super::identity::{self, Verdict};
+use crate::groups::{Direction, GroupStore};
 use crate::registry::DeviceRegistry;
 
 /// Build a server TLS config that requires a client certificate signed by
@@ -115,6 +116,7 @@ pub struct TlsRelay {
     hub: RelayHub,
     registry: Arc<DeviceRegistry>,
     clients: ConnectedClients,
+    groups: Arc<GroupStore>,
 }
 
 impl TlsRelay {
@@ -132,7 +134,16 @@ impl TlsRelay {
             hub,
             registry,
             clients,
+            groups: Arc::new(GroupStore::in_memory()),
         })
+    }
+
+    /// Use `groups` for routing (default: an empty store, where every
+    /// device is anonymous and reaches every other) -- see
+    /// `crate::groups`.
+    pub fn with_groups(mut self, groups: Arc<GroupStore>) -> Self {
+        self.groups = groups;
+        self
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -151,6 +162,7 @@ impl TlsRelay {
             let rx = self.hub.subscribe();
             let registry = Arc::clone(&self.registry);
             let clients = self.clients.clone();
+            let groups = Arc::clone(&self.groups);
             tokio::spawn(async move {
                 let mut tls_stream = match acceptor.accept(stream).await {
                     Ok(stream) => stream,
@@ -177,7 +189,7 @@ impl TlsRelay {
                 }
 
                 info!(%peer, cn, "mTLS client connected");
-                handle_client(tls_stream, peer, cn, tx, rx, registry, clients).await;
+                handle_client(tls_stream, peer, cn, tx, rx, registry, clients, groups).await;
             });
         }
     }
@@ -190,6 +202,9 @@ fn peer_common_name(stream: &TlsStream<TcpStream>) -> Option<String> {
     crate::pki::common_name_from_cert_der(leaf.as_ref())
 }
 
+// One connection's whole context; bundling it into a struct would only
+// move the same eight fields around.
+#[allow(clippy::too_many_arguments)]
 async fn handle_client(
     stream: TlsStream<TcpStream>,
     peer: SocketAddr,
@@ -198,6 +213,7 @@ async fn handle_client(
     mut rx: broadcast::Receiver<Outbound>,
     registry: Arc<DeviceRegistry>,
     clients: ConnectedClients,
+    groups: Arc<GroupStore>,
 ) {
     clients.register(ClientEndpoint {
         remote_addr: peer,
@@ -257,7 +273,12 @@ async fn handle_client(
                                         .addressed_uids()
                                         .map(|uids| uids.into_iter().map(String::from).collect::<Vec<_>>().into());
                                     // Relay the event as received (see `DecodedItem::Event`).
-                                    let _ = tx.send(Outbound { sender: peer, xml: xml.into(), dest_uids });
+                                    let _ = tx.send(Outbound {
+                                        sender: peer,
+                                        xml: xml.into(),
+                                        dest_uids,
+                                        groups: Arc::new(groups.active_groups(Some(&cn), Direction::In)),
+                                    });
                                 },
                                 DecodedItem::Skipped { error, .. } => {
                                     debug!(%peer, cn, %error, "skipped semantically-invalid CoT event");
@@ -282,6 +303,13 @@ async fn handle_client(
                         // (broadcast) message goes to everyone, as before.
                         let my_uid = registry.find(&cn).and_then(|d| d.uid);
                         if !msg.is_deliverable_to(my_uid.as_deref()) {
+                            continue;
+                        }
+                        // Groups (official reachability): only if the
+                        // sender's IN groups meet this device's active OUT
+                        // groups -- looked up per message, so membership
+                        // and channel changes apply without reconnecting.
+                        if !msg.reaches(&groups.active_groups(Some(&cn), Direction::Out)) {
                             continue;
                         }
                         if let Err(error) = writer.write_all(msg.xml.as_bytes()).await {

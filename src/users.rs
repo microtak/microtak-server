@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::eventlog::{EventLog, EventLogError};
+use crate::groups::GroupGrant;
 
 #[derive(Debug, Error)]
 pub enum UserError {
@@ -47,12 +48,16 @@ pub struct UserInfo {
     pub username: String,
     pub created_at_unix: i64,
     pub revoked: bool,
+    /// Groups a device enrolling with this account is added to.
+    #[serde(default)]
+    pub groups: Vec<GroupGrant>,
 }
 
 struct UserRecord {
     password_hash: String,
     created_at_unix: i64,
     revoked: bool,
+    groups: Vec<GroupGrant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +67,9 @@ enum UserEvent {
         username: String,
         password_hash: String,
         created_at_unix: i64,
+        /// Absent in logs written before groups existed.
+        #[serde(default)]
+        groups: Vec<GroupGrant>,
     },
     Revoked {
         username: String,
@@ -97,6 +105,18 @@ impl UserStore {
     /// already exists, revoked or not -- revoke then mint a differently-
     /// named account instead of trying to reuse a name.
     pub fn mint(&self, username: &str, password: &str, now_unix: i64) -> Result<(), UserError> {
+        self.mint_with_groups(username, password, Vec::new(), now_unix)
+    }
+
+    /// Like [`Self::mint`], with the groups a device enrolling with this
+    /// account is added to.
+    pub fn mint_with_groups(
+        &self,
+        username: &str,
+        password: &str,
+        groups: Vec<GroupGrant>,
+        now_unix: i64,
+    ) -> Result<(), UserError> {
         let mut users = self.users.write().unwrap();
         if users.contains_key(username) {
             return Err(UserError::AlreadyExists);
@@ -105,6 +125,7 @@ impl UserStore {
             username: username.to_string(),
             password_hash: hash_password(password),
             created_at_unix: now_unix,
+            groups,
         };
         if let Some(log) = &self.log {
             log.append(&event)?;
@@ -138,6 +159,7 @@ impl UserStore {
                 username: username.clone(),
                 created_at_unix: record.created_at_unix,
                 revoked: record.revoked,
+                groups: record.groups.clone(),
             })
             .collect();
         all.sort_by_key(|u| u.created_at_unix);
@@ -147,6 +169,16 @@ impl UserStore {
     /// Real credential check against the stored Argon2 hash. Returns
     /// `false` for a revoked user even with the correct password --
     /// revocation takes effect immediately, not just on future mints.
+    /// The groups a device enrolling with `username` is added to.
+    pub fn groups_of(&self, username: &str) -> Vec<GroupGrant> {
+        self.users
+            .read()
+            .unwrap()
+            .get(username)
+            .map(|record| record.groups.clone())
+            .unwrap_or_default()
+    }
+
     /// Whether an account (active or revoked) exists under `username`.
     pub fn exists(&self, username: &str) -> bool {
         self.users.read().unwrap().contains_key(username)
@@ -170,6 +202,7 @@ fn apply_event(users: &mut HashMap<String, UserRecord>, event: &UserEvent) {
             username,
             password_hash,
             created_at_unix,
+            groups,
         } => {
             users.insert(
                 username.clone(),
@@ -177,6 +210,7 @@ fn apply_event(users: &mut HashMap<String, UserRecord>, event: &UserEvent) {
                     password_hash: password_hash.clone(),
                     created_at_unix: *created_at_unix,
                     revoked: false,
+                    groups: groups.clone(),
                 },
             );
         }

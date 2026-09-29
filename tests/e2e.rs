@@ -1454,3 +1454,100 @@ async fn e2e_content_impersonating_another_device_is_dropped() {
         "nothing forged arrives late either"
     );
 }
+
+/// Groups end to end, with the official TAK Server's reachability rule: a
+/// message reaches a device only when the sender's active IN groups meet
+/// the device's active OUT groups. Devices without groups are anonymous
+/// (`__ANON__` both ways). A device switching a channel off
+/// (`PUT /Marti/api/groups/activebits`, what ATAK's channel selector calls)
+/// stops receiving from it at once, without reconnecting.
+#[tokio::test]
+async fn e2e_groups_decide_who_receives_what() {
+    use microtak_server::groups::Membership;
+
+    let app = App::bind(test_config()).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let mtls_addr = app.mtls_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    let groups = Arc::clone(&app.groups);
+    tokio::spawn(app.run());
+
+    groups.create("Red", None, 0).unwrap();
+    groups.create("Blue", None, 0).unwrap();
+    for (device, group, membership) in [
+        ("red-1", "Red", Membership::Both),
+        ("red-2", "Red", Membership::Both),
+        ("red-2", "Blue", Membership::Both),
+        ("blue-1", "Blue", Membership::Both),
+        ("listener", "Red", Membership::Out),
+    ] {
+        groups.set_member(group, device, Some(membership)).unwrap();
+    }
+
+    let base_url = format!("https://{enrollment_addr}");
+    let mut streams = std::collections::HashMap::new();
+    let mut red2_identity = None;
+    for device in ["red-1", "red-2", "blue-1", "anon-1", "listener"] {
+        let (cert, key) = enroll(&base_url, device).await;
+        if device == "red-2" {
+            red2_identity = Some((cert.clone(), key.serialize_pem()));
+        }
+        streams.insert(device, connect_mtls(mtls_addr, &ca_cert_pem, &cert, key).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    async fn say(streams: &mut std::collections::HashMap<&str, TlsStream<TcpStream>>, from: &str) {
+        let s = streams.get_mut(from).unwrap();
+        s.write_all(event_xml(&format!("UID-{from}")).as_bytes()).await.unwrap();
+    }
+    async fn heard(
+        streams: &mut std::collections::HashMap<&str, TlsStream<TcpStream>>,
+        who: &str,
+        from: &str,
+    ) -> bool {
+        receives_within(streams.get_mut(who).unwrap(), &format!("UID-{from}-CS"), Duration::from_millis(400)).await
+    }
+
+    say(&mut streams, "red-1").await;
+    assert!(heard(&mut streams, "red-2", "red-1").await, "same group");
+    assert!(heard(&mut streams, "listener", "red-1").await, "OUT member receives");
+    assert!(!heard(&mut streams, "blue-1", "red-1").await, "other group");
+    assert!(!heard(&mut streams, "anon-1", "red-1").await, "anonymous device");
+
+    say(&mut streams, "listener").await;
+    assert!(!heard(&mut streams, "red-1", "listener").await, "no IN membership: can't send into Red");
+
+    say(&mut streams, "anon-1").await;
+    assert!(!heard(&mut streams, "red-1", "anon-1").await, "anonymous traffic stays anonymous");
+
+    say(&mut streams, "blue-1").await;
+    assert!(heard(&mut streams, "red-2", "blue-1").await, "red-2 is in Blue too");
+
+    // red-2 switches Blue off through the client API (bitpos: Red=1, Blue=2).
+    let (red2_cert, red2_key_pem) = red2_identity.unwrap();
+    let red2_key = rcgen::KeyPair::from_pem(&red2_key_pem).unwrap();
+    let api = mtls_reqwest_client(&ca_cert_pem, &red2_cert, red2_key, marti_api_addr);
+    let listed: serde_json::Value = api
+        .get(format!("https://{SERVER_NAME}:{}/Marti/api/groups/all?useCache=true", marti_api_addr.port()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["data"].as_array().unwrap().len(), 4, "Red and Blue, IN and OUT: {listed}");
+    let status = api
+        .put(format!("https://{SERVER_NAME}:{}/Marti/api/groups/activebits", marti_api_addr.port()))
+        .json(&[1])
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+
+    say(&mut streams, "blue-1").await;
+    assert!(!heard(&mut streams, "red-2", "blue-1").await, "Blue switched off: nothing from it");
+    say(&mut streams, "red-1").await;
+    assert!(heard(&mut streams, "red-2", "red-1").await, "Red still on");
+}

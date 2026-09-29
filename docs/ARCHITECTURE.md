@@ -184,6 +184,17 @@ Typing a host, port and password into a phone under stress is the real friction 
 - **Chat type**: `is_chat` only recognised `t-x-c-t`; real GeoChat is `b-t-f`.
 - **"All Chat Rooms"**: ATAK's broadcast room carries `chatgrp uid0=<sender> uid1="All Chat Rooms"`, which the chatgrp-based routing treated as the recipient list -- so all-hands chat reached nobody. It's now broadcast (the official server routes chat on `<marti><dest>` only).
 
+## Groups ("channels") — 2026-09-29
+
+Mirrors the official TAK Server's model, read from `TAK-Product-Center/Server`:
+
+- **Memberships with direction** (`com.bbn.marti.remote.groups.Direction`): IN = may send into the group, OUT = receives from it. A message is tagged with the sender's active IN groups (`SubmissionService`: "Only put IN groups in the message") and delivered to a device that is in the OUT side of one of them (`CommonGroupDirectedReachability.isReachable`). MicroTAK looks the receiver's groups up per message, so membership and channel changes apply to connected devices immediately (the official server re-authenticates connected users to achieve the same).
+- **`__ANON__`**: identities without groups are in `__ANON__` both ways (official `doAnonAssignment`); plain-TCP connections too. A deployment that never creates a group is unchanged.
+- **Client API** (official shapes): `GET /Marti/api/groups/all` (with `useCache=true`: IN and OUT memberships with `active` flags; without: OUT only, the official cache-miss behaviour; the admin gets all groups), `PUT /Marti/api/groups/active` (Group objects) and `/activebits` (bitpos list). Group JSON: `name`, `direction`, `created` (`yyyy-MM-dd`), `type` (`SYSTEM`), `bitpos`, `active`, `description`. At least one group must stay active.
+- **Admin API**: `GET/POST /Marti/api/admin/groups`, `DELETE …/groups/:name`, `PUT/DELETE …/groups/:name/members/:identity` (`{"direction": "IN"|"OUT"|"BOTH"}`). Tokens and accounts carry `groups`/`groupsIn`/`groupsOut` (the official user file's `groupList`/`groupListIN`/`groupListOUT`), applied at enrollment; a token or account whose group was deleted since is refused (409) without spending the token -- a device silently falling back to `__ANON__` would see more than intended.
+- **Missions** (official mission group vector): visible only within their groups (default: the creator's groups; non-admins can only use their own groups; the admin sees and places anywhere); 404 outside, so existence doesn't leak. New role `ReadOnlySubscriber` (`MISSION_READONLY_SUBSCRIBER`: read only) and a per-mission `defaultRole` for subscribers; roles accept the official `MISSION_*` names. Missions from before groups load into `__ANON__`.
+- `src/groups.rs` (event-log backed like every store), `src/marti/groups.rs`, admin routes in `src/marti/admin.rs`; routing in `src/transport/{hub,tcp,tls}.rs`.
+
 ## Mission roles — decided 2026-09-23
 
 The other half of the permissions discussion above: missions previously had zero authorization beyond identity-claim matching (a caller could only ever act *as itself*, but any authenticated device could delete or rewrite *any* mission's metadata, not just its own). Added `MissionRole` (`Owner`, `Subscriber`) to `src/missions.rs`'s data model — `Owner` assigned automatically to a mission's creator, `Subscriber` assigned automatically on subscribing and removed on unsubscribing (an `Owner` who subscribes/unsubscribes from their own mission keeps `Owner` regardless — subscription state never demotes an owner).

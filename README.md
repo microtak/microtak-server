@@ -168,6 +168,28 @@ A [Helm chart](charts/microtak-server) is also available for Kubernetes
 deployments. See [docs/PACKAGING.md](docs/PACKAGING.md) for the plan to add
 apt, Nix, and AUR packages on top of these.
 
+### Groups ("channels")
+
+MicroTAK mirrors the official TAK Server's groups. An identity (a device's
+certificate name) is a member of groups with a direction: **IN** — it may
+send into the group — and/or **OUT** — it receives from the group. A
+message reaches a device only if the sender's active IN groups and the
+device's active OUT groups share a group. An identity without groups is in
+`__ANON__` both ways, so a server without groups behaves as before:
+everyone sees everyone.
+
+- The admin creates groups and sets memberships
+  (`/Marti/api/admin/groups…`, or `microtak-admin-cli group …`).
+- Invite tokens and password accounts can carry groups (`groups` for both
+  directions, `groupsIn`, `groupsOut`), applied when the device enrolls — so
+  a QR code can put a phone straight into its team.
+- Devices switch their groups on and off themselves (ATAK's channel
+  selector: `GET /Marti/api/groups/all`, `PUT /Marti/api/groups/active` /
+  `activebits`), effective immediately.
+- Missions are visible only within their groups (default: the creator's),
+  and support the official read-only subscriber role
+  (`defaultRole: "MISSION_READONLY_SUBSCRIBER"`).
+
 ### TLS certificates
 
 - **Server names**: the server certificate names `server_common_name`
