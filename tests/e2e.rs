@@ -63,10 +63,60 @@ fn test_config() -> AppConfig {
     }
 }
 
+/// A device's own position report (SA): `<contact>` with a callsign *and*
+/// an endpoint -- the kind of event that binds a device's uid.
 fn event_xml(uid: &str) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><event version="2.0" uid="{uid}" type="a-f-G-U-C" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/></event>"#
+        r#"<?xml version="1.0" encoding="UTF-8"?><event version="2.0" uid="{uid}" type="a-f-G-U-C" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><takv platform="ATAK-CIV" version="5.6.0" device="test" os="34"/><contact callsign="{uid}-CS" endpoint="*:-1:stcp"/><__group name="Cyan" role="Team Member"/></detail></event>"#
     )
+}
+
+/// A GeoChat message to "All Chat Rooms" from `sender_uid`, as ATAK sends it.
+fn chat_xml(sender_uid: &str, message_id: &str) -> String {
+    format!(
+        r#"<event version="2.0" uid="GeoChat.{sender_uid}.All Chat Rooms.{message_id}" type="b-t-f" how="h-g-i-g-o" time="2026-09-29T12:01:00Z" start="2026-09-29T12:01:00Z" stale="2026-09-30T12:01:00Z"><point lat="53.25" lon="10.4" hae="12.0" ce="9.9" le="9999999.0"/><detail><__chat parent="RootContactGroup" groupOwner="false" messageId="{message_id}" chatroom="All Chat Rooms" id="All Chat Rooms" senderCallsign="{sender_uid}-CS"><chatgrp uid0="{sender_uid}" uid1="All Chat Rooms" id="All Chat Rooms"/></__chat><link uid="{sender_uid}" type="a-f-G-U-C" relation="p-p"/><remarks source="BAO.F.ATAK.{sender_uid}" to="All Chat Rooms" time="2026-09-29T12:01:00Z">hello from {sender_uid}</remarks></detail></event>"#
+    )
+}
+
+/// A hostile-marker point dropped by `creator_uid`, as ATAK sends it --
+/// with detail elements MicroTAK doesn't model (icon, colour).
+fn marker_xml(marker_uid: &str, creator_uid: &str) -> String {
+    format!(
+        r#"<event version="2.0" uid="{marker_uid}" type="a-h-G" how="h-g-i-g-o" time="2026-09-29T12:02:00Z" start="2026-09-29T12:02:00Z" stale="2026-10-29T12:02:00Z"><point lat="53.26" lon="10.41" hae="0.0" ce="9999999.0" le="9999999.0"/><detail><status readiness="true"/><archive/><link uid="{creator_uid}" production_time="2026-09-29T12:02:00Z" type="a-f-G-U-C" parent_callsign="{creator_uid}-CS" relation="p-p"/><contact callsign="H.1"/><usericon iconsetpath="COT_MAPPING_2525B/a-h/a-h-G"/><color argb="-65536"/></detail></event>"#
+    )
+}
+
+/// Read from `stream` until `needle` shows up (or time out), returning
+/// everything read.
+async fn read_until_contains(stream: &mut TlsStream<TcpStream>, needle: &str) -> String {
+    let mut seen = String::new();
+    let mut buf = vec![0u8; 8192];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !seen.contains(needle) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match timeout(remaining, stream.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
+            _ => break,
+        }
+    }
+    seen
+}
+
+/// Whether anything containing `needle` arrives within a short window.
+async fn receives_within(stream: &mut TlsStream<TcpStream>, needle: &str, wait: Duration) -> bool {
+    let mut buf = vec![0u8; 8192];
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match timeout(remaining, stream.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                if String::from_utf8_lossy(&buf[..n]).contains(needle) {
+                    return true;
+                }
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// A client for the enrollment port the way a real device first meets it:
@@ -1322,4 +1372,85 @@ async fn e2e_qr_style_enrollment_with_a_bound_token_as_basic_auth_password() {
 
     let (again, _) = enroll_with("phone-1").await;
     assert_ne!(again.status(), 200, "the token is single-use");
+}
+
+/// TC-TLS-04 as revised: a device's own chat messages and markers -- each
+/// with its own uid -- are relayed, **byte for byte** (detail elements
+/// MicroTAK doesn't model, like `usericon`/`color`/`takv`, arrive intact),
+/// and the sender stays connected.
+#[tokio::test]
+async fn e2e_a_devices_chat_and_markers_are_relayed_intact() {
+    let app = App::bind(test_config()).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let mtls_addr = app.mtls_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    tokio::spawn(app.run());
+    let base_url = format!("https://{enrollment_addr}");
+    let (cert_a, key_a) = enroll(&base_url, "chatty").await;
+    let (cert_b, key_b) = enroll(&base_url, "listener").await;
+    let mut a = connect_mtls(mtls_addr, &ca_cert_pem, &cert_a, key_a).await.unwrap();
+    let mut b = connect_mtls(mtls_addr, &ca_cert_pem, &cert_b, key_b).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let sa = event_xml("ANDROID-chatty");
+    a.write_all(sa.as_bytes()).await.unwrap();
+    let got = read_until_contains(&mut b, "ANDROID-chatty-CS").await;
+    assert!(got.contains(r#"<takv platform="ATAK-CIV""#), "SA detail relayed intact: {got}");
+
+    let chat = chat_xml("ANDROID-chatty", "m1");
+    a.write_all(chat.as_bytes()).await.unwrap();
+    let got = read_until_contains(&mut b, "hello from ANDROID-chatty").await;
+    assert!(got.contains(&chat), "the chat message arrives exactly as sent: {got}");
+
+    let marker = marker_xml("marker-1", "ANDROID-chatty");
+    a.write_all(marker.as_bytes()).await.unwrap();
+    let got = read_until_contains(&mut b, "marker-1").await;
+    assert!(got.contains(&marker), "the marker arrives exactly as sent: {got}");
+
+    // Still connected: a later SA still flows.
+    a.write_all(sa.as_bytes()).await.unwrap();
+    assert!(read_until_contains(&mut b, "ANDROID-chatty-CS").await.contains("ANDROID-chatty-CS"));
+}
+
+/// Impersonation through authored content is dropped, not relayed: chat
+/// "from" another device, a marker "created by" another device, and a
+/// non-SA event reusing another device's uid. The impersonator stays
+/// connected (its own traffic still flows).
+#[tokio::test]
+async fn e2e_content_impersonating_another_device_is_dropped() {
+    let app = App::bind(test_config()).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let mtls_addr = app.mtls_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    tokio::spawn(app.run());
+    let base_url = format!("https://{enrollment_addr}");
+    let (cert_v, key_v) = enroll(&base_url, "victim").await;
+    let (cert_m, key_m) = enroll(&base_url, "mallory").await;
+    let (cert_w, key_w) = enroll(&base_url, "watcher").await;
+    let mut victim = connect_mtls(mtls_addr, &ca_cert_pem, &cert_v, key_v).await.unwrap();
+    let mut mallory = connect_mtls(mtls_addr, &ca_cert_pem, &cert_m, key_m).await.unwrap();
+    let mut watcher = connect_mtls(mtls_addr, &ca_cert_pem, &cert_w, key_w).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    victim.write_all(event_xml("ANDROID-victim").as_bytes()).await.unwrap();
+    read_until_contains(&mut watcher, "ANDROID-victim-CS").await;
+    mallory.write_all(event_xml("ANDROID-mallory").as_bytes()).await.unwrap();
+    read_until_contains(&mut watcher, "ANDROID-mallory-CS").await;
+
+    mallory.write_all(chat_xml("ANDROID-victim", "forged").as_bytes()).await.unwrap();
+    mallory.write_all(marker_xml("forged-marker", "ANDROID-victim").as_bytes()).await.unwrap();
+    let fake_position = r#"<event version="2.0" uid="ANDROID-victim" type="a-f-G-U-C" how="m-g" time="2026-09-29T12:00:00Z" start="2026-09-29T12:00:00Z" stale="2026-09-29T12:05:00Z"><point lat="0.0" lon="0.0" hae="0.0" ce="1.0" le="1.0"/><detail><contact callsign="FAKE"/></detail></event>"#;
+    mallory.write_all(fake_position.as_bytes()).await.unwrap();
+    // Then something legitimate, as a marker for "everything before this
+    // has been processed".
+    mallory.write_all(chat_xml("ANDROID-mallory", "legit").as_bytes()).await.unwrap();
+
+    let got = read_until_contains(&mut watcher, "hello from ANDROID-mallory").await;
+    assert!(got.contains("hello from ANDROID-mallory"), "mallory's own chat still flows: {got}");
+    assert!(!got.contains("forged"), "forged chat/marker must not be relayed: {got}");
+    assert!(!got.contains("FAKE"), "a fake position for the victim must not be relayed: {got}");
+    assert!(
+        !receives_within(&mut watcher, "forged", Duration::from_millis(300)).await,
+        "nothing forged arrives late either"
+    );
 }

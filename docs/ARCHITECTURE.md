@@ -170,6 +170,20 @@ Typing a host, port and password into a phone under stress is the real friction 
 - **Tokens bound to a device name** (TC-ENROLL-14): `POST /Marti/api/admin/enrollmentTokens` accepts `commonName`; such a token only enrolls that identity, and a refused attempt doesn't spend it. The admin CN can't be bound (bootstrap token only). Old token logs load unchanged (the field defaults to unbound).
 - Rate limiting counts wrong tokens presented this way like wrong passwords.
 
+## Device identity vs. authored content, and relaying CoT intact — 2026-09-29
+
+**Problem found**: the uid binding (TC-TLS-04) checked *every* CoT event on an mTLS connection against the device's single bound uid. Real clients send more than their own position on that connection -- GeoChat messages (type `b-t-f`, uid `GeoChat.<sender>.<room>.<id>`, confirmed from OmniTAK-iOS's source), markers, shapes and routes, each with its own uid -- so the first chat message or dropped marker disconnected the device (and if the *first* event was a chat, the device got bound to that chat uid).
+
+**Now** (`src/transport/identity.rs`), mirroring the official TAK Server:
+- A device's identity is its **own situational-awareness report**, recognised exactly as the official server does (`CotEventContainer.isSituationalAwarenessMessage`: uid + `<contact>` with `callsign` *and* `endpoint`; markers have a callsign but no endpoint, chat has neither). Only SA reports bind (first one, trust on first use) and must match; a mismatch disconnects -- the official server's optional `validateClientUid` does the same check against the enrolled uid.
+- Authored content is allowed, with one rule the official server doesn't have but the owner asked for (no impersonation): an event reusing another device's bound uid, or naming another device as its producer (`<link relation="p-p">` -- a chat sender, a marker's creator), is **dropped** (logged), not relayed. Dropping rather than disconnecting keeps one bad message from cutting a device off.
+- No per-marker ownership: like the official server, any device may update any marker; access control is by groups and missions.
+
+**Also fixed on the way**, because chat and markers couldn't have worked otherwise:
+- **Lossy relaying**: relays re-serialised the parsed model, which only covers the detail elements MicroTAK acts on -- `takv`, `__group` (team colour/role), the contact `endpoint`, `link`, marker icons/colours, shape vertices were silently stripped. Relays now forward each event's original XML (the decoder keeps it alongside the model).
+- **Chat type**: `is_chat` only recognised `t-x-c-t`; real GeoChat is `b-t-f`.
+- **"All Chat Rooms"**: ATAK's broadcast room carries `chatgrp uid0=<sender> uid1="All Chat Rooms"`, which the chatgrp-based routing treated as the recipient list -- so all-hands chat reached nobody. It's now broadcast (the official server routes chat on `<marti><dest>` only).
+
 ## Mission roles — decided 2026-09-23
 
 The other half of the permissions discussion above: missions previously had zero authorization beyond identity-claim matching (a caller could only ever act *as itself*, but any authenticated device could delete or rewrite *any* mission's metadata, not just its own). Added `MissionRole` (`Owner`, `Subscriber`) to `src/missions.rs`'s data model — `Owner` assigned automatically to a mission's creator, `Subscriber` assigned automatically on subscribing and removed on unsubscribing (an `Owner` who subscribes/unsubscribes from their own mission keeps `Owner` regardless — subscription state never demotes an owner).

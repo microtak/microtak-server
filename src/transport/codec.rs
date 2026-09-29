@@ -54,11 +54,13 @@ pub enum StreamError {
 /// One decoded unit of stream progress.
 #[derive(Debug)]
 pub enum DecodedItem {
-    /// A complete, valid CoT event. Boxed: `Event` grew large once
-    /// `cot::Detail` started modeling real sub-elements (contact/chat/marti),
-    /// and `DecodedItem` shouldn't pay that size on every variant just for
-    /// `Skipped`'s much smaller payload.
-    Event(Box<Event>),
+    /// A complete, valid CoT event: the parsed model (for routing and
+    /// identity checks) plus its exact original `<event>…</event>` text,
+    /// which is what gets relayed -- the model only covers the detail
+    /// elements MicroTAK acts on, so re-serialising it would strip
+    /// everything else (`takv`, `__group`, marker icons/colours, shapes, …).
+    /// Boxed: `Event` is large, and `Skipped` is much smaller.
+    Event { event: Box<Event>, xml: String },
     /// A complete, well-bounded `<event>...</event>` document that failed to
     /// parse as a valid CoT event (missing required attribute, malformed
     /// inner XML, etc). Per TC-STREAM-05, this does NOT terminate the
@@ -69,7 +71,7 @@ pub enum DecodedItem {
 impl fmt::Display for DecodedItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DecodedItem::Event(e) => write!(f, "Event(uid={})", e.uid),
+            DecodedItem::Event { event, .. } => write!(f, "Event(uid={})", event.uid),
             DecodedItem::Skipped { error, .. } => write!(f, "Skipped({error})"),
         }
     }
@@ -132,7 +134,10 @@ impl StreamDecoder {
                             self.buf.drain(..end + EVENT_CLOSE.len()).collect();
                         let xml = String::from_utf8_lossy(&xml_bytes).into_owned();
                         match Event::from_xml(&xml) {
-                            Ok(event) => items.push(DecodedItem::Event(Box::new(event))),
+                            Ok(event) => items.push(DecodedItem::Event {
+                                event: Box::new(event),
+                                xml,
+                            }),
                             Err(error) => items.push(DecodedItem::Skipped { xml, error }),
                         }
                         continue;
@@ -217,6 +222,21 @@ fn trim_leading_whitespace(buf: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
+    /// The relayed text is the event exactly as received -- detail elements
+    /// the model doesn't cover survive, and the XML declaration is gone.
+    #[test]
+    fn decoded_events_carry_their_exact_original_xml() {
+        let original = crate::cot::tests::ATAK_MARKER;
+        let mut decoder = StreamDecoder::new();
+        let items = decoder
+            .feed(format!("<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n{original}").as_bytes())
+            .unwrap();
+        match &items[..] {
+            [DecodedItem::Event { xml, .. }] => assert_eq!(xml, original),
+            other => panic!("expected one event, got {other:?}"),
+        }
+    }
+
     fn event_xml(uid: &str) -> String {
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?><event version="2.0" uid="{uid}" type="a-f-G-U-C" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/></event>"#
@@ -229,8 +249,8 @@ mod tests {
         let stream = format!("{}{}", event_xml("A"), event_xml("B"));
         let items = decoder.feed(stream.as_bytes()).expect("no stream error");
         assert_eq!(items.len(), 2);
-        assert!(matches!(&items[0], DecodedItem::Event(e) if e.uid == "A"));
-        assert!(matches!(&items[1], DecodedItem::Event(e) if e.uid == "B"));
+        assert!(matches!(&items[0], DecodedItem::Event { event: e, .. } if e.uid == "A"));
+        assert!(matches!(&items[1], DecodedItem::Event { event: e, .. } if e.uid == "B"));
     }
 
     #[test]
@@ -242,7 +262,7 @@ mod tests {
         assert!(decoder.feed(first.as_bytes()).unwrap().is_empty());
         let items = decoder.feed(second.as_bytes()).unwrap();
         assert_eq!(items.len(), 1);
-        assert!(matches!(&items[0], DecodedItem::Event(e) if e.uid == "SPLIT-DECL"));
+        assert!(matches!(&items[0], DecodedItem::Event { event: e, .. } if e.uid == "SPLIT-DECL"));
     }
 
     #[test]
@@ -255,7 +275,7 @@ mod tests {
         assert!(decoder.feed(first.as_bytes()).unwrap().is_empty());
         let items = decoder.feed(second.as_bytes()).unwrap();
         assert_eq!(items.len(), 1);
-        assert!(matches!(&items[0], DecodedItem::Event(e) if e.uid == "SPLIT-EVENT"));
+        assert!(matches!(&items[0], DecodedItem::Event { event: e, .. } if e.uid == "SPLIT-EVENT"));
     }
 
     #[test]
@@ -267,7 +287,7 @@ mod tests {
             items.extend(decoder.feed(&[*byte]).unwrap());
         }
         assert_eq!(items.len(), 1);
-        assert!(matches!(&items[0], DecodedItem::Event(e) if e.uid == "BYTE-BY-BYTE"));
+        assert!(matches!(&items[0], DecodedItem::Event { event: e, .. } if e.uid == "BYTE-BY-BYTE"));
     }
 
     #[test]
@@ -288,7 +308,7 @@ mod tests {
         let items = decoder.feed(stream.as_bytes()).unwrap();
         assert_eq!(items.len(), 2);
         assert!(matches!(&items[0], DecodedItem::Skipped { .. }));
-        assert!(matches!(&items[1], DecodedItem::Event(e) if e.uid == "AFTER-BAD"));
+        assert!(matches!(&items[1], DecodedItem::Event { event: e, .. } if e.uid == "AFTER-BAD"));
     }
 
     #[test]

@@ -158,6 +158,16 @@ impl DeviceRegistry {
         Ok(devices.get(common_name).unwrap().clone())
     }
 
+    /// The common name of the device that has bound `uid`, if any.
+    pub fn owner_of_uid(&self, uid: &str) -> Option<String> {
+        self.devices
+            .read()
+            .unwrap()
+            .values()
+            .find(|d| d.uid.as_deref() == Some(uid))
+            .map(|d| d.common_name.clone())
+    }
+
     pub fn find(&self, common_name: &str) -> Option<DeviceRecord> {
         self.devices.read().unwrap().get(common_name).cloned()
     }

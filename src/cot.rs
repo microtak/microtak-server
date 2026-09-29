@@ -7,15 +7,13 @@
 //! `wiki/MicroTAK-Test-Plan.md` for the full CoT test-case catalog this
 //! module is meant to satisfy.
 //!
-//! **Known simplification (TC-COT-10)**: `detail` models only the
-//! sub-elements listed above; anything else (`status`, `precisionlocation`,
-//! `__geofence`, `track`, ...) is silently dropped on round-trip. This is a
-//! deliberate scope cut, not an oversight — modeling "everything, known or
-//! not" doesn't mix well with `quick_xml`'s typed serde model (which is
-//! also why the *previous* version of this module's `detail` field, a bare
-//! `$text`-only passthrough, never actually worked for anything with child
-//! elements — it silently captured nothing for e.g. `<contact>`, a real bug
-//! fixed by this structured model, not a hypothetical one).
+//! **What `detail` models**: only the sub-elements MicroTAK acts on
+//! (contact callsign/endpoint, GeoChat, individual addressing, remarks,
+//! `link`); anything else is ignored by the model. That no longer loses
+//! data on the wire: relays forward each event's **original XML** (see
+//! `transport::codec::DecodedItem::Event`) -- before 2026-09-29 they
+//! re-serialised this model, silently stripping `takv`, `__group`, marker
+//! icons/colours, shapes and every other unmodelled element (TC-COT-10).
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -78,12 +76,31 @@ pub struct Detail {
     pub marti: Option<Marti>,
     #[serde(rename = "remarks", skip_serializing_if = "Option::is_none", default)]
     pub remarks: Option<Remarks>,
+    /// `<link>` elements -- e.g. a marker's or chat message's creator
+    /// (`relation="p-p"`). Real clients interleave these with other detail
+    /// children, hence quick-xml's `overlapped-lists` feature.
+    #[serde(rename = "link", skip_serializing_if = "Vec::is_empty", default)]
+    pub links: Vec<Link>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Link {
+    #[serde(rename = "@uid", skip_serializing_if = "Option::is_none", default)]
+    pub uid: Option<String>,
+    #[serde(rename = "@relation", skip_serializing_if = "Option::is_none", default)]
+    pub relation: Option<String>,
+    #[serde(rename = "@type", skip_serializing_if = "Option::is_none", default)]
+    pub link_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Contact {
     #[serde(rename = "@callsign", skip_serializing_if = "Option::is_none", default)]
     pub callsign: Option<String>,
+    /// Where the device can be reached (`host:port:proto`); only a device's
+    /// own position report carries one -- see [`Event::is_situational_awareness`].
+    #[serde(rename = "@endpoint", skip_serializing_if = "Option::is_none", default)]
+    pub endpoint: Option<String>,
 }
 
 /// GeoChat detail (`t-x-c-t` events) — see `docs/TEST-PLAN.md` §7 for the
@@ -166,6 +183,12 @@ pub struct Remarks {
     pub text: String,
 }
 
+/// ATAK's broadcast chat room. Its `chatgrp` names the sender and the room
+/// itself (`uid0=<sender> uid1="All Chat Rooms"`), not recipients -- a
+/// message to it goes to everyone (the official TAK Server routes chat on
+/// `<marti><dest>` only and leaves room filtering to clients).
+pub const ALL_CHAT_ROOMS: &str = "All Chat Rooms";
+
 impl Event {
     /// Parse a single `<event>...</event>` XML document.
     ///
@@ -181,10 +204,37 @@ impl Event {
         Ok(quick_xml::se::to_string(self)?)
     }
 
-    /// True for GeoChat events (`t-x-c-t` family types) — see
-    /// `wiki/ATAK-Communications-Architecture.md` §4.
+    /// True for GeoChat events. Real ATAK/OmniTAK GeoChat is type `b-t-f`
+    /// (uid `GeoChat.<sender>.<room>.<id>`, confirmed from OmniTAK-iOS's
+    /// source); the `t-x-c-t` family is kept for compatibility with what
+    /// this module originally assumed.
     pub fn is_chat(&self) -> bool {
-        self.cot_type.starts_with("t-x-c-t")
+        self.cot_type == "b-t-f" || self.cot_type.starts_with("b-t-f-") || self.cot_type.starts_with("t-x-c-t")
+    }
+
+    /// Whether this is a device's own situational-awareness report (its
+    /// position/identity "PLI"), as opposed to content it authored
+    /// (markers, chat, shapes): a `uid` plus a `<contact>` carrying both a
+    /// `callsign` and an `endpoint`. The same definition the official TAK
+    /// Server uses (`CotEventContainer.isSituationalAwarenessMessage`) --
+    /// markers carry a callsign but no endpoint; chat carries neither.
+    pub fn is_situational_awareness(&self) -> bool {
+        let Some(contact) = self.detail.as_ref().and_then(|d| d.contact.as_ref()) else {
+            return false;
+        };
+        let non_empty = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
+        !self.uid.trim().is_empty() && non_empty(&contact.callsign) && non_empty(&contact.endpoint)
+    }
+
+    /// The uids this event names as its producer: `<link relation="p-p">`
+    /// -- a marker's creator, a GeoChat message's sender.
+    pub fn producer_uids(&self) -> Vec<&str> {
+        self.detail
+            .iter()
+            .flat_map(|detail| detail.links.iter())
+            .filter(|link| link.relation.as_deref() == Some("p-p"))
+            .filter_map(|link| link.uid.as_deref())
+            .collect()
     }
 
     /// The set of `uid`s this event is individually/team addressed to, if
@@ -200,6 +250,7 @@ impl Event {
             uids.extend(marti.dest.iter().filter_map(|d| d.uid.as_deref()));
         }
         if let Some(chat) = &detail.chat
+            && chat.chatroom != ALL_CHAT_ROOMS
             && let Some(chatgrp) = &chat.chatgrp
         {
             uids.extend(chatgrp.member_uids());
@@ -214,9 +265,10 @@ impl Event {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
+    pub(crate) const MINIMAL_EVENT_PUB: &str = MINIMAL_EVENT;
     const MINIMAL_EVENT: &str = r#"<event version="2.0" uid="TEST-UID-1" type="a-f-G-U-C" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.2500" lon="10.4000" hae="10.0" ce="5.0" le="3.0"/></event>"#;
 
     #[test]
@@ -276,6 +328,31 @@ mod tests {
         assert!(event.is_chat());
     }
 
+    /// Real client traffic, shaped like ATAK/OmniTAK sends it.
+    pub(crate) const ATAK_SA: &str = r#"<event version="2.0" uid="ANDROID-abc123" type="a-f-G-U-C" how="h-e" time="2026-09-29T12:00:00Z" start="2026-09-29T12:00:00Z" stale="2026-09-29T12:06:00Z"><point lat="53.25" lon="10.4" hae="12.0" ce="9.9" le="9999999.0"/><detail><takv os="34" version="5.6.0" device="GOOGLE PIXEL 10" platform="ATAK-CIV"/><contact endpoint="*:-1:stcp" callsign="ALPHA-1"/><uid Droid="ALPHA-1"/><precisionlocation altsrc="GPS" geopointsrc="GPS"/><__group role="Team Member" name="Cyan"/><status battery="88"/><track course="0.0" speed="0.0"/></detail></event>"#;
+    pub(crate) const ATAK_CHAT: &str = r#"<event version="2.0" uid="GeoChat.ANDROID-abc123.All Chat Rooms.5f1e2d3c" type="b-t-f" how="h-g-i-g-o" time="2026-09-29T12:01:00Z" start="2026-09-29T12:01:00Z" stale="2026-09-30T12:01:00Z"><point lat="53.25" lon="10.4" hae="12.0" ce="9.9" le="9999999.0"/><detail><__chat parent="RootContactGroup" groupOwner="false" messageId="5f1e2d3c" chatroom="All Chat Rooms" id="All Chat Rooms" senderCallsign="ALPHA-1"><chatgrp uid0="ANDROID-abc123" uid1="All Chat Rooms" id="All Chat Rooms"/></__chat><link uid="ANDROID-abc123" type="a-f-G-U-C" relation="p-p"/><remarks source="BAO.F.ATAK.ANDROID-abc123" to="All Chat Rooms" time="2026-09-29T12:01:00Z">hello team</remarks></detail></event>"#;
+    pub(crate) const ATAK_MARKER: &str = r#"<event version="2.0" uid="0d1c2b3a-4f5e-6d7c-8b9a-0f1e2d3c4b5a" type="a-h-G" how="h-g-i-g-o" time="2026-09-29T12:02:00Z" start="2026-09-29T12:02:00Z" stale="2026-10-29T12:02:00Z"><point lat="53.26" lon="10.41" hae="0.0" ce="9999999.0" le="9999999.0"/><detail><status readiness="true"/><archive/><link uid="ANDROID-abc123" production_time="2026-09-29T12:02:00Z" type="a-f-G-U-C" parent_callsign="ALPHA-1" relation="p-p"/><contact callsign="H.1"/><remarks/><archive/><usericon iconsetpath="COT_MAPPING_2525B/a-h/a-h-G"/><link uid="ANDROID-other" relation="c-c"/><color argb="-1"/></detail></event>"#;
+
+    #[test]
+    fn only_a_devices_own_report_counts_as_situational_awareness() {
+        assert!(Event::from_xml(ATAK_SA).unwrap().is_situational_awareness());
+        let chat = Event::from_xml(ATAK_CHAT).unwrap();
+        assert!(!chat.is_situational_awareness());
+        assert!(chat.is_chat(), "real GeoChat is b-t-f");
+        let marker = Event::from_xml(ATAK_MARKER).unwrap();
+        assert!(!marker.is_situational_awareness(), "a marker has a callsign but no endpoint");
+        assert!(!Event::from_xml(MINIMAL_EVENT).unwrap().is_situational_awareness());
+    }
+
+    /// `<link>` elements interleaved with other detail children still parse
+    /// (quick-xml `overlapped-lists`), and only `p-p` links name a producer.
+    #[test]
+    fn producer_uids_come_from_p_p_links_even_when_interleaved() {
+        assert_eq!(Event::from_xml(ATAK_MARKER).unwrap().producer_uids(), vec!["ANDROID-abc123"]);
+        assert_eq!(Event::from_xml(ATAK_CHAT).unwrap().producer_uids(), vec!["ANDROID-abc123"]);
+        assert!(Event::from_xml(ATAK_SA).unwrap().producer_uids().is_empty());
+    }
+
     #[test]
     fn addressed_uids_unions_marti_dest_and_chatgrp() {
         let xml = r#"<event version="2.0" uid="u" type="t-x-c-t" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><marti><dest uid="UID-DIRECT"/></marti><__chat id="c" chatroom="Team"><chatgrp id="c" uid0="UID-TEAM-A"/></__chat></detail></event>"#;
@@ -283,6 +360,13 @@ mod tests {
         let mut uids = event.addressed_uids().unwrap();
         uids.sort();
         assert_eq!(uids, vec!["UID-DIRECT", "UID-TEAM-A"]);
+    }
+
+    /// A real ATAK "All Chat Rooms" message is a broadcast: its chatgrp
+    /// lists the sender and the room name, not recipients.
+    #[test]
+    fn all_chat_rooms_messages_are_broadcast() {
+        assert!(Event::from_xml(ATAK_CHAT).unwrap().addressed_uids().is_none());
     }
 
     #[test]

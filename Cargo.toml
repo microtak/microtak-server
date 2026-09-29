@@ -21,7 +21,7 @@ getrandom = "0.2"
 hyper-util = { version = "0.1.20", default-features = false, features = ["server", "server-auto", "tokio", "service"] }
 if-addrs = "0.15"
 pem = "4"
-quick-xml = { version = "0.36", features = ["serialize"] }
+quick-xml = { version = "0.36", features = ["serialize", "overlapped-lists"] }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
