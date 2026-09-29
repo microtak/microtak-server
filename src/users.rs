@@ -147,6 +147,11 @@ impl UserStore {
     /// Real credential check against the stored Argon2 hash. Returns
     /// `false` for a revoked user even with the correct password --
     /// revocation takes effect immediately, not just on future mints.
+    /// Whether an account (active or revoked) exists under `username`.
+    pub fn exists(&self, username: &str) -> bool {
+        self.users.read().unwrap().contains_key(username)
+    }
+
     pub fn authenticate(&self, username: &str, password: &str) -> bool {
         let users = self.users.read().unwrap();
         let Some(record) = users.get(username) else {

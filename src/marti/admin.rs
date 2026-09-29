@@ -99,6 +99,10 @@ struct MintTokenRequest {
     expires_in_secs: Option<i64>,
     #[serde(default)]
     note: Option<String>,
+    /// Bind the token to the one identity it may enroll -- what a QR code
+    /// for a specific device carries (`username=` in the `tak://` link).
+    #[serde(rename = "commonName", default)]
+    common_name: Option<String>,
 }
 
 async fn mint_token(
@@ -115,6 +119,7 @@ async fn mint_token(
         MintTokenRequest {
             expires_in_secs: None,
             note: None,
+            common_name: None,
         }
     } else {
         match serde_json::from_slice(&body) {
@@ -125,10 +130,18 @@ async fn mint_token(
         }
     };
 
-    match state
-        .tokens
-        .mint(request.expires_in_secs, request.note, now_unix())
-    {
+    if request.common_name.is_some() && request.common_name == state.admin_common_name {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "the admin identity is enrolled with the bootstrap token only".to_string(),
+        );
+    }
+    match state.tokens.mint_bound(
+        request.expires_in_secs,
+        request.note,
+        request.common_name,
+        now_unix(),
+    ) {
         Ok(token) => (StatusCode::CREATED, Json(serde_json::json!({ "token": token }))).into_response(),
         Err(error) => token_error_response(error),
     }
@@ -466,6 +479,40 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(!users.authenticate("jz-admin", "hunter2"));
+    }
+
+    /// A token can be minted for one specific device identity (what a QR
+    /// code for that device carries); the binding shows up in the list.
+    #[tokio::test]
+    async fn mint_token_can_bind_it_to_a_common_name() {
+        let (mut app, tokens, _users, _registry) = app_with_admin(Some("jz-admin"));
+        let response = request_as(
+            &mut app,
+            "jz-admin",
+            "POST",
+            "/Marti/api/admin/enrollmentTokens",
+            r#"{"commonName": "device-7"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(tokens.list()[0].common_name.as_deref(), Some("device-7"));
+    }
+
+    /// No token may be minted for the admin identity -- that's the
+    /// bootstrap token's job alone.
+    #[tokio::test]
+    async fn mint_token_refuses_to_bind_to_the_admin_identity() {
+        let (mut app, tokens, _users, _registry) = app_with_admin(Some("jz-admin"));
+        let response = request_as(
+            &mut app,
+            "jz-admin",
+            "POST",
+            "/Marti/api/admin/enrollmentTokens",
+            r#"{"commonName": "jz-admin"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(tokens.list().is_empty());
     }
 
     #[tokio::test]

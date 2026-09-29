@@ -55,7 +55,11 @@ microtak-admin-cli enroll --enrollment-url https://<server>:8446 --ca ca.pem \
 ```
 
 The token works once, only for the admin identity, and the file is deleted
-after use. From then on, new devices need a one-time invite token (or a
+after use. Invite tokens can be bound to one device name (`commonName` when
+minting; the CLI's `token mint --cn`), which is what an enrollment QR code
+for that device carries: TAK clients scanning
+`tak://com.atakmap.app/enroll?host=…&username=…&token=…` enroll over HTTPS
+presenting the token as the password for that username. From then on, new devices need a one-time invite token (or a
 password account, below) minted by the admin through the mTLS-authenticated
 admin API, or more conveniently with the companion CLI,
 [microtak-admin-cli](https://github.com/microtak/microtak-admin-cli), which

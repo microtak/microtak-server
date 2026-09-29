@@ -1245,3 +1245,81 @@ async fn e2e_enrollment_port_is_https_only_with_a_cert_from_the_servers_ca() {
         .await;
     assert!(wrong_name.is_err());
 }
+
+/// The QR enrollment flow end to end, as OmniTAK/ATAK drive it from a
+/// `tak://com.atakmap.app/enroll?host=…&username=…&token=…` code: the admin
+/// mints a token bound to the device's name, the device enrolls over HTTPS
+/// with `Basic(username, token)`, its cert works over mTLS, and the token
+/// can't be used again.
+#[tokio::test]
+async fn e2e_qr_style_enrollment_with_a_bound_token_as_basic_auth_password() {
+    let config = AppConfig {
+        admin_common_name: Some("admin".to_string()),
+        enrollment_mode: AppConfig::default().enrollment_mode,
+        ..test_config()
+    };
+    let app = App::bind(config).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let mtls_addr = app.mtls_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    let bootstrap = std::fs::read_to_string(app.bootstrap_token_path().unwrap()).unwrap();
+    tokio::spawn(app.run());
+    let enrollment_url = format!("https://{enrollment_addr}/Marti/api/tls/signClient/v2");
+
+    let (csr, admin_key) = pki::build_csr("admin").unwrap();
+    let body: serde_json::Value = enrollment_client()
+        .post(format!("{enrollment_url}?token={}", bootstrap.trim()))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(csr)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let admin_cert = wrap_pem(body["signedCert"].as_str().unwrap());
+    let admin = mtls_reqwest_client(&ca_cert_pem, &admin_cert, admin_key, marti_api_addr);
+
+    let minted: serde_json::Value = admin
+        .post(format!(
+            "https://{SERVER_NAME}:{}/Marti/api/admin/enrollmentTokens",
+            marti_api_addr.port()
+        ))
+        .json(&serde_json::json!({ "commonName": "phone-1" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = minted["token"].as_str().unwrap().to_string();
+
+    let enroll_with = |cn: &'static str| {
+        let token = token.clone();
+        let enrollment_url = enrollment_url.clone();
+        async move {
+            let (csr, key) = pki::build_csr(cn).unwrap();
+            let response = enrollment_client()
+                .post(&enrollment_url)
+                .basic_auth(cn, Some(&token))
+                .header(CONTENT_TYPE, "text/plain")
+                .body(csr)
+                .send()
+                .await
+                .unwrap();
+            (response, key)
+        }
+    };
+
+    let (response, device_key) = enroll_with("phone-1").await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let device_cert = wrap_pem(body["signedCert"].as_str().unwrap());
+    connect_mtls(mtls_addr, &ca_cert_pem, &device_cert, device_key)
+        .await
+        .expect("the QR-enrolled device's cert works over mTLS");
+
+    let (again, _) = enroll_with("phone-1").await;
+    assert_ne!(again.status(), 200, "the token is single-use");
+}

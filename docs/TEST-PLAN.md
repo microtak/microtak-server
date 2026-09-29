@@ -273,6 +273,16 @@ See `docs/ARCHITECTURE.md` "TLS-only enrollment". Trust-decision checks mutation
 
 Not tested automatically: the interface watcher's periodic re-issue loop (`servernames::watch_interfaces`) -- its pieces (address collection, issuing, swapping) are each tested, the timer loop itself isn't.
 
+## 21. QR enrollment (2026-09-28)
+
+See `docs/ARCHITECTURE.md` "QR enrollment". Mutation-tested: 5/5 checks caught.
+
+| ID | Case | Type | Test |
+|---|---|---|---|
+| TC-ENROLL-14 | A token bound to a CN at mint time enrolls only that CN; a refused attempt doesn't spend it; the binding persists and old logs load; the admin CN can't be bound | [DESIGN] | `enrollment_tokens::tc_enroll_14_*`, `enrollment_tokens::a_tokens_binding_survives_a_reload_and_old_logs_still_load`, `enrollment::tc_enroll_14_*`, `admin::mint_token_can_bind_it_to_a_common_name`, `admin::mint_token_refuses_to_bind_to_the_admin_identity` |
+| TC-ENROLL-16 | `Basic(username, token)` for a non-account username enrolls via the token path; CN must equal the username (bound or not); an existing account's secret is only checked as its password; wrong tokens count toward the rate limit | [COMPAT] | `enrollment::tc_enroll_16_*`, `basic_token_login_requires_the_csr_cn_to_match_even_for_an_unbound_token`, `an_invite_token_is_not_accepted_as_an_existing_accounts_password`, `wrong_tokens_via_basic_auth_are_rate_limited` |
+| TC-E2E-QR | Mint a bound token via the admin API → enroll over HTTPS with `Basic(name, token)` → mTLS works → token single-use | [COMPAT] | `e2e_qr_style_enrollment_with_a_bound_token_as_basic_auth_password` |
+
 ## Pending research
 
 - MeshCore throughput figures — needed to finalize TC-MESH-03/05's concrete bandwidth budget.
