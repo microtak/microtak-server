@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.7.0](https://github.com/microtak/microtak-server/compare/v0.6.0...v0.7.0) (2026-09-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* missions are no longer visible to every authenticated caller -- only to identities sharing one of the mission's groups (every existing mission and identity is in __ANON__, so nothing changes until groups are configured). The Subscriber role name serialises unchanged; a new "readonly_subscriber" role value may appear in mission JSON.
+* events without a <contact callsign endpoint> no longer bind a device's uid; events impersonating another device are dropped instead of disconnecting the sender.
+* the enrollment port no longer accepts plain HTTP; clients and tools must use https:// (microtak-admin-cli enroll needs --ca for a server using its own CA). A reverse proxy in front of 8446 must connect to it over HTTPS.
+* enrollment_mode = "auto" no longer accepts enrollments before the admin has enrolled; the admin device must enroll with the bootstrap token from data_dir/bootstrap-token. admin_common_name now defaults to "admin". An existing identity can no longer be re-enrolled with an invite token or in Open mode. The plain-TCP relay (8087) must be enabled explicitly with plain_tcp_enabled = true.
+
+### Features
+
+* groups (channels) and group-scoped missions, mirroring the official TAK Server ([#11](https://github.com/microtak/microtak-server/issues/11)) ([15e437c](https://github.com/microtak/microtak-server/commit/15e437ca8e753349a6284102d80a1d70d9bacc2d))
+* serve enrollment over TLS only, with certificates that fit grid-down ([#8](https://github.com/microtak/microtak-server/issues/8)) ([2730821](https://github.com/microtak/microtak-server/commit/2730821efcee44c4e8e63a841cc90be517e4facd))
+* standard QR enrollment -- tokens as Basic password, bound to a device name ([#9](https://github.com/microtak/microtak-server/issues/9)) ([64471ec](https://github.com/microtak/microtak-server/commit/64471ecd39f8a4831730956934fd60f97e826f23))
+
+
+### Bug Fixes
+
+* bind only a device's own SA; relay chat and markers intact ([#10](https://github.com/microtak/microtak-server/issues/10)) ([5ee00f5](https://github.com/microtak/microtak-server/commit/5ee00f53b81985dcfa5258a56f5a98f3dd4f5895))
+* close enrollment identity takeover and CA-issuance holes ([#6](https://github.com/microtak/microtak-server/issues/6)) ([f653a10](https://github.com/microtak/microtak-server/commit/f653a10d271839eb736c0621057c9401dff955f2))
+
 ## [0.6.0](https://github.com/microtak/microtak-server/compare/v0.5.0...v0.6.0) (2026-09-24)
 
 
