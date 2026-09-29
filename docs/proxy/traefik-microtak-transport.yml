@@ -1,0 +1,19 @@
+# Traefik dynamic configuration (file provider) for docker-compose.proxy.yml:
+# how Traefik connects to MicroTAK's HTTPS-only enrollment port.
+#
+# - serverName: a name in MicroTAK's server certificate -- the default
+#   `server_common_name` ("microtak-server") is always included.
+# - rootCAs: MicroTAK's own CA certificate, copied from its data directory
+#   (`ca-cert.pem` -- the public certificate only, never `ca-key.pem`) to a
+#   path Traefik can read.
+#
+# With these, the hop from Traefik to MicroTAK is encrypted *and* MicroTAK's
+# identity is verified. Don't replace this with `insecureSkipVerify: true`
+# unless the proxy can't verify a private CA (see docs/proxy/README.md for
+# what that trades away).
+http:
+  serversTransports:
+    microtak:
+      serverName: microtak-server
+      rootCAs:
+        - /etc/traefik/microtak-ca.pem

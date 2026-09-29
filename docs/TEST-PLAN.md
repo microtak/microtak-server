@@ -258,6 +258,21 @@ From a security review during the first live deployment -- see `docs/ARCHITECTUR
 
 **Mutation-testing exception**: replacing the handler's atomic `enroll_new` with the overwriting `enroll` on the token/open path is *not* caught at the HTTP level -- the early "already enrolled?" check answers every request the tests can produce, and the remaining race window (two requests passing that check together) is too narrow for `concurrent_enrollments_of_one_new_identity_yield_exactly_one_cert` to hit reliably. The atomicity itself is covered by the registry-level test above.
 
+## 20. TLS-only enrollment (2026-09-28)
+
+See `docs/ARCHITECTURE.md` "TLS-only enrollment". Trust-decision checks mutation-tested like §19.
+
+| ID | Case | Type | Test |
+|---|---|---|---|
+| TC-TLS-08 | The enrollment listener speaks TLS only: plain HTTP gets no HTTP response; enrollment and OAuth work over HTTPS without a client cert | [HARDEN] | `e2e_enrollment_port_is_https_only_with_a_cert_from_the_servers_ca`; every enrollment unit/e2e test now runs over HTTPS |
+| TC-TLS-09 | The server cert chains to MicroTAK's CA and names `server_common_name` + configured `server_names` (IPs as IP SANs); a verifying client succeeds under those names and fails under others | [DESIGN] | `pki::server_cert_names_become_ip_or_dns_sans`, the e2e test above |
+| TC-TLS-09b | Interface addresses (loopback/link-local/multicast/unspecified excluded) are named too, de-duplicated, common name first | [DESIGN] | `servernames::*` |
+| TC-TLS-10 | Cert files: a valid pair loads; a mismatched/empty/missing pair is refused; a replaced pair is picked up without a restart and a broken replacement leaves the previous cert serving | [DESIGN] | `certsource::*` |
+| TC-CFG-TLS | `enrollment_cert_file`/`enrollment_key_file` are all-or-nothing; `server_names` and `trusted_proxies` parse; malformed proxies are a startup error | [DESIGN] | `config::enrollment_cert_files_and_server_names_parse`, `clientip::rejects_malformed_entries` |
+| TC-LIMIT-08b | Behind a trusted proxy, rate limiting is per forwarded client; `X-Forwarded-For` from an untrusted peer is ignored; client-supplied left-most entries and trusted hops are skipped | [HARDEN] | `enrollment::behind_a_trusted_proxy_rate_limiting_is_per_forwarded_client`, `clientip::*` |
+
+Not tested automatically: the interface watcher's periodic re-issue loop (`servernames::watch_interfaces`) -- its pieces (address collection, issuing, swapping) are each tested, the timer loop itself isn't.
+
 ## Pending research
 
 - MeshCore throughput figures — needed to finalize TC-MESH-03/05's concrete bandwidth budget.

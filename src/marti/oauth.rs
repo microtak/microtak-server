@@ -2,10 +2,9 @@
 //! contract CloudTAK's own login flow speaks (confirmed from
 //! `dfpc-coe/node-tak`'s real client source, `lib/api/oauth.ts`).
 //!
-//! Served on the same plain-HTTP listener as enrollment (`config.server.
-//! webtak` in `node-tak`'s own terms) -- login itself has no cert to
-//! authenticate the transport with, same reasoning as enrollment being
-//! plain HTTP.
+//! Served on the same HTTPS-only listener as enrollment (`config.server.
+//! webtak` in `node-tak`'s own terms) -- login itself has no client cert to
+//! authenticate the transport with, same reasoning as enrollment.
 //!
 //! This is purely an identity check that hands back a JWT carrying the
 //! username as its `sub` claim -- nothing here issues a certificate.

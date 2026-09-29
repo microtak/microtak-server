@@ -10,6 +10,8 @@
 pub mod app;
 pub mod backup;
 pub mod bootstrap;
+pub mod certsource;
+pub mod clientip;
 pub mod config;
 pub mod content_store;
 pub mod cot;
@@ -19,6 +21,7 @@ pub mod marti;
 pub mod missions;
 pub mod pki;
 pub mod ratelimit;
+pub mod servernames;
 pub mod registry;
 pub mod transport;
 pub mod users;
@@ -66,7 +69,8 @@ pub mod users;
 // - `marti::enrollment` + `marti::missions` + `marti::client_endpoints` +
 //   `marti::content`: the HTTP `/Marti/api/*` contract on top of
 //   `pki`/`registry`/`missions`/`content_store`. No groups/device profiles
-//   yet. Enrollment is deliberately plain HTTP (unauthenticated by design);
+//   yet. Enrollment is HTTPS without client-cert auth (a device has no
+//   cert yet), via `marti::TlsHttpServer`;
 //   everything else is mTLS-authenticated via `marti::MtlsHttpServer`
 //   (TC-MARTI-10), and `missions` additionally cross-checks a claimed
 //   creatorUid/actorUid/uid against the connecting cert's identity -- see

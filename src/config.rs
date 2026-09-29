@@ -17,6 +17,7 @@ use time::Duration;
 use thiserror::Error;
 
 use crate::app::{AppConfig, BackupConfig, EnrollmentMode};
+use crate::certsource::CertSource;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -30,6 +31,19 @@ pub struct Config {
     pub mtls_port: u16,
     pub ca_common_name: String,
     pub server_common_name: String,
+    /// Extra IPs/DNS names for the server certificate -- see
+    /// `AppConfig::server_names`.
+    pub server_names: Vec<String>,
+    /// See `AppConfig::server_names_from_interfaces` -- on by default.
+    pub server_names_from_interfaces: bool,
+    /// Reverse proxies whose `X-Forwarded-For` is trusted, as IPs or CIDR
+    /// networks -- see `AppConfig::trusted_proxies`.
+    pub trusted_proxies: Vec<String>,
+    /// Optional PEM certificate chain + key for the enrollment listener
+    /// (e.g. Let's Encrypt). Set both or neither; unset means a
+    /// certificate from MicroTAK's own CA. See `src/certsource.rs`.
+    pub enrollment_cert_file: Option<PathBuf>,
+    pub enrollment_key_file: Option<PathBuf>,
     pub cert_validity_days: i64,
     pub data_dir: PathBuf,
     /// Whether periodic backup of `data_dir` runs at all -- disabled by
@@ -67,6 +81,11 @@ impl Default for Config {
             mtls_port: defaults.mtls_addr.port(),
             ca_common_name: defaults.ca_common_name,
             server_common_name: defaults.server_common_name,
+            server_names: defaults.server_names,
+            server_names_from_interfaces: defaults.server_names_from_interfaces,
+            trusted_proxies: Vec::new(),
+            enrollment_cert_file: None,
+            enrollment_key_file: None,
             cert_validity_days: defaults.cert_validity.whole_days(),
             data_dir: defaults.data_dir,
             backup_enabled: defaults.backup.enabled,
@@ -97,6 +116,10 @@ pub enum ConfigError {
     InvalidBindHost(String),
     #[error("invalid cert_validity_days {0}: must be positive")]
     InvalidCertValidity(i64),
+    #[error("enrollment_cert_file and enrollment_key_file must be set together")]
+    IncompleteEnrollmentCert,
+    #[error(transparent)]
+    InvalidTrustedProxy(#[from] crate::clientip::InvalidTrustedProxy),
 }
 
 impl Config {
@@ -137,6 +160,14 @@ impl Config {
         if self.cert_validity_days <= 0 {
             return Err(ConfigError::InvalidCertValidity(self.cert_validity_days));
         }
+        let enrollment_cert = match (&self.enrollment_cert_file, &self.enrollment_key_file) {
+            (None, None) => CertSource::Internal,
+            (Some(cert_file), Some(key_file)) => CertSource::Files {
+                cert_file: cert_file.clone(),
+                key_file: key_file.clone(),
+            },
+            _ => return Err(ConfigError::IncompleteEnrollmentCert),
+        };
 
         Ok(AppConfig {
             enrollment_addr: SocketAddr::new(bind_ip, self.enrollment_port),
@@ -146,6 +177,10 @@ impl Config {
             mtls_addr: SocketAddr::new(bind_ip, self.mtls_port),
             ca_common_name: self.ca_common_name.clone(),
             server_common_name: self.server_common_name.clone(),
+            server_names: self.server_names.clone(),
+            server_names_from_interfaces: self.server_names_from_interfaces,
+            trusted_proxies: crate::clientip::TrustedProxies::parse(&self.trusted_proxies)?,
+            enrollment_cert,
             cert_validity: Duration::days(self.cert_validity_days),
             data_dir: self.data_dir.clone(),
             backup: BackupConfig {
@@ -321,6 +356,36 @@ mod tests {
         assert_eq!(app_config.enrollment_mode, EnrollmentMode::Open);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Enrollment cert files are all-or-nothing, and parse into
+    /// `CertSource::Files`; `server_names` passes through.
+    #[test]
+    fn enrollment_cert_files_and_server_names_parse() {
+        let both: Config = toml::from_str(
+            "server_names = [\"192.168.1.10\", \"tak.example.com\"]\nenrollment_cert_file = \"/c.pem\"\nenrollment_key_file = \"/k.pem\"\n",
+        )
+        .unwrap();
+        let app_config = both.to_app_config().unwrap();
+        assert_eq!(app_config.server_names, vec!["192.168.1.10", "tak.example.com"]);
+        assert_eq!(
+            app_config.enrollment_cert,
+            CertSource::Files {
+                cert_file: PathBuf::from("/c.pem"),
+                key_file: PathBuf::from("/k.pem"),
+            }
+        );
+
+        let only_cert: Config = toml::from_str("enrollment_cert_file = \"/c.pem\"\n").unwrap();
+        assert!(matches!(
+            only_cert.to_app_config(),
+            Err(ConfigError::IncompleteEnrollmentCert)
+        ));
+
+        assert_eq!(
+            Config::default().to_app_config().unwrap().enrollment_cert,
+            CertSource::Internal
+        );
     }
 
     /// Secure by default: with no config at all, mode is `Auto` (locked

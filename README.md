@@ -46,10 +46,11 @@ Name configured as `admin_common_name`, `"admin"` by default — with that
 token:
 
 ```sh
-# Docker: read the token from the data volume
+# Docker: read the token and the CA certificate from the data volume
 docker compose exec microtak-server cat data/bootstrap-token
+docker compose exec microtak-server cat data/ca-cert.pem > ca.pem
 
-microtak-admin-cli enroll --enrollment-url http://<server>:8446 \
+microtak-admin-cli enroll --enrollment-url https://<server>:8446 --ca ca.pem \
   --cn admin --token <bootstrap token>
 ```
 
@@ -121,10 +122,17 @@ This builds the image and exposes the four ports MicroTAK listens on:
 
 | Port | Purpose |
 |------|---------|
-| 8446 | Certificate enrollment (plain HTTP) |
+| 8446 | Certificate enrollment + OAuth login (**HTTPS only**, no client cert) |
 | 8443 | Marti API — missions, admin (mTLS) |
 | 8087 | CoT relay (plain TCP) — **off by default**, see below |
 | 8089 | CoT relay (mTLS) |
+
+MicroTAK serves **no plain HTTP**. The enrollment port presents a
+certificate from MicroTAK's own CA by default — nothing to set up, works
+fully offline, and TAK clients trust it on first contact (OmniTAK does by
+default) and then pin the CA they receive during enrollment, so nothing has
+to be installed on devices. See "TLS certificates" below for naming the
+server's addresses, using Let's Encrypt, and running behind a reverse proxy.
 
 The plain-TCP relay on 8087 is unauthenticated and unencrypted — anyone who
 can reach it can read every position and inject events — so it only runs
@@ -155,6 +163,29 @@ redundant (or actively broken) second TLS layer in front.
 A [Helm chart](charts/microtak-server) is also available for Kubernetes
 deployments. See [docs/PACKAGING.md](docs/PACKAGING.md) for the plan to add
 apt, Nix, and AUR packages on top of these.
+
+### TLS certificates
+
+- **Server names**: the server certificate names `server_common_name`
+  (`microtak-server`) plus every non-loopback address of the host's network
+  interfaces — LAN, Wi-Fi, Starlink, … — re-checked every minute and
+  re-issued live when addresses come and go (`server_names_from_interfaces`,
+  on by default). Add DNS names, or the host's addresses when MicroTAK runs
+  in a container on a bridge network (where it only sees its own container
+  address), with `server_names = ["192.168.1.10", "tak.example.com"]`.
+  Enrolled devices pin MicroTAK's CA, not a particular server certificate,
+  so re-issuing never affects them.
+- **Let's Encrypt** (server has internet and a DNS name): point
+  `enrollment_cert_file` / `enrollment_key_file` at the PEM files your ACME
+  client (certbot, lego, …) maintains. They're re-read automatically after
+  renewal; a broken renewal is logged and the previous certificate keeps
+  serving. MicroTAK has no built-in ACME client on purpose — the ACME
+  challenges need plain HTTP on port 80 or port 443. The mTLS ports (8443,
+  8089) always use MicroTAK's own CA.
+- **Reverse proxy** (Traefik, Pangolin): see
+  [docs/proxy/README.md](docs/proxy/README.md) — the proxy re-encrypts to
+  MicroTAK (never plain HTTP to the backend), the mTLS ports stay TCP
+  passthrough, and `trusted_proxies` keeps rate limiting per real client.
 
 ### Building from source
 
