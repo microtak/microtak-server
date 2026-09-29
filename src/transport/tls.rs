@@ -35,6 +35,7 @@ use tracing::{debug, info, warn};
 use super::codec::{DecodedItem, StreamDecoder};
 use super::connections::{ClientEndpoint, ConnectedClients, Transport, UnregisterOnDrop};
 use super::hub::{Outbound, RelayHub};
+use super::identity::{self, Verdict};
 use crate::registry::DeviceRegistry;
 
 /// Build a server TLS config that requires a client certificate signed by
@@ -235,27 +236,28 @@ async fn handle_client(
                     Ok(items) => {
                         for item in items {
                             match item {
-                                DecodedItem::Event(event) => {
-                                    // TC-TLS-04: this connection's authenticated
-                                    // identity (cn) must own the uid it's
-                                    // asserting.
-                                    if let Err(error) = registry.bind_uid(&cn, &event.uid) {
-                                        warn!(%peer, cn, uid = %event.uid, %error, "uid binding violation, disconnecting client");
-                                        let _ = writer.shutdown().await;
-                                        return;
+                                DecodedItem::Event { event, xml } => {
+                                    // TC-TLS-04: see `super::identity`.
+                                    match identity::authorize(&registry, &cn, &event) {
+                                        Verdict::Relay => {}
+                                        Verdict::Drop(reason) => {
+                                            warn!(%peer, cn, uid = %event.uid, reason, "dropping event that impersonates another device");
+                                            continue;
+                                        }
+                                        Verdict::Disconnect(reason) => {
+                                            warn!(%peer, cn, uid = %event.uid, reason, "uid binding violation, disconnecting client");
+                                            let _ = writer.shutdown().await;
+                                            return;
+                                        }
                                     }
-                                    clients.set_uid(peer, event.uid.clone());
+                                    if event.is_situational_awareness() {
+                                        clients.set_uid(peer, event.uid.clone());
+                                    }
                                     let dest_uids = event
                                         .addressed_uids()
                                         .map(|uids| uids.into_iter().map(String::from).collect::<Vec<_>>().into());
-                                    match event.to_xml() {
-                                        Ok(xml) => {
-                                            let _ = tx.send(Outbound { sender: peer, xml: xml.into(), dest_uids });
-                                        }
-                                        Err(error) => {
-                                            warn!(%peer, cn, %error, "failed to re-serialize decoded event, dropping");
-                                        }
-                                    }
+                                    // Relay the event as received (see `DecodedItem::Event`).
+                                    let _ = tx.send(Outbound { sender: peer, xml: xml.into(), dest_uids });
                                 },
                                 DecodedItem::Skipped { error, .. } => {
                                     debug!(%peer, cn, %error, "skipped semantically-invalid CoT event");
@@ -308,9 +310,11 @@ mod tests {
     use tokio_rustls::rustls::pki_types::ServerName;
     use tokio_rustls::TlsConnector;
 
+    /// A device's own position report (SA) -- `<contact>` with callsign and
+    /// endpoint, the kind of event that binds a uid (see `super::identity`).
     fn event_xml(uid: &str) -> String {
         format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?><event version="2.0" uid="{uid}" type="a-f-G-U-C" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/></event>"#
+            r#"<?xml version="1.0" encoding="UTF-8"?><event version="2.0" uid="{uid}" type="a-f-G-U-C" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><contact callsign="{uid}-CS" endpoint="*:-1:stcp"/></detail></event>"#
         )
     }
 

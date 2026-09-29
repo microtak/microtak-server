@@ -106,21 +106,15 @@ async fn handle_client(
                     Ok(items) => {
                         for item in items {
                             match item {
-                                DecodedItem::Event(event) => {
+                                DecodedItem::Event { event, xml } => {
                                     let dest_uids = event
                                         .addressed_uids()
                                         .map(|uids| uids.into_iter().map(String::from).collect::<Vec<_>>().into());
-                                    match event.to_xml() {
-                                        Ok(xml) => {
-                                            // A closed broadcast channel (no
-                                            // subscribers at all) is not an
-                                            // error for the sender.
-                                            let _ = tx.send(Outbound { sender: peer, xml: xml.into(), dest_uids });
-                                        }
-                                        Err(error) => {
-                                            warn!(%peer, %error, "failed to re-serialize decoded event, dropping");
-                                        }
-                                    }
+                                    // Relay the event as received (see
+                                    // `DecodedItem::Event`). A closed
+                                    // broadcast channel (no subscribers at
+                                    // all) is not an error for the sender.
+                                    let _ = tx.send(Outbound { sender: peer, xml: xml.into(), dest_uids });
                                 }
                                 DecodedItem::Skipped { error, .. } => {
                                     debug!(%peer, %error, "skipped semantically-invalid CoT event");

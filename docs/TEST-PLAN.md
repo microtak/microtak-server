@@ -283,6 +283,18 @@ See `docs/ARCHITECTURE.md` "QR enrollment". Mutation-tested: 5/5 checks caught.
 | TC-ENROLL-16 | `Basic(username, token)` for a non-account username enrolls via the token path; CN must equal the username (bound or not); an existing account's secret is only checked as its password; wrong tokens count toward the rate limit | [COMPAT] | `enrollment::tc_enroll_16_*`, `basic_token_login_requires_the_csr_cn_to_match_even_for_an_unbound_token`, `an_invite_token_is_not_accepted_as_an_existing_accounts_password`, `wrong_tokens_via_basic_auth_are_rate_limited` |
 | TC-E2E-QR | Mint a bound token via the admin API → enroll over HTTPS with `Basic(name, token)` → mTLS works → token single-use | [COMPAT] | `e2e_qr_style_enrollment_with_a_bound_token_as_basic_auth_password` |
 
+## 22. Device identity vs. authored content; intact relaying (2026-09-29)
+
+See `docs/ARCHITECTURE.md` "Device identity vs. authored content". Samples are shaped like real ATAK/OmniTAK traffic (SA with `takv`/`contact endpoint`/`__group`, `b-t-f` GeoChat, a marker with interleaved `link`s, `usericon`, `color`). Mutation-tested: 7/7 caught.
+
+| ID | Case | Type | Test |
+|---|---|---|---|
+| TC-TLS-04 (revised) | Only a device's own SA report (uid + contact callsign + endpoint) binds/must match its uid; content sent before the first SA binds nothing | [COMPAT] | `identity::*`, `cot::only_a_devices_own_report_counts_as_situational_awareness`, `e2e_rejects_cross_device_uid_spoofing_after_http_enrollment` |
+| TC-TLS-04b | A device's own chat and markers are relayed and it stays connected | [COMPAT] | `identity::a_devices_own_chat_and_markers_are_relayed`, `e2e_a_devices_chat_and_markers_are_relayed_intact` |
+| TC-TLS-04c | Content reusing another device's bound uid, or naming it as producer (`link relation="p-p"`), is dropped; the sender stays connected | [HARDEN] | `identity::content_*`, `e2e_content_impersonating_another_device_is_dropped` |
+| TC-COT-10 | Relayed events arrive byte for byte as sent (unmodelled detail elements survive; XML declaration stripped) | [COMPAT] | `codec::decoded_events_carry_their_exact_original_xml`, `e2e_a_devices_chat_and_markers_are_relayed_intact` |
+| TC-CHAT-06 | `b-t-f` is chat; "All Chat Rooms" messages are broadcast; interleaved `<link>`s parse | [COMPAT] | `cot::*` |
+
 ## Pending research
 
 - MeshCore throughput figures — needed to finalize TC-MESH-03/05's concrete bandwidth budget.
