@@ -21,11 +21,14 @@ use tracing::{debug, info, warn};
 use super::codec::{DecodedItem, StreamDecoder};
 use super::connections::{ClientEndpoint, ConnectedClients, Transport, UnregisterOnDrop};
 use super::hub::{Outbound, RelayHub};
+use crate::groups::{Direction, GroupStore};
+use std::sync::Arc;
 
 pub struct TcpRelay {
     listener: TcpListener,
     hub: RelayHub,
     clients: ConnectedClients,
+    groups: Arc<GroupStore>,
 }
 
 impl TcpRelay {
@@ -39,7 +42,16 @@ impl TcpRelay {
             listener,
             hub,
             clients,
+            groups: Arc::new(GroupStore::in_memory()),
         })
+    }
+
+    /// Use `groups` for routing (default: an empty store, where every
+    /// connection is anonymous and reaches every other). Plain-TCP clients
+    /// are unauthenticated, so they are always `__ANON__` both ways.
+    pub fn with_groups(mut self, groups: Arc<GroupStore>) -> Self {
+        self.groups = groups;
+        self
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -54,8 +66,9 @@ impl TcpRelay {
             let tx = self.hub.sender();
             let rx = self.hub.subscribe();
             let clients = self.clients.clone();
+            let groups = Arc::clone(&self.groups);
             tokio::spawn(async move {
-                handle_client(stream, peer, tx, rx, clients).await;
+                handle_client(stream, peer, tx, rx, clients, groups).await;
             });
         }
     }
@@ -67,6 +80,7 @@ async fn handle_client(
     tx: broadcast::Sender<Outbound>,
     mut rx: broadcast::Receiver<Outbound>,
     clients: ConnectedClients,
+    groups: Arc<GroupStore>,
 ) {
     info!(%peer, "client connected");
     clients.register(ClientEndpoint {
@@ -114,7 +128,12 @@ async fn handle_client(
                                     // `DecodedItem::Event`). A closed
                                     // broadcast channel (no subscribers at
                                     // all) is not an error for the sender.
-                                    let _ = tx.send(Outbound { sender: peer, xml: xml.into(), dest_uids });
+                                    let _ = tx.send(Outbound {
+                                        sender: peer,
+                                        xml: xml.into(),
+                                        dest_uids,
+                                        groups: Arc::new(groups.active_groups(None, Direction::In)),
+                                    });
                                 }
                                 DecodedItem::Skipped { error, .. } => {
                                     debug!(%peer, %error, "skipped semantically-invalid CoT event");
@@ -139,7 +158,9 @@ async fn handle_client(
                         // which does) -- a directed GeoChat message is
                         // never deliverable here, only broadcasts. A
                         // documented scope cut, not a silent one.
-                        if !msg.is_deliverable_to(None) {
+                        if !msg.is_deliverable_to(None)
+                            || !msg.reaches(&groups.active_groups(None, Direction::Out))
+                        {
                             continue;
                         }
                         if let Err(error) = writer.write_all(msg.xml.as_bytes()).await {

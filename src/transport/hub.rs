@@ -42,9 +42,20 @@ pub struct Outbound {
     /// only broadcasts. Documented, not silent: see `transport::tcp`'s
     /// delivery loop.
     pub dest_uids: Option<Arc<[String]>>,
+    /// The sender's active IN groups at send time (`crate::groups`): the
+    /// message reaches a connection only if one of these is among that
+    /// connection's active OUT groups -- the official TAK Server's
+    /// reachability rule. Anonymous senders carry `__ANON__`.
+    pub groups: Arc<std::collections::BTreeSet<String>>,
 }
 
 impl Outbound {
+    /// Whether a connection receiving from `receiver_out_groups` (its
+    /// active OUT groups) may see this message at all.
+    pub fn reaches(&self, receiver_out_groups: &std::collections::BTreeSet<String>) -> bool {
+        self.groups.iter().any(|group| receiver_out_groups.contains(group))
+    }
+
     /// Whether a connection whose own identity is `my_uid` should receive
     /// this message: always true for a broadcast, otherwise only if
     /// `my_uid` is one of the addressed recipients.
@@ -96,7 +107,19 @@ mod tests {
             xml: "<event/>".into(),
             dest_uids: dest_uids
                 .map(|uids| uids.into_iter().map(String::from).collect::<Vec<_>>().into()),
+            groups: Arc::new(std::collections::BTreeSet::from(["__ANON__".to_string()])),
         }
+    }
+
+    /// Official reachability: delivered iff the sender's IN groups and the
+    /// receiver's OUT groups share a group.
+    #[test]
+    fn reaches_requires_a_shared_group() {
+        let mut msg = outbound(None);
+        msg.groups = Arc::new(["Red".to_string(), "Blue".to_string()].into());
+        assert!(msg.reaches(&["Blue".to_string()].into()));
+        assert!(!msg.reaches(&["Green".to_string()].into()));
+        assert!(!msg.reaches(&std::collections::BTreeSet::new()));
     }
 
     #[test]

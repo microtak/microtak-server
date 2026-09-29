@@ -34,6 +34,7 @@ use super::PeerIdentity;
 use crate::enrollment_tokens::{EnrollmentTokenError, EnrollmentTokenStore};
 use crate::pki;
 use crate::registry::DeviceRegistry;
+use crate::groups::{grants_from, GroupError, GroupGrant, GroupStore, Membership};
 use crate::users::UserStore;
 
 #[derive(Clone)]
@@ -41,6 +42,7 @@ pub struct AdminState {
     pub tokens: Arc<EnrollmentTokenStore>,
     pub users: Arc<UserStore>,
     pub registry: Arc<DeviceRegistry>,
+    pub groups: Arc<GroupStore>,
     /// `None` means the admin API is unreachable by anyone.
     pub admin_common_name: Option<String>,
 }
@@ -59,6 +61,12 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/Marti/api/admin/users/:username",
             axum::routing::delete(revoke_user),
+        )
+        .route("/Marti/api/admin/groups", post(create_group).get(list_groups))
+        .route("/Marti/api/admin/groups/:name", axum::routing::delete(delete_group))
+        .route(
+            "/Marti/api/admin/groups/:name/members/:identity",
+            axum::routing::put(set_group_member).delete(remove_group_member),
         )
         .route("/Marti/api/certadmin/cert/:hash", axum::routing::get(get_cert_by_hash))
         .with_state(state)
@@ -103,6 +111,31 @@ struct MintTokenRequest {
     /// for a specific device carries (`username=` in the `tak://` link).
     #[serde(rename = "commonName", default)]
     common_name: Option<String>,
+    #[serde(flatten)]
+    groups: GroupLists,
+}
+
+/// Groups to add an enrolling device to, as the official server's user
+/// file lists them: `groups` (IN+OUT), `groupsIn`, `groupsOut`.
+#[derive(Deserialize, Default)]
+struct GroupLists {
+    #[serde(default)]
+    groups: Vec<String>,
+    #[serde(rename = "groupsIn", default)]
+    groups_in: Vec<String>,
+    #[serde(rename = "groupsOut", default)]
+    groups_out: Vec<String>,
+}
+
+impl GroupLists {
+    /// The grants, or the name of the first group that doesn't exist.
+    fn resolve(&self, store: &GroupStore) -> Result<Vec<GroupGrant>, String> {
+        let grants = grants_from(&self.groups, &self.groups_in, &self.groups_out);
+        match store.first_missing(&grants) {
+            Some(missing) => Err(missing),
+            None => Ok(grants),
+        }
+    }
 }
 
 async fn mint_token(
@@ -120,6 +153,7 @@ async fn mint_token(
             expires_in_secs: None,
             note: None,
             common_name: None,
+            groups: GroupLists::default(),
         }
     } else {
         match serde_json::from_slice(&body) {
@@ -136,10 +170,17 @@ async fn mint_token(
             "the admin identity is enrolled with the bootstrap token only".to_string(),
         );
     }
-    match state.tokens.mint_bound(
+    let grants = match request.groups.resolve(&state.groups) {
+        Ok(grants) => grants,
+        Err(missing) => {
+            return error_response(StatusCode::BAD_REQUEST, format!("unknown group '{missing}'"))
+        }
+    };
+    match state.tokens.mint_with(
         request.expires_in_secs,
         request.note,
         request.common_name,
+        grants,
         now_unix(),
     ) {
         Ok(token) => (StatusCode::CREATED, Json(serde_json::json!({ "token": token }))).into_response(),
@@ -190,6 +231,8 @@ struct MintUserRequest {
     /// same ergonomics as an enrollment token's own single-reveal value.
     #[serde(default)]
     password: Option<String>,
+    #[serde(flatten)]
+    groups: GroupLists,
 }
 
 async fn mint_user(
@@ -215,8 +258,14 @@ async fn mint_user(
             "the admin identity can't have a password account".to_string(),
         );
     }
+    let grants = match request.groups.resolve(&state.groups) {
+        Ok(grants) => grants,
+        Err(missing) => {
+            return error_response(StatusCode::BAD_REQUEST, format!("unknown group '{missing}'"))
+        }
+    };
     let password = request.password.unwrap_or_else(random_password);
-    match state.users.mint(&request.username, &password, now_unix()) {
+    match state.users.mint_with_groups(&request.username, &password, grants, now_unix()) {
         Ok(()) => (
             StatusCode::CREATED,
             Json(serde_json::json!({ "username": request.username, "password": password })),
@@ -291,6 +340,100 @@ async fn get_cert_by_hash(
     .into_response()
 }
 
+// ---------------------------------------------------------------------
+// Groups ("channels") -- see `crate::groups`
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateGroupRequest {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SetMemberRequest {
+    /// `IN`, `OUT` or `BOTH`.
+    direction: Membership,
+}
+
+fn group_error_response(error: GroupError) -> Response {
+    let status = match &error {
+        GroupError::NotFound(_) => StatusCode::NOT_FOUND,
+        GroupError::AlreadyExists(_) => StatusCode::CONFLICT,
+        GroupError::InvalidName(_) | GroupError::NoActiveGroup => StatusCode::BAD_REQUEST,
+        GroupError::EventLog(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    error_response(status, error.to_string())
+}
+
+async fn list_groups(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    Json(state.groups.list()).into_response()
+}
+
+async fn create_group(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Json(request): Json<CreateGroupRequest>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    match state.groups.create(&request.name, request.description, now_unix()) {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(error) => group_error_response(error),
+    }
+}
+
+async fn delete_group(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    match state.groups.delete(&name) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => group_error_response(error),
+    }
+}
+
+async fn set_group_member(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path((name, member)): Path<(String, String)>,
+    Json(request): Json<SetMemberRequest>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    match state.groups.set_member(&name, &member, Some(request.direction)) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => group_error_response(error),
+    }
+}
+
+async fn remove_group_member(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path((name, member)): Path<(String, String)>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    match state.groups.set_member(&name, &member, None) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => group_error_response(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +451,7 @@ mod tests {
             tokens: Arc::clone(&tokens),
             users: Arc::clone(&users),
             registry: Arc::clone(&registry),
+            groups: Arc::new(GroupStore::in_memory()),
             admin_common_name: admin_cn.map(str::to_string),
         };
         (router(state), tokens, users, registry)
@@ -513,6 +657,93 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(tokens.list().is_empty());
+    }
+
+    fn app_with_groups() -> (Router, Arc<GroupStore>, Arc<EnrollmentTokenStore>, Arc<UserStore>) {
+        let tokens = Arc::new(EnrollmentTokenStore::in_memory());
+        let users = Arc::new(UserStore::in_memory());
+        let groups = Arc::new(GroupStore::in_memory());
+        let state = AdminState {
+            tokens: Arc::clone(&tokens),
+            users: Arc::clone(&users),
+            registry: Arc::new(DeviceRegistry::in_memory()),
+            groups: Arc::clone(&groups),
+            admin_common_name: Some("jz-admin".into()),
+        };
+        (router(state), groups, tokens, users)
+    }
+
+    #[tokio::test]
+    async fn admin_manages_groups_and_members() {
+        let (mut app, groups, _, _) = app_with_groups();
+        let created = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/groups", r#"{"name":"Red","description":"red team"}"#).await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let dup = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/groups", r#"{"name":"Red"}"#).await;
+        assert_eq!(dup.status(), StatusCode::CONFLICT);
+        let bad = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/groups", r#"{"name":"__ANON__"}"#).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        let set = request_as(&mut app, "jz-admin", "PUT", "/Marti/api/admin/groups/Red/members/phone-1", r#"{"direction":"IN"}"#).await;
+        assert_eq!(set.status(), StatusCode::NO_CONTENT);
+        let unknown = request_as(&mut app, "jz-admin", "PUT", "/Marti/api/admin/groups/Nope/members/phone-1", r#"{"direction":"BOTH"}"#).await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let listed = request_as(&mut app, "jz-admin", "GET", "/Marti/api/admin/groups", "").await;
+        let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(listed.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let red = body.as_array().unwrap().iter().find(|g| g["name"] == "Red").unwrap();
+        assert_eq!(red["members"]["phone-1"], "IN");
+        assert_eq!(red["description"], "red team");
+
+        let removed = request_as(&mut app, "jz-admin", "DELETE", "/Marti/api/admin/groups/Red/members/phone-1", "").await;
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+        assert!(!groups.all_group_names("phone-1").contains("Red"));
+        let deleted = request_as(&mut app, "jz-admin", "DELETE", "/Marti/api/admin/groups/Red", "").await;
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        assert!(!groups.exists("Red"));
+    }
+
+    #[tokio::test]
+    async fn only_the_admin_can_manage_groups() {
+        let (mut app, groups, _, _) = app_with_groups();
+        for (method, uri, body) in [
+            ("GET", "/Marti/api/admin/groups", ""),
+            ("POST", "/Marti/api/admin/groups", r#"{"name":"Red"}"#),
+            ("PUT", "/Marti/api/admin/groups/__ANON__/members/me", r#"{"direction":"BOTH"}"#),
+            ("DELETE", "/Marti/api/admin/groups/__ANON__", ""),
+        ] {
+            let response = request_as(&mut app, "phone-1", method, uri, body).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+        assert!(!groups.exists("Red"));
+    }
+
+    /// Tokens and accounts carry the official-style group lists; unknown
+    /// groups are refused before anything is minted.
+    #[tokio::test]
+    async fn tokens_and_accounts_carry_groups_and_unknown_groups_are_refused() {
+        let (mut app, groups, tokens, users) = app_with_groups();
+        groups.create("Red", None, 0).unwrap();
+        groups.create("Blue", None, 0).unwrap();
+        let minted = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/enrollmentTokens",
+            r#"{"commonName":"phone-1","groups":["Red"],"groupsOut":["Blue"]}"#).await;
+        assert_eq!(minted.status(), StatusCode::CREATED);
+        assert_eq!(
+            tokens.list()[0].groups,
+            vec![
+                GroupGrant { name: "Blue".into(), membership: Membership::Out },
+                GroupGrant { name: "Red".into(), membership: Membership::Both },
+            ]
+        );
+        let bad = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/enrollmentTokens", r#"{"groups":["Nope"]}"#).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(tokens.list().len(), 1);
+
+        let user = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/users", r#"{"username":"bob","password":"pw","groupsIn":["Red"]}"#).await;
+        assert_eq!(user.status(), StatusCode::CREATED);
+        assert_eq!(users.groups_of("bob"), vec![GroupGrant { name: "Red".into(), membership: Membership::In }]);
+        let bad = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/users", r#"{"username":"eve","groups":["Nope"]}"#).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        assert!(!users.exists("eve"));
     }
 
     #[tokio::test]

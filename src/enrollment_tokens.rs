@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::eventlog::{EventLog, EventLogError};
+use crate::groups::GroupGrant;
 
 #[derive(Debug, Error)]
 pub enum EnrollmentTokenError {
@@ -48,6 +49,9 @@ pub struct EnrollmentToken {
     /// what a QR code minted for one specific device carries.
     #[serde(default)]
     pub common_name: Option<String>,
+    /// Groups the enrolling device is added to (see `crate::groups`).
+    #[serde(default)]
+    pub groups: Vec<GroupGrant>,
     pub used: bool,
     pub used_by_common_name: Option<String>,
     pub used_at_unix: Option<i64>,
@@ -82,6 +86,9 @@ enum TokenEvent {
         /// Absent in logs written before bindings existed.
         #[serde(default)]
         common_name: Option<String>,
+        /// Absent in logs written before groups existed.
+        #[serde(default)]
+        groups: Vec<GroupGrant>,
     },
     Consumed {
         token: String,
@@ -140,6 +147,19 @@ impl EnrollmentTokenStore {
         common_name: Option<String>,
         now_unix: i64,
     ) -> Result<String, EnrollmentTokenError> {
+        self.mint_with(expires_in_secs, note, common_name, Vec::new(), now_unix)
+    }
+
+    /// Like [`Self::mint_bound`], also carrying the groups the enrolling
+    /// device is added to.
+    pub fn mint_with(
+        &self,
+        expires_in_secs: Option<i64>,
+        note: Option<String>,
+        common_name: Option<String>,
+        groups: Vec<GroupGrant>,
+        now_unix: i64,
+    ) -> Result<String, EnrollmentTokenError> {
         let token = random_token();
         let mut tokens = self.tokens.write().unwrap();
         let event = TokenEvent::Minted {
@@ -148,6 +168,7 @@ impl EnrollmentTokenStore {
             expires_at_unix: expires_in_secs.map(|secs| now_unix + secs),
             note,
             common_name,
+            groups,
         };
         if let Some(log) = &self.log {
             log.append(&event)?;
@@ -191,6 +212,11 @@ impl EnrollmentTokenStore {
         Ok(())
     }
 
+    /// A snapshot of one token, if it exists.
+    pub fn get(&self, token: &str) -> Option<EnrollmentToken> {
+        self.tokens.read().unwrap().get(token).cloned()
+    }
+
     pub fn revoke(&self, token: &str) -> Result<(), EnrollmentTokenError> {
         let mut tokens = self.tokens.write().unwrap();
         if !tokens.contains_key(token) {
@@ -221,6 +247,7 @@ fn apply_event(tokens: &mut HashMap<String, EnrollmentToken>, event: &TokenEvent
             expires_at_unix,
             note,
             common_name,
+            groups,
         } => {
             tokens.insert(
                 token.clone(),
@@ -230,6 +257,7 @@ fn apply_event(tokens: &mut HashMap<String, EnrollmentToken>, event: &TokenEvent
                     expires_at_unix: *expires_at_unix,
                     note: note.clone(),
                     common_name: common_name.clone(),
+                    groups: groups.clone(),
                     used: false,
                     used_by_common_name: None,
                     used_at_unix: None,

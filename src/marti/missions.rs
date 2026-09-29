@@ -3,7 +3,13 @@
 //! Implements the metadata half of `docs/TEST-PLAN.md` §5 on top of
 //! [`crate::missions::MissionStore`]. **Not implemented**: DataSync file
 //! *content* upload/download (TC-MARTI-07/08), `clientEndPoints`
-//! (TC-MARTI-09), groups/device-profile-gated visibility.
+//! (TC-MARTI-09), device-profile-gated visibility.
+//!
+//! **Groups** (`crate::groups`, 2026-09-29): every mission is visible in a
+//! set of groups (default: its creator's). A caller outside all of them
+//! gets 404 on every mission endpoint and doesn't see it listed -- the
+//! official server's mission group check; the admin sees everything. A
+//! non-admin can only put a mission into groups it belongs to.
 //!
 //! **TC-MARTI-10**: served mTLS-authenticated via
 //! [`super::MtlsHttpServer`], which also injects the connecting cert's CN
@@ -17,16 +23,14 @@
 //! **Roles (`docs/ARCHITECTURE.md` "Enrollment lockdown / admin API" and
 //! the mission-roles follow-up it names)**: on top of the identity-claim
 //! check above, some actions also require a specific
-//! [`crate::missions::MissionRole`] on the target mission. `delete_mission`
-//! and `update_mission` require `Owner`; `add_content` requires *any* role
-//! (`Owner` or `Subscriber`) — a caller with no role on the mission at all
-//! can read it (`GET`, unrestricted, see below) but can't modify it.
-//! `assign_role`/`revoke_role` (`PUT`/`DELETE /missions/:name/role`) are
-//! `Owner`-only. **Deliberately unrestricted**: `list_missions`,
-//! `get_mission`, and `get_changes` remain open to any authenticated
-//! caller regardless of role, matching real collaborative
-//! situational-awareness use (discovering/previewing a mission you haven't
-//! joined yet) — only mutating actions are role-gated.
+//! [`crate::missions::MissionRole`] on the target mission, mirroring the
+//! official roles: `delete_mission` and `update_mission` (incl. its
+//! groups) require `Owner` (`MISSION_OWNER`); `add_content` requires a
+//! writing role, `Owner` or `Subscriber` (`MISSION_WRITE`) -- not
+//! `ReadOnlySubscriber` (`MISSION_READONLY_SUBSCRIBER`). Subscribing grants
+//! the mission's `defaultRole`. `assign_role`/`revoke_role` are
+//! `Owner`-only. Reading (`list`/`get`/`changes`) needs no role -- only
+//! membership of one of the mission's groups (see above).
 //!
 //! **`PUT` vs `PATCH` (TC-MARTI-02/12)**: `PUT /missions/:name` is
 //! strict-create-only (409 if the name is already taken); updates go
@@ -47,11 +51,31 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 
 use super::PeerIdentity;
+use crate::groups::GroupStore;
 use crate::missions::{
     Mission, MissionContentRef, MissionError, MissionRole, MissionStore, MissionUpdate,
 };
 
+/// What the mission API needs: the store, plus groups for visibility.
+#[derive(Clone)]
+pub struct MissionsState {
+    pub store: Arc<MissionStore>,
+    pub groups: Arc<GroupStore>,
+    /// The admin identity sees every mission.
+    pub admin_common_name: Option<String>,
+}
+
+/// The mission API with no groups configured (everyone is `__ANON__`, so
+/// every mission is visible to everyone) -- see [`router_with`].
 pub fn router(store: Arc<MissionStore>) -> Router {
+    router_with(MissionsState {
+        store,
+        groups: Arc::new(GroupStore::in_memory()),
+        admin_common_name: None,
+    })
+}
+
+pub fn router_with(state: MissionsState) -> Router {
     Router::new()
         .route("/Marti/api/missions", get(list_missions))
         .route(
@@ -75,7 +99,7 @@ pub fn router(store: Arc<MissionStore>) -> Router {
             "/Marti/api/missions/:name/role/:uid",
             axum::routing::delete(revoke_role),
         )
-        .with_state(store)
+        .with_state(state)
 }
 
 fn now_unix() -> i64 {
@@ -142,21 +166,76 @@ fn require_owner(store: &MissionStore, name: &str, identity: &PeerIdentity) -> O
     }
 }
 
-/// Actions any role holder may do (currently just adding content) --
-/// `Owner` or `Subscriber`, rejecting a caller with no role on the mission
-/// at all.
-fn require_any_role(store: &MissionStore, name: &str, identity: &PeerIdentity) -> Option<Response> {
+/// Adding content -- official `MISSION_WRITE`: `Owner` or `Subscriber`.
+/// A caller with no role, or `ReadOnlySubscriber`, is rejected.
+fn require_write_role(store: &MissionStore, name: &str, identity: &PeerIdentity) -> Option<Response> {
     match store.role_of(name, &identity.0) {
-        Some(_) => None,
-        None => Some(error_response(
+        Some(role) if role.can_write() => None,
+        _ => Some(error_response(
             StatusCode::FORBIDDEN,
-            "this action requires a role (Owner or Subscriber) on this mission".to_string(),
+            "this action requires a writing role (Owner or Subscriber) on this mission".to_string(),
         )),
     }
 }
 
-async fn list_missions(State(store): State<Arc<MissionStore>>) -> Json<Vec<Mission>> {
-    Json(store.list())
+fn is_admin(state: &MissionsState, identity: &PeerIdentity) -> bool {
+    state.admin_common_name.as_deref() == Some(identity.0.as_str())
+}
+
+/// Whether `identity` may see `mission` at all: it shares one of the
+/// mission's groups (either direction), or it's the admin -- the official
+/// server's mission group check (`isGroupVectorAllowed`).
+fn can_see(state: &MissionsState, mission: &Mission, identity: &PeerIdentity) -> bool {
+    if is_admin(state, identity) {
+        return true;
+    }
+    let mine = state.groups.all_group_names(&identity.0);
+    mission.groups.iter().any(|group| mine.contains(group))
+}
+
+/// 404 -- not 403 -- for a mission the caller can't see, so its existence
+/// doesn't leak outside its groups.
+fn require_visible(state: &MissionsState, name: &str, identity: &PeerIdentity) -> Option<Response> {
+    match state.store.get(name) {
+        Some(mission) if can_see(state, &mission, identity) => None,
+        _ => Some(mission_error_response(MissionError::NotFound(name.to_string()))),
+    }
+}
+
+/// Validate a requested group list: every group must exist, and a
+/// non-admin may only use groups it belongs to (it can't place a mission
+/// where it couldn't see it itself).
+fn validate_groups(state: &MissionsState, groups: &[String], identity: &PeerIdentity) -> Option<Response> {
+    if groups.is_empty() {
+        return Some(error_response(StatusCode::BAD_REQUEST, "a mission needs at least one group".to_string()));
+    }
+    if let Some(unknown) = groups.iter().find(|g| !state.groups.exists(g)) {
+        return Some(error_response(StatusCode::BAD_REQUEST, format!("unknown group '{unknown}'")));
+    }
+    if !is_admin(state, identity) {
+        let mine = state.groups.all_group_names(&identity.0);
+        if let Some(foreign) = groups.iter().find(|g| !mine.contains(*g)) {
+            return Some(error_response(
+                StatusCode::FORBIDDEN,
+                format!("not a member of group '{foreign}'"),
+            ));
+        }
+    }
+    None
+}
+
+async fn list_missions(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+) -> Json<Vec<Mission>> {
+    Json(
+        state
+            .store
+            .list()
+            .into_iter()
+            .filter(|mission| can_see(&state, mission, &identity))
+            .collect(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -166,11 +245,18 @@ struct CreateMissionRequest {
     creator_uid: String,
     #[serde(default)]
     keywords: Vec<String>,
+    /// Groups the mission is visible in; default: the creator's groups.
+    #[serde(default)]
+    groups: Option<Vec<String>>,
+    /// Role subscribers get (official `defaultRole`): `subscriber`
+    /// (default) or `readonly_subscriber` (`MISSION_READONLY_SUBSCRIBER`).
+    #[serde(rename = "defaultRole", default)]
+    default_role: Option<MissionRole>,
 }
 
 /// TC-MARTI-01/02: strict create.
 async fn create_mission(
-    State(store): State<Arc<MissionStore>>,
+    State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
     Path(name): Path<String>,
     Json(request): Json<CreateMissionRequest>,
@@ -178,11 +264,24 @@ async fn create_mission(
     if let Some(response) = require_matching_identity(&identity, &request.creator_uid) {
         return response;
     }
-    match store.create(
+    let groups = match request.groups {
+        Some(groups) => groups,
+        None => state.groups.all_group_names(&identity.0).into_iter().collect(),
+    };
+    if let Some(response) = validate_groups(&state, &groups, &identity) {
+        return response;
+    }
+    let default_role = request.default_role.unwrap_or(MissionRole::Subscriber);
+    if default_role == MissionRole::Owner {
+        return error_response(StatusCode::BAD_REQUEST, "defaultRole can't be Owner".to_string());
+    }
+    match state.store.create_with(
         &name,
         request.description,
         &request.creator_uid,
         request.keywords,
+        groups,
+        default_role,
         now_unix(),
     ) {
         Ok(mission) => (StatusCode::CREATED, Json(mission)).into_response(),
@@ -191,10 +290,14 @@ async fn create_mission(
 }
 
 async fn get_mission(
-    State(store): State<Arc<MissionStore>>,
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
     Path(name): Path<String>,
 ) -> Response {
-    match store.get(&name) {
+    if let Some(response) = require_visible(&state, &name, &identity) {
+        return response;
+    }
+    match state.store.get(&name) {
         Some(mission) => Json(mission).into_response(),
         None => mission_error_response(MissionError::NotFound(name)),
     }
@@ -206,11 +309,15 @@ struct UpdateMissionRequest {
     keywords: Option<Vec<String>>,
     #[serde(rename = "actorUid")]
     actor_uid: String,
+    /// Replace the groups the mission is visible in (official
+    /// `MISSION_UPDATE_GROUPS`, Owner only).
+    #[serde(default)]
+    groups: Option<Vec<String>>,
 }
 
 /// TC-MARTI-12: partial update, only provided fields change.
 async fn update_mission(
-    State(store): State<Arc<MissionStore>>,
+    State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
     Path(name): Path<String>,
     Json(request): Json<UpdateMissionRequest>,
@@ -218,28 +325,42 @@ async fn update_mission(
     if let Some(response) = require_matching_identity(&identity, &request.actor_uid) {
         return response;
     }
-    if let Some(response) = require_owner(&store, &name, &identity) {
+    if let Some(response) = require_visible(&state, &name, &identity) {
         return response;
+    }
+    if let Some(response) = require_owner(&state.store, &name, &identity) {
+        return response;
+    }
+    if let Some(groups) = request.groups {
+        if let Some(response) = validate_groups(&state, &groups, &identity) {
+            return response;
+        }
+        if let Err(error) = state.store.set_groups(&name, groups, &request.actor_uid, now_unix()) {
+            return mission_error_response(error);
+        }
     }
     let update = MissionUpdate {
         description: request.description,
         keywords: request.keywords,
     };
-    match store.update(&name, update, &request.actor_uid, now_unix()) {
+    match state.store.update(&name, update, &request.actor_uid, now_unix()) {
         Ok(mission) => Json(mission).into_response(),
         Err(error) => mission_error_response(error),
     }
 }
 
 async fn delete_mission(
-    State(store): State<Arc<MissionStore>>,
+    State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
     Path(name): Path<String>,
 ) -> Response {
-    if let Some(response) = require_owner(&store, &name, &identity) {
+    if let Some(response) = require_visible(&state, &name, &identity) {
         return response;
     }
-    match store.delete(&name) {
+    if let Some(response) = require_owner(&state.store, &name, &identity) {
+        return response;
+    }
+    match state.store.delete(&name) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => mission_error_response(error),
     }
@@ -247,10 +368,14 @@ async fn delete_mission(
 
 /// TC-MARTI-05.
 async fn get_changes(
-    State(store): State<Arc<MissionStore>>,
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
     Path(name): Path<String>,
 ) -> Response {
-    match store.changes(&name) {
+    if let Some(response) = require_visible(&state, &name, &identity) {
+        return response;
+    }
+    match state.store.changes(&name) {
         Ok(changes) => Json(changes).into_response(),
         Err(error) => mission_error_response(error),
     }
@@ -265,7 +390,7 @@ struct AddContentRequest {
 }
 
 async fn add_content(
-    State(store): State<Arc<MissionStore>>,
+    State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
     Path(name): Path<String>,
     Json(request): Json<AddContentRequest>,
@@ -273,7 +398,10 @@ async fn add_content(
     if let Some(response) = require_matching_identity(&identity, &request.creator_uid) {
         return response;
     }
-    if let Some(response) = require_any_role(&store, &name, &identity) {
+    if let Some(response) = require_visible(&state, &name, &identity) {
+        return response;
+    }
+    if let Some(response) = require_write_role(&state.store, &name, &identity) {
         return response;
     }
     let content = MissionContentRef {
@@ -282,7 +410,7 @@ async fn add_content(
         added_at_unix: now_unix(),
         creator_uid: request.creator_uid,
     };
-    match store.add_content(&name, content, now_unix()) {
+    match state.store.add_content(&name, content, now_unix()) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => mission_error_response(error),
     }
@@ -297,7 +425,7 @@ struct SubscriptionQuery {
 /// authenticated identity, same policy as every other identity claim in
 /// this module.
 async fn subscribe(
-    State(store): State<Arc<MissionStore>>,
+    State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
     Path(name): Path<String>,
     Query(query): Query<SubscriptionQuery>,
@@ -305,14 +433,17 @@ async fn subscribe(
     if let Some(response) = require_matching_identity(&identity, &query.uid) {
         return response;
     }
-    match store.subscribe(&name, &query.uid, now_unix()) {
+    if let Some(response) = require_visible(&state, &name, &identity) {
+        return response;
+    }
+    match state.store.subscribe(&name, &query.uid, now_unix()) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => mission_error_response(error),
     }
 }
 
 async fn unsubscribe(
-    State(store): State<Arc<MissionStore>>,
+    State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
     Path(name): Path<String>,
     Query(query): Query<SubscriptionQuery>,
@@ -320,7 +451,10 @@ async fn unsubscribe(
     if let Some(response) = require_matching_identity(&identity, &query.uid) {
         return response;
     }
-    match store.unsubscribe(&name, &query.uid, now_unix()) {
+    if let Some(response) = require_visible(&state, &name, &identity) {
+        return response;
+    }
+    match state.store.unsubscribe(&name, &query.uid, now_unix()) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => mission_error_response(error),
     }
@@ -337,15 +471,18 @@ struct AssignRoleRequest {
 /// `MissionStore::assign_role`'s own doc comment) with 409, the same
 /// status this module already uses for other real state conflicts.
 async fn assign_role(
-    State(store): State<Arc<MissionStore>>,
+    State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
     Path(name): Path<String>,
     Json(request): Json<AssignRoleRequest>,
 ) -> Response {
-    if let Some(response) = require_owner(&store, &name, &identity) {
+    if let Some(response) = require_visible(&state, &name, &identity) {
         return response;
     }
-    match store.assign_role(&name, &request.uid, request.role, &identity.0, now_unix()) {
+    if let Some(response) = require_owner(&state.store, &name, &identity) {
+        return response;
+    }
+    match state.store.assign_role(&name, &request.uid, request.role, &identity.0, now_unix()) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => mission_error_response(error),
     }
@@ -354,14 +491,17 @@ async fn assign_role(
 /// `Owner`-only: revoke another identity's role entirely. Same last-owner
 /// protection as [`assign_role`].
 async fn revoke_role(
-    State(store): State<Arc<MissionStore>>,
+    State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
     Path((name, uid)): Path<(String, String)>,
 ) -> Response {
-    if let Some(response) = require_owner(&store, &name, &identity) {
+    if let Some(response) = require_visible(&state, &name, &identity) {
         return response;
     }
-    match store.revoke_role(&name, &uid, &identity.0, now_unix()) {
+    if let Some(response) = require_owner(&state.store, &name, &identity) {
+        return response;
+    }
+    match state.store.revoke_role(&name, &uid, &identity.0, now_unix()) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => mission_error_response(error),
     }
@@ -418,6 +558,109 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         app.clone().oneshot(request).await.unwrap()
+    }
+
+    /// A mission API with groups Red (red-1, red-2) and Blue (blue-1),
+    /// and "admin" as the admin identity.
+    fn app_with_groups() -> (Router, Arc<GroupStore>, Arc<MissionStore>) {
+        use crate::groups::Membership;
+        let groups = Arc::new(GroupStore::in_memory());
+        groups.create("Red", None, 0).unwrap();
+        groups.create("Blue", None, 0).unwrap();
+        groups.set_member("Red", "red-1", Some(Membership::Both)).unwrap();
+        groups.set_member("Red", "red-2", Some(Membership::Out)).unwrap();
+        groups.set_member("Blue", "blue-1", Some(Membership::Both)).unwrap();
+        let store = Arc::new(MissionStore::in_memory());
+        let app = router_with(MissionsState {
+            store: Arc::clone(&store),
+            groups: Arc::clone(&groups),
+            admin_common_name: Some("admin".into()),
+        });
+        (app, groups, store)
+    }
+
+    async fn status_of(app: &mut Router, identity: &str, method: &str, uri: &str, body: serde_json::Value) -> Status {
+        json_request_as(app, identity, method, uri, body).await.0
+    }
+
+    /// A mission defaults to its creator's groups and is invisible -- 404,
+    /// not 403 -- to anyone outside them; the admin sees everything.
+    #[tokio::test]
+    async fn missions_are_only_visible_within_their_groups() {
+        let (mut app, _, _) = app_with_groups();
+        let (status, body) = json_request_as(&mut app, "red-1", "PUT", "/Marti/api/missions/op", serde_json::json!({"creatorUid": "red-1"})).await;
+        assert_eq!(status, Status::CREATED);
+        assert_eq!(body["groups"], serde_json::json!(["Red"]));
+
+        let listed = |body: serde_json::Value| body.as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let (_, body) = json_request_as(&mut app, "red-2", "GET", "/Marti/api/missions", serde_json::Value::Null).await;
+        assert_eq!(listed(body), vec!["op"], "OUT-only member of Red sees it");
+        let (_, body) = json_request_as(&mut app, "blue-1", "GET", "/Marti/api/missions", serde_json::Value::Null).await;
+        assert!(listed(body).is_empty());
+        let (_, body) = json_request_as(&mut app, "admin", "GET", "/Marti/api/missions", serde_json::Value::Null).await;
+        assert_eq!(listed(body), vec!["op"]);
+
+        for (method, uri, body) in [
+            ("GET", "/Marti/api/missions/op", serde_json::Value::Null),
+            ("GET", "/Marti/api/missions/op/changes", serde_json::Value::Null),
+            ("PUT", "/Marti/api/missions/op/subscription?uid=blue-1", serde_json::Value::Null),
+            ("PUT", "/Marti/api/missions/op/contents", serde_json::json!({"hash": "h", "filename": "f", "creatorUid": "blue-1"})),
+        ] {
+            assert_eq!(status_of(&mut app, "blue-1", method, uri, body).await, Status::NOT_FOUND, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn creating_a_mission_in_foreign_or_unknown_groups_is_refused() {
+        let (mut app, _, store) = app_with_groups();
+        let create = |groups: serde_json::Value| serde_json::json!({"creatorUid": "red-1", "groups": groups});
+        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/a", create(serde_json::json!(["Blue"]))).await, Status::FORBIDDEN);
+        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/b", create(serde_json::json!(["Nope"]))).await, Status::BAD_REQUEST);
+        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/c", create(serde_json::json!([]))).await, Status::BAD_REQUEST);
+        assert!(store.list().is_empty());
+        // The admin may place a mission in any group.
+        let admin = serde_json::json!({"creatorUid": "admin", "groups": ["Blue"]});
+        assert_eq!(status_of(&mut app, "admin", "PUT", "/Marti/api/missions/d", admin).await, Status::CREATED);
+    }
+
+    /// Official `MISSION_READONLY_SUBSCRIBER`: a mission created with
+    /// `defaultRole` read-only gives subscribers read access only.
+    #[tokio::test]
+    async fn a_readonly_default_role_lets_subscribers_read_but_not_write() {
+        let (mut app, _, store) = app_with_groups();
+        let create = serde_json::json!({"creatorUid": "red-1", "defaultRole": "MISSION_READONLY_SUBSCRIBER"});
+        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/briefing", create).await, Status::CREATED);
+        assert_eq!(status_of(&mut app, "red-2", "PUT", "/Marti/api/missions/briefing/subscription?uid=red-2", serde_json::Value::Null).await, Status::OK);
+        assert_eq!(store.role_of("briefing", "red-2"), Some(MissionRole::ReadOnlySubscriber));
+        let content = serde_json::json!({"hash": "h", "filename": "f", "creatorUid": "red-2"});
+        assert_eq!(status_of(&mut app, "red-2", "PUT", "/Marti/api/missions/briefing/contents", content).await, Status::FORBIDDEN);
+        assert_eq!(status_of(&mut app, "red-2", "GET", "/Marti/api/missions/briefing", serde_json::Value::Null).await, Status::OK);
+
+        // The owner can promote it; the owner can also assign read-only.
+        let promote = serde_json::json!({"uid": "red-2", "role": "MISSION_SUBSCRIBER"});
+        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/briefing/role", promote).await, Status::OK);
+        let content = serde_json::json!({"hash": "h", "filename": "f", "creatorUid": "red-2"});
+        assert_eq!(status_of(&mut app, "red-2", "PUT", "/Marti/api/missions/briefing/contents", content).await, Status::OK);
+        let demote = serde_json::json!({"uid": "red-2", "role": "readonly_subscriber"});
+        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/briefing/role", demote).await, Status::OK);
+        assert_eq!(store.role_of("briefing", "red-2"), Some(MissionRole::ReadOnlySubscriber));
+
+        let owner_default = serde_json::json!({"creatorUid": "red-1", "defaultRole": "owner"});
+        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/x", owner_default).await, Status::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_owner_can_move_a_mission_between_its_groups() {
+        use crate::groups::Membership;
+        let (mut app, groups, _) = app_with_groups();
+        groups.set_member("Blue", "red-1", Some(Membership::Both)).unwrap();
+        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/op", serde_json::json!({"creatorUid": "red-1", "groups": ["Red"]})).await, Status::CREATED);
+        assert_eq!(status_of(&mut app, "blue-1", "GET", "/Marti/api/missions/op", serde_json::Value::Null).await, Status::NOT_FOUND);
+
+        let (status, body) = json_request_as(&mut app, "red-1", "PATCH", "/Marti/api/missions/op", serde_json::json!({"actorUid": "red-1", "groups": ["Blue"]})).await;
+        assert_eq!(status, Status::OK, "{body}");
+        assert_eq!(status_of(&mut app, "blue-1", "GET", "/Marti/api/missions/op", serde_json::Value::Null).await, Status::OK);
+        assert_eq!(status_of(&mut app, "red-2", "GET", "/Marti/api/missions/op", serde_json::Value::Null).await, Status::NOT_FOUND);
     }
 
     /// TC-MARTI-01.

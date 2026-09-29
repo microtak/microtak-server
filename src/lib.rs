@@ -17,6 +17,7 @@ pub mod content_store;
 pub mod cot;
 pub mod enrollment_tokens;
 pub mod eventlog;
+pub mod groups;
 pub mod marti;
 pub mod missions;
 pub mod pki;

@@ -42,6 +42,7 @@ use super::PeerIp;
 use crate::app::EnrollmentMode;
 use crate::bootstrap::{BootstrapError, BootstrapToken};
 use crate::enrollment_tokens::EnrollmentTokenStore;
+use crate::groups::{GroupGrant, GroupStore};
 use crate::pki::CertificateAuthority;
 use crate::ratelimit::{user_key, AuthLimiter};
 use crate::registry::{DeviceRegistry, RegistryError};
@@ -68,6 +69,8 @@ pub struct EnrollmentState {
     /// Failed-attempt limiting and bounded password checks -- see
     /// [`crate::ratelimit`]. Shared with `/oauth/token`.
     pub limiter: Arc<AuthLimiter>,
+    /// Groups granted at enrollment are applied here (`crate::groups`).
+    pub groups: Arc<GroupStore>,
 }
 
 impl EnrollmentState {
@@ -242,6 +245,12 @@ async fn sign_client_v2(
         None => None,
     };
 
+    // Groups the device is added to once enrolled (`crate::groups`): the
+    // account's or the invite token's. Checked to still exist *before*
+    // anything is spent or recorded -- a device silently falling back to
+    // the anonymous group would see more than intended.
+    let mut grants: Vec<GroupGrant> = Vec::new();
+
     let enrolled = match password_login {
         Some((username, password)) => {
             let user_key = user_key(&username);
@@ -273,6 +282,10 @@ async fn sign_client_v2(
             if state.is_admin_cn(common_name) {
                 warn!(%username, "signClient/v2 rejected: the admin identity can't be enrolled with a password");
                 return admin_requires_bootstrap();
+            }
+            grants = state.users.groups_of(&username);
+            if let Some(missing) = state.groups.first_missing(&grants) {
+                return missing_group(common_name, &missing);
             }
             // Proven owner of this identity: may create or rotate it.
             state.registry.enroll(common_name, &signed.cert_pem, now)
@@ -316,6 +329,12 @@ async fn sign_client_v2(
                 if state.limiter.is_blocked(&ip_key) {
                     return too_many_attempts();
                 }
+                if let Some(minted) = state.tokens.get(token) {
+                    if let Some(missing) = state.groups.first_missing(&minted.groups) {
+                        return missing_group(common_name, &missing);
+                    }
+                    grants = minted.groups;
+                }
                 if let Err(error) = state.tokens.validate_and_consume(token, common_name, now) {
                     state.limiter.record_failure(&ip_key);
                     warn!(common_name, %error, "enrollment rejected: invalid token");
@@ -338,8 +357,22 @@ async fn sign_client_v2(
         }
     }
 
+    if let Err(error) = state.groups.grant(common_name, &grants) {
+        // Only possible if a group was deleted in the instant since the
+        // check above; the device stays enrolled, its groups need fixing.
+        warn!(common_name, %error, "enrolled, but applying its groups failed");
+    }
+
     info!(common_name, "device enrolled");
     shaped_success_response(&headers, &signed.cert_pem, &state.ca.ca_cert_pem())
+}
+
+fn missing_group(common_name: &str, group: &str) -> Response {
+    warn!(common_name, group, "enrollment refused: its group no longer exists");
+    error_response(
+        StatusCode::CONFLICT,
+        &format!("group '{group}' this enrollment would add the device to no longer exists"),
+    )
 }
 
 fn too_many_attempts() -> Response {
@@ -479,6 +512,7 @@ mod tests {
             users: Arc::new(UserStore::in_memory()),
             bootstrap: Arc::new(BootstrapToken::none()),
             limiter: Arc::new(AuthLimiter::default()),
+            groups: Arc::new(GroupStore::in_memory()),
         })
     }
 
@@ -747,6 +781,7 @@ mod tests {
             users: Arc::new(UserStore::in_memory()),
             bootstrap: Arc::new(BootstrapToken::none()),
             limiter: Arc::new(AuthLimiter::default()),
+            groups: Arc::new(GroupStore::in_memory()),
         })
     }
 
@@ -878,6 +913,7 @@ mod tests {
             users: Arc::new(UserStore::in_memory()),
             bootstrap: Arc::new(BootstrapToken::none()),
             limiter: Arc::new(AuthLimiter::default()),
+            groups: Arc::new(GroupStore::in_memory()),
         });
         let base_url = spawn_server(state).await;
 
@@ -1070,6 +1106,7 @@ mod tests {
                 users: Arc::new(UserStore::in_memory()),
                 bootstrap: Arc::new(BootstrapToken::none()),
                 limiter: Arc::new(AuthLimiter::default()),
+                groups: Arc::new(GroupStore::in_memory()),
             });
             let registry_check = Arc::clone(&state);
             let base_url = spawn_server(state).await;
@@ -1093,6 +1130,7 @@ mod tests {
             users: Arc::new(UserStore::in_memory()),
             bootstrap: Arc::new(BootstrapToken::in_memory(bootstrap)),
             limiter: Arc::new(AuthLimiter::default()),
+            groups: Arc::new(GroupStore::in_memory()),
         })
     }
 
@@ -1247,6 +1285,70 @@ mod tests {
         assert_eq!(last, 429);
     }
 
+    /// An invite token's groups are applied to the device it enrolls.
+    #[tokio::test]
+    async fn an_invite_tokens_groups_are_applied_at_enrollment() {
+        use crate::groups::{grants_from, Direction};
+        let state = test_state_requiring_tokens();
+        state.groups.create("Red", None, 0).unwrap();
+        let token = state
+            .tokens
+            .mint_with(None, None, None, grants_from(&[], &[], &["Red".into()]), 1)
+            .unwrap();
+        let check = Arc::clone(&state);
+        let base_url = spawn_server(state).await;
+
+        let (csr_pem, _key) = build_csr("device-red").unwrap();
+        assert_eq!(post_csr(&base_url, &format!("?token={token}"), csr_pem).await.status(), 200);
+        assert_eq!(
+            check.groups.active_groups(Some("device-red"), Direction::Out),
+            ["Red".to_string()].into()
+        );
+        assert!(check.groups.active_groups(Some("device-red"), Direction::In).is_empty());
+    }
+
+    /// If a token's group has been deleted since minting, enrollment is
+    /// refused and the token isn't spent -- rather than enrolling a device
+    /// that would fall back to the anonymous group.
+    #[tokio::test]
+    async fn a_token_whose_group_was_deleted_is_refused_unspent() {
+        use crate::groups::grants_from;
+        let state = test_state_requiring_tokens();
+        state.groups.create("Red", None, 0).unwrap();
+        let token = state
+            .tokens
+            .mint_with(None, None, None, grants_from(&["Red".into()], &[], &[]), 1)
+            .unwrap();
+        state.groups.delete("Red").unwrap();
+        let check = Arc::clone(&state);
+        let base_url = spawn_server(state).await;
+
+        let (csr_pem, _key) = build_csr("device-red").unwrap();
+        assert_eq!(post_csr(&base_url, &format!("?token={token}"), csr_pem).await.status(), 409);
+        assert!(check.registry.find("device-red").is_none());
+        assert!(!check.tokens.list()[0].used);
+    }
+
+    /// A password account's groups are applied when its device enrolls.
+    #[tokio::test]
+    async fn an_accounts_groups_are_applied_at_enrollment() {
+        use crate::groups::{grants_from, Direction};
+        let state = test_state_requiring_tokens();
+        state.groups.create("Blue", None, 0).unwrap();
+        state
+            .users
+            .mint_with_groups("device-blue", "pw", grants_from(&[], &["Blue".into()], &[]), 0)
+            .unwrap();
+        let check = Arc::clone(&state);
+        let base_url = spawn_server(state).await;
+
+        assert_eq!(post_csr_basic(&base_url, "device-blue", "pw", "device-blue").await.status(), 200);
+        assert_eq!(
+            check.groups.active_groups(Some("device-blue"), Direction::In),
+            ["Blue".to_string()].into()
+        );
+    }
+
     /// The password path is the one way to rotate an existing identity's
     /// cert -- it proves ownership of that identity.
     #[tokio::test]
@@ -1306,6 +1408,7 @@ mod tests {
             users: Arc::new(UserStore::in_memory()),
             bootstrap: Arc::new(BootstrapToken::none()),
             limiter: Arc::new(AuthLimiter::default()),
+            groups: Arc::new(GroupStore::in_memory()),
         });
         let registry_check = Arc::clone(&state);
         let base_url = spawn_server(state).await;

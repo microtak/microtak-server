@@ -19,6 +19,8 @@ use tracing::info;
 use crate::backup::{BackupRunner, OffsiteTarget};
 use crate::bootstrap::{BootstrapToken, BOOTSTRAP_TOKEN_FILE};
 use crate::certsource::{self, CertLoadError, CertSource, SwappableCert};
+use crate::groups::GroupStore;
+use crate::marti::groups::GroupsState;
 use crate::clientip::TrustedProxies;
 use crate::servernames::{self, ServerCertError};
 use crate::ratelimit::AuthLimiter;
@@ -202,6 +204,8 @@ pub enum AppError {
     ServerCert(#[from] ServerCertError),
     #[error("enrollment TLS certificate: {0}")]
     EnrollmentCert(#[from] CertLoadError),
+    #[error("group store setup failed: {0}")]
+    Groups(#[from] crate::groups::GroupError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -224,6 +228,7 @@ pub struct App {
     pub registry: Arc<DeviceRegistry>,
     pub missions: Arc<MissionStore>,
     pub content_store: Arc<ContentStore>,
+    pub groups: Arc<GroupStore>,
     enrollment: TlsHttpServer,
     marti_api: MtlsHttpServer,
     tcp: Option<TcpRelay>,
@@ -256,6 +261,7 @@ impl App {
         let registry = Arc::new(DeviceRegistry::load_or_create(
             config.data_dir.join("devices.log"),
         )?);
+        let groups = Arc::new(GroupStore::load_or_create(config.data_dir.join("groups.log"))?);
         let missions = Arc::new(MissionStore::load_or_create(
             config.data_dir.join("missions.log"),
         )?);
@@ -352,6 +358,7 @@ impl App {
             users: Arc::clone(&users),
             bootstrap: Arc::clone(&bootstrap),
             limiter: Arc::clone(&limiter),
+            groups: Arc::clone(&groups),
         });
 
         let plain_router = enrollment::router(enrollment_state)
@@ -367,20 +374,32 @@ impl App {
             tokens: enrollment_tokens,
             users,
             registry: Arc::clone(&registry),
+            groups: Arc::clone(&groups),
             admin_common_name: config.admin_common_name.clone(),
         };
-        let marti_router = missions_api::router(Arc::clone(&missions))
+        let marti_router = missions_api::router_with(missions_api::MissionsState {
+            store: Arc::clone(&missions),
+            groups: Arc::clone(&groups),
+            admin_common_name: config.admin_common_name.clone(),
+        })
             .merge(client_endpoints::router(clients.clone()))
             .merge(content_api::router(Arc::clone(&content_store)))
             .merge(admin::router(admin_state))
             .merge(discovery::router())
             .merge(contacts::router(clients.clone()))
-            .merge(groups::router());
+            .merge(groups::router(GroupsState {
+                groups: Arc::clone(&groups),
+                admin_common_name: config.admin_common_name.clone(),
+            }));
         let marti_api =
             MtlsHttpServer::bind(config.marti_api_addr, Arc::clone(&tls_server_config), marti_router)
                 .await?;
         let tcp = if config.plain_tcp_enabled {
-            Some(TcpRelay::bind(config.plain_tcp_addr, hub.clone(), clients.clone()).await?)
+            Some(
+                TcpRelay::bind(config.plain_tcp_addr, hub.clone(), clients.clone())
+                    .await?
+                    .with_groups(Arc::clone(&groups)),
+            )
         } else {
             None
         };
@@ -391,7 +410,8 @@ impl App {
             Arc::clone(&registry),
             clients,
         )
-        .await?;
+        .await?
+        .with_groups(Arc::clone(&groups));
 
         if config.backup.enabled {
             let offsite = OffsiteTarget::new(config.backup.offsite_command.clone());
@@ -404,6 +424,7 @@ impl App {
             registry,
             missions,
             content_store,
+            groups,
             enrollment,
             marti_api,
             tcp,

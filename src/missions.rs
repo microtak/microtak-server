@@ -65,12 +65,35 @@ pub enum MissionError {
 pub enum MissionRole {
     /// Full control: update, delete, add content, and manage other
     /// identities' roles. Assigned automatically to a mission's creator.
+    /// The official server's `MISSION_OWNER`.
+    #[serde(alias = "MISSION_OWNER")]
     Owner,
     /// Can add content, but not update mission metadata, delete the
     /// mission, or manage roles. Assigned automatically on subscribing
     /// (and removed on unsubscribing) unless the identity already holds
     /// `Owner`, which subscribing/unsubscribing never changes.
+    /// The official `MISSION_SUBSCRIBER` (read + write).
+    #[serde(alias = "MISSION_SUBSCRIBER")]
     Subscriber,
+    /// Read only: may see and subscribe to the mission, but not add
+    /// content. The official `MISSION_READONLY_SUBSCRIBER`.
+    #[serde(rename = "readonly_subscriber", alias = "MISSION_READONLY_SUBSCRIBER", alias = "readonly")]
+    ReadOnlySubscriber,
+}
+
+impl MissionRole {
+    /// Whether this role may add content (official `MISSION_WRITE`).
+    pub fn can_write(self) -> bool {
+        matches!(self, MissionRole::Owner | MissionRole::Subscriber)
+    }
+}
+
+fn subscriber_role() -> MissionRole {
+    MissionRole::Subscriber
+}
+
+fn anon_groups() -> Vec<String> {
+    vec![crate::groups::ANON_GROUP.to_string()]
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -83,6 +106,16 @@ pub struct Mission {
     pub contents: Vec<MissionContentRef>,
     pub subscribers: Vec<String>,
     pub roles: HashMap<String, MissionRole>,
+    /// The groups this mission is visible in (`crate::groups`): only an
+    /// identity in one of them (either direction) can see it. Missions
+    /// created before groups existed are in `__ANON__`.
+    #[serde(default = "anon_groups")]
+    pub groups: Vec<String>,
+    /// The role an identity gets when subscribing (official
+    /// `defaultRole`): `Subscriber` unless the mission was created
+    /// read-only for subscribers.
+    #[serde(rename = "defaultRole", default = "subscriber_role")]
+    pub default_role: MissionRole,
 }
 
 /// A reference to Data Package content associated with a mission — just
@@ -149,6 +182,17 @@ enum MissionEvent {
         description: Option<String>,
         creator_uid: String,
         keywords: Vec<String>,
+        at_unix: i64,
+        /// Absent in logs written before groups existed (-> `__ANON__`).
+        #[serde(default)]
+        groups: Vec<String>,
+        #[serde(default = "subscriber_role")]
+        default_role: MissionRole,
+    },
+    GroupsSet {
+        name: String,
+        groups: Vec<String>,
+        actor_uid: String,
         at_unix: i64,
     },
     Updated {
@@ -219,12 +263,38 @@ impl MissionStore {
     }
 
     /// TC-MARTI-01/02: strict create — errors if `name` is already taken.
+    /// Visible in `__ANON__`, subscribers get `Subscriber` -- see
+    /// [`Self::create_with`].
     pub fn create(
         &self,
         name: &str,
         description: Option<String>,
         creator_uid: &str,
         keywords: Vec<String>,
+        now_unix: i64,
+    ) -> Result<Mission, MissionError> {
+        self.create_with(
+            name,
+            description,
+            creator_uid,
+            keywords,
+            anon_groups(),
+            MissionRole::Subscriber,
+            now_unix,
+        )
+    }
+
+    /// Like [`Self::create`], choosing the groups the mission is visible
+    /// in and the role subscribers get.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with(
+        &self,
+        name: &str,
+        description: Option<String>,
+        creator_uid: &str,
+        keywords: Vec<String>,
+        groups: Vec<String>,
+        default_role: MissionRole,
         now_unix: i64,
     ) -> Result<Mission, MissionError> {
         let mut missions = self.missions.write().unwrap();
@@ -241,6 +311,8 @@ impl MissionStore {
             creator_uid: creator_uid.to_string(),
             keywords,
             at_unix: now_unix,
+            groups,
+            default_role,
         };
         if let Some(log) = &self.log {
             log.append(&event)?;
@@ -271,6 +343,31 @@ impl MissionStore {
             name: name.to_string(),
             description: changes.description,
             keywords: changes.keywords,
+            actor_uid: actor_uid.to_string(),
+            at_unix: now_unix,
+        };
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply_event(&mut missions, &event);
+        Ok(missions.get(name).unwrap().mission.clone().unwrap())
+    }
+
+    /// Replace the groups the mission is visible in.
+    pub fn set_groups(
+        &self,
+        name: &str,
+        groups: Vec<String>,
+        actor_uid: &str,
+        now_unix: i64,
+    ) -> Result<Mission, MissionError> {
+        let mut missions = self.missions.write().unwrap();
+        if missions.get(name).is_none_or(|record| record.mission.is_none()) {
+            return Err(MissionError::NotFound(name.to_string()));
+        }
+        let event = MissionEvent::GroupsSet {
+            name: name.to_string(),
+            groups,
             actor_uid: actor_uid.to_string(),
             at_unix: now_unix,
         };
@@ -534,6 +631,8 @@ fn apply_event(missions: &mut HashMap<String, MissionRecord>, event: &MissionEve
             creator_uid,
             keywords,
             at_unix,
+            groups,
+            default_role,
         } => {
             let mut roles = HashMap::new();
             roles.insert(creator_uid.clone(), MissionRole::Owner);
@@ -546,6 +645,8 @@ fn apply_event(missions: &mut HashMap<String, MissionRecord>, event: &MissionEve
                 contents: Vec::new(),
                 subscribers: Vec::new(),
                 roles,
+                groups: if groups.is_empty() { anon_groups() } else { groups.clone() },
+                default_role: *default_role,
             };
             let record = missions.entry(name.clone()).or_default();
             record.mission = Some(mission);
@@ -555,6 +656,24 @@ fn apply_event(missions: &mut HashMap<String, MissionRecord>, event: &MissionEve
                 creator_uid: creator_uid.clone(),
                 content_hash: None,
             });
+        }
+        MissionEvent::GroupsSet {
+            name,
+            groups,
+            actor_uid,
+            at_unix,
+        } => {
+            if let Some(record) = missions.get_mut(name) {
+                if let Some(mission) = record.mission.as_mut() {
+                    mission.groups = groups.clone();
+                }
+                record.changes.push(MissionChange {
+                    change_type: ChangeType::Update,
+                    timestamp_unix: *at_unix,
+                    creator_uid: actor_uid.clone(),
+                    content_hash: None,
+                });
+            }
         }
         MissionEvent::Updated {
             name,
@@ -624,7 +743,8 @@ fn apply_event(missions: &mut HashMap<String, MissionRecord>, event: &MissionEve
                     mission.subscribers.push(uid.clone());
                     // Subscribing never demotes an existing Owner -- only
                     // grants Subscriber to an identity with no role yet.
-                    mission.roles.entry(uid.clone()).or_insert(MissionRole::Subscriber);
+                    let default_role = mission.default_role;
+                    mission.roles.entry(uid.clone()).or_insert(default_role);
                 }
                 record.changes.push(MissionChange {
                     change_type: ChangeType::Subscribe,
@@ -640,7 +760,10 @@ fn apply_event(missions: &mut HashMap<String, MissionRecord>, event: &MissionEve
                     mission.subscribers.retain(|s| s != uid);
                     // Unsubscribing only ever removes a Subscriber role --
                     // an Owner who unsubscribes keeps their Owner role.
-                    if mission.roles.get(uid) == Some(&MissionRole::Subscriber) {
+                    if matches!(
+                        mission.roles.get(uid),
+                        Some(MissionRole::Subscriber | MissionRole::ReadOnlySubscriber)
+                    ) {
                         mission.roles.remove(uid);
                     }
                 }
@@ -695,6 +818,52 @@ fn apply_event(missions: &mut HashMap<String, MissionRecord>, event: &MissionEve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscribing_gives_the_missions_default_role_and_unsubscribing_removes_it() {
+        let store = MissionStore::in_memory();
+        store
+            .create_with("m", None, "owner", vec![], vec!["Red".into()], MissionRole::ReadOnlySubscriber, 1)
+            .unwrap();
+        store.subscribe("m", "reader", 2).unwrap();
+        assert_eq!(store.role_of("m", "reader"), Some(MissionRole::ReadOnlySubscriber));
+        store.unsubscribe("m", "reader", 3).unwrap();
+        assert_eq!(store.role_of("m", "reader"), None);
+        assert_eq!(store.get("m").unwrap().groups, vec!["Red".to_string()]);
+    }
+
+    /// Missions logged before groups existed load into `__ANON__` with a
+    /// `Subscriber` default role -- unchanged behaviour for old data.
+    #[test]
+    fn missions_from_before_groups_load_as_anonymous() {
+        let dir = std::env::temp_dir().join(format!("microtak-missions-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("missions.log");
+        std::fs::write(
+            &path,
+            "{\"type\":\"Created\",\"name\":\"old\",\"description\":null,\"creator_uid\":\"u\",\"keywords\":[],\"at_unix\":1}\n",
+        )
+        .unwrap();
+        let store = MissionStore::load_or_create(&path).unwrap();
+        let mission = store.get("old").unwrap();
+        assert_eq!(mission.groups, vec![crate::groups::ANON_GROUP.to_string()]);
+        assert_eq!(mission.default_role, MissionRole::Subscriber);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn roles_accept_the_official_names() {
+        for (json, role) in [
+            ("\"MISSION_OWNER\"", MissionRole::Owner),
+            ("\"MISSION_SUBSCRIBER\"", MissionRole::Subscriber),
+            ("\"MISSION_READONLY_SUBSCRIBER\"", MissionRole::ReadOnlySubscriber),
+            ("\"readonly_subscriber\"", MissionRole::ReadOnlySubscriber),
+            ("\"owner\"", MissionRole::Owner),
+        ] {
+            assert_eq!(serde_json::from_str::<MissionRole>(json).unwrap(), role, "{json}");
+        }
+        assert!(!MissionRole::ReadOnlySubscriber.can_write());
+    }
 
     #[test]
     fn tc_marti_01_creates_gets_and_deletes_a_mission() {
