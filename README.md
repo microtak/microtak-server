@@ -23,6 +23,8 @@ and need to resync once a link comes back. That part isn't built yet — see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for what's running today versus
 still on the drawing board.
 
+MicroTAK is not affiliated with or endorsed by the U.S. Department of Defense, the TAK Product Center, or any other organization.
+
 ## What it does today
 
 - Real-time CoT relay over mutual-TLS, so ATAK/iTAK/WinTAK clients see each
