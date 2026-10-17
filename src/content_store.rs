@@ -182,6 +182,13 @@ impl ContentStore {
         }
     }
 
+    /// Remove the content stored under `hash` (no-op if absent or invalid).
+    pub fn remove(&self, hash: &str) {
+        if let Ok(normalized) = validate_hash(hash) {
+            let _ = std::fs::remove_file(self.path_for(&normalized));
+        }
+    }
+
     /// File count (images vs. everything else) and total size, for metrics.
     /// Scans the directory -- fine at this project's scale.
     pub fn stats(&self) -> ContentStats {

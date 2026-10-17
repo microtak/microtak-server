@@ -23,6 +23,7 @@ use crate::groups::GroupStore;
 use crate::marti::groups::GroupsState;
 use crate::clientip::TrustedProxies;
 use crate::servernames::{self, ServerCertError};
+use crate::sync::{ResourceStore, SyncError};
 use crate::ratelimit::AuthLimiter;
 use crate::content_store::ContentStore;
 use crate::enrollment_tokens::{EnrollmentTokenError, EnrollmentTokenStore};
@@ -227,6 +228,8 @@ pub enum AppError {
     Groups(#[from] crate::groups::GroupError),
     #[error("OAuth signing key: {0}")]
     OAuthKey(#[from] oauth::JwtSignerError),
+    #[error("resource store error: {0}")]
+    Resources(#[from] SyncError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -291,6 +294,7 @@ impl App {
             config.data_dir.join("missions.log"),
         )?);
         let content_store = Arc::new(ContentStore::open(config.data_dir.join("content"))?);
+        let resources = Arc::new(ResourceStore::load_or_create(config.data_dir.join("resources.log"))?);
         let enrollment_tokens = Arc::new(EnrollmentTokenStore::load_or_create(
             config.data_dir.join("enrollment_tokens.log"),
         )?);
@@ -433,7 +437,13 @@ impl App {
             admin_common_name: config.admin_common_name.clone(),
         })
             .merge(client_endpoints::router(clients.clone()))
-            .merge(content_api::router_with_limit(Arc::clone(&content_store), config.max_upload_bytes))
+            .merge(content_api::router(content_api::SyncState {
+                content: Arc::clone(&content_store),
+                resources: Arc::clone(&resources),
+                groups: Arc::clone(&groups),
+                admin_common_name: config.admin_common_name.clone(),
+                max_upload_bytes: config.max_upload_bytes,
+            }))
             .merge(admin::router(admin_state))
             .merge(discovery::router())
             .merge(contacts::router(clients.clone()))

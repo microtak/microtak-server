@@ -317,15 +317,18 @@ async fn e2e_backup_mirrors_live_server_state_to_disk() {
     let (cert, key) = enroll(&base_url, "backup-client").await;
     let client = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
     let upload_url = format!(
-        "https://{SERVER_NAME}:{}/Marti/api/sync/missionupload",
+        "https://{SERVER_NAME}:{}/Marti/sync/upload?name=backup.txt",
         marti_api_addr.port()
     );
-    client
+    let status = client
         .post(&upload_url)
+        .header(CONTENT_TYPE, "text/plain")
         .body("backed up bytes")
         .send()
         .await
-        .unwrap();
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
 
     // Give a couple of the 50ms backup ticks time to run.
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -596,98 +599,234 @@ async fn e2e_mission_roles_enforce_owner_and_subscriber_authorization() {
     assert_eq!(last_owner_delete.status(), 204);
 }
 
-/// TC-MARTI-07/08, end-to-end: upload real file bytes through the running
-/// server, get back the server's own computed hash, reference that hash in
-/// a mission's content list, then download it back and confirm the bytes
-/// are byte-for-byte identical -- the full DataSync content round trip a
-/// real ATAK client depends on, not just the content store in isolation.
-#[tokio::test]
-async fn e2e_datasync_content_upload_download_round_trip() {
+/// A running server with one ordinary enrolled device (Open mode), for the
+/// Enterprise Sync tests.
+async fn sync_client(cn: &str) -> (reqwest::Client, String, SocketAddr, String) {
     let app = App::bind(test_config()).await.unwrap();
     let enrollment_addr = app.enrollment_addr().unwrap();
     let marti_api_addr = app.marti_api_addr().unwrap();
     let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
-
-    let enrollment_base_url = format!("https://{enrollment_addr}");
-    let (cert, key) = enroll(&enrollment_base_url, "content-client").await;
+    let (cert, key) = enroll(&format!("https://{enrollment_addr}"), cn).await;
     let client = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
     let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
+    (client, base_url, enrollment_addr, ca_cert_pem)
+}
 
-    let file_bytes = b"this is a real KML file's worth of bytes";
-    let upload_response = client
-        .post(format!("{base_url}/Marti/api/sync/missionupload"))
-        .body(file_bytes.to_vec())
+/// Official MissionPackageUploadServlet + ContentServlet: ATAK uploads a
+/// data package as multipart part `assetfile`, gets back the content URL as
+/// plain text, and downloads it with the stored type and name.
+#[tokio::test]
+async fn e2e_missionupload_and_content_like_the_official_server() {
+    let (client, base_url, _, _) = sync_client("sync-alice").await;
+    let package = b"PK\x03\x04 a data package".to_vec();
+    let expected_hash = {
+        use sha2::Digest;
+        sha2::Sha256::digest(&package).iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let form = reqwest::multipart::Form::new().part(
+        "assetfile",
+        reqwest::multipart::Part::bytes(package.clone()).file_name("Recon.zip"),
+    );
+    let response = client
+        .post(format!("{base_url}/Marti/sync/missionupload?hash=ignored&filename=Recon.zip&creatorUid=ANDROID-A"))
+        .multipart(form)
         .send()
         .await
         .unwrap();
-    assert_eq!(upload_response.status(), 200);
-    let upload_body: serde_json::Value = upload_response.json().await.unwrap();
-    let hash = upload_body["hash"].as_str().unwrap().to_string();
-    assert_eq!(hash.len(), 64, "expected a SHA-256 hex hash: {hash}");
+    assert_eq!(response.status(), 200);
+    assert!(response.headers()["content-type"].to_str().unwrap().starts_with("text/plain"));
+    let url = response.text().await.unwrap();
+    assert!(
+        url.starts_with("https://") && url.ends_with(&format!("/Marti/sync/content?hash={expected_hash}")),
+        "{url}"
+    );
 
-    // TC-MARTI-07: re-uploading with a deliberately wrong claimed hash is
-    // rejected, proving the server checks the real content, not the claim.
-    let bad_upload = client
+    let download = client.get(format!("{base_url}/Marti/sync/content?hash={expected_hash}")).send().await.unwrap();
+    assert_eq!(download.status(), 200);
+    assert_eq!(download.headers()["content-type"], "application/x-zip-compressed");
+    assert_eq!(download.headers()["content-disposition"], "inline; filename=\"Recon.zip\"");
+    assert_eq!(download.headers()["api-version"], "3");
+    assert_eq!(download.bytes().await.unwrap().to_vec(), package);
+
+    // Raw body: the official servlet insists on multipart.
+    let raw = client
+        .post(format!("{base_url}/Marti/sync/missionupload?filename=x.zip&creatorUid=A"))
+        .body(b"raw".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw.status(), 400);
+    // filename is required.
+    let form = reqwest::multipart::Form::new().part("assetfile", reqwest::multipart::Part::bytes(b"x".to_vec()));
+    let missing = client.post(format!("{base_url}/Marti/sync/missionupload?creatorUid=A")).multipart(form).send().await.unwrap();
+    assert_eq!(missing.status(), 400);
+
+    // missionquery: the content URL if the hash is known, 404 if not.
+    let query = client.get(format!("{base_url}/Marti/sync/missionquery?hash={expected_hash}")).send().await.unwrap();
+    assert_eq!(query.status(), 200);
+    assert!(query.text().await.unwrap().ends_with(&format!("hash={expected_hash}")));
+    let unknown = client.get(format!("{base_url}/Marti/sync/missionquery?hash={}", "f".repeat(64))).send().await.unwrap();
+    assert_eq!(unknown.status(), 404);
+    let none = client.get(format!("{base_url}/Marti/sync/content?hash={}", "f".repeat(64))).send().await.unwrap();
+    assert_eq!(none.status(), 404);
+}
+
+/// Official UploadServlet: raw body, metadata as query parameters named like
+/// Metadata fields (case-insensitive, arrays comma-separated); the answer is
+/// the stored Metadata JSON. Unknown parameters are refused.
+#[tokio::test]
+async fn e2e_sync_upload_stores_metadata_like_the_official_server() {
+    let (client, base_url, _, _) = sync_client("sync-bob").await;
+    let response = client
         .post(format!(
-            "{base_url}/Marti/api/sync/missionupload?hash={}",
-            "0".repeat(64)
+            "{base_url}/Marti/sync/upload?name=photo.jpg&keywords=recon,photo&creatorUid=ANDROID-B&uid=MARKER-1&latitude=53.25&longitude=10.4"
         ))
-        .body(file_bytes.to_vec())
+        .header(CONTENT_TYPE, "image/jpeg")
+        .body(b"\xff\xd8\xff jpeg".to_vec())
         .send()
         .await
         .unwrap();
-    assert_eq!(bad_upload.status(), 400);
+    assert_eq!(response.status(), 200);
+    let metadata: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(metadata["UID"], "MARKER-1");
+    assert_eq!(metadata["Name"], "photo.jpg");
+    assert_eq!(metadata["MIMEType"], "image/jpeg");
+    assert_eq!(metadata["Keywords"], serde_json::json!(["recon", "photo"]));
+    assert_eq!(metadata["CreatorUid"], "ANDROID-B");
+    assert_eq!(metadata["SubmissionUser"], "sync-bob");
+    assert_eq!(metadata["Latitude"], "53.25");
+    assert_eq!(metadata["Size"], "8");
+    assert!(metadata["PrimaryKey"].as_str().unwrap().parse::<i64>().is_ok());
 
-    // Reference the real hash from a mission's content list.
-    let create_response = client
-        .put(format!("{base_url}/Marti/api/missions/Content%20Test"))
-        .json(&serde_json::json!({"creatorUid": "content-client"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(create_response.status(), 201);
+    let by_uid = client.get(format!("{base_url}/Marti/sync/content?uid=MARKER-1")).send().await.unwrap();
+    assert_eq!(by_uid.status(), 200);
 
-    let content_response = client
-        .put(format!(
-            "{base_url}/Marti/api/missions/Content%20Test/contents"
-        ))
-        .json(&serde_json::json!({"hash": hash, "filename": "recon.kml", "creatorUid": "content-client"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(content_response.status(), 200);
+    let unknown = client.post(format!("{base_url}/Marti/sync/upload?name=a&bogus=1")).body(b"x".to_vec()).send().await.unwrap();
+    assert_eq!(unknown.status(), 400);
+    let empty = client.post(format!("{base_url}/Marti/sync/upload?name=a")).body(Vec::<u8>::new()).send().await.unwrap();
+    assert_eq!(empty.status(), 400);
+}
 
-    let mission: serde_json::Value = client
-        .get(format!("{base_url}/Marti/api/missions/Content%20Test"))
+/// Official SearchServlet ({resultCount, results} of Metadata) and the REST
+/// /Marti/api/sync/search (envelope of Resource); keyword filter.
+#[tokio::test]
+async fn e2e_sync_search_both_flavours() {
+    let (client, base_url, _, _) = sync_client("sync-carol").await;
+    for (name, keywords) in [("a.zip", "missionpackage"), ("b.txt", "notes")] {
+        let status = client
+            .post(format!("{base_url}/Marti/sync/upload?name={name}&keywords={keywords}"))
+            .body(name.as_bytes().to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 200);
+    }
+    let servlet: serde_json::Value = client.get(format!("{base_url}/Marti/sync/search")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(servlet["resultCount"], 2, "{servlet}");
+    assert_eq!(servlet["results"].as_array().unwrap().len(), 2);
+    assert!(servlet["results"][0]["Hash"].is_string());
+
+    let filtered: serde_json::Value = client
+        .get(format!("{base_url}/Marti/sync/search?keywords=missionpackage"))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(mission["contents"][0]["hash"], hash);
+    assert_eq!(filtered["resultCount"], 1, "{filtered}");
+    assert_eq!(filtered["results"][0]["Name"], "a.zip");
 
-    // Download the exact bytes back by that same hash.
-    let download_response = client
-        .get(format!("{base_url}/Marti/api/sync/content?hash={hash}"))
+    let rest: serde_json::Value = client
+        .get(format!("{base_url}/Marti/api/sync/search?keyword=notes"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rest["version"], "3");
+    assert_eq!(rest["type"], "Resource");
+    let data = rest["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1, "{rest}");
+    assert_eq!(data[0]["name"], "b.txt");
+    assert!(data[0]["submissionTime"].as_str().unwrap().ends_with('Z'));
+}
+
+/// Files are visible only within their groups; delete by hash (official
+/// DeleteServlet) removes metadata and content.
+#[tokio::test]
+async fn e2e_sync_visibility_and_delete() {
+    let config = AppConfig {
+        admin_common_name: Some("admin".to_string()),
+        ..test_config()
+    };
+    let app = App::bind(config).await.unwrap();
+    let groups = app.groups.clone();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    tokio::spawn(app.run());
+    groups.create("Red", None, 0).unwrap();
+    groups.create("Blue", None, 0).unwrap();
+    groups.set_member("Red", "red-user", Some(microtak_server::groups::Membership::Both)).unwrap();
+    groups.set_member("Blue", "blue-user", Some(microtak_server::groups::Membership::Both)).unwrap();
+    let url = format!("https://{enrollment_addr}");
+    let (red_cert, red_key) = enroll(&url, "red-user").await;
+    let (blue_cert, blue_key) = enroll(&url, "blue-user").await;
+    let red = mtls_reqwest_client(&ca_cert_pem, &red_cert, red_key, marti_api_addr);
+    let blue = mtls_reqwest_client(&ca_cert_pem, &blue_cert, blue_key, marti_api_addr);
+    let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
+
+    let body: serde_json::Value = serde_json::from_str(
+        &red.post(format!("{base_url}/Marti/sync/upload?name=red.txt")).body(b"red secret".to_vec()).send().await.unwrap().text().await.unwrap(),
+    )
+    .unwrap();
+    let hash = body["Hash"].as_str().unwrap().to_string();
+
+    let blue_view = blue.get(format!("{base_url}/Marti/sync/content?hash={hash}")).send().await.unwrap();
+    assert_eq!(blue_view.status(), 404, "Blue can't see Red's file");
+    let blue_search: serde_json::Value = blue.get(format!("{base_url}/Marti/sync/search")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(blue_search["resultCount"], 0);
+    assert_eq!(red.get(format!("{base_url}/Marti/sync/content?hash={hash}")).send().await.unwrap().status(), 200);
+
+    let delete = red.delete(format!("{base_url}/Marti/sync/delete?Hash={hash}")).send().await.unwrap();
+    assert_eq!(delete.status(), 200);
+    assert!(delete.text().await.unwrap().contains("Deleted 1 resource(s)."));
+    assert_eq!(red.get(format!("{base_url}/Marti/sync/content?hash={hash}")).send().await.unwrap().status(), 404);
+}
+
+/// Official MissionApi /resources/{hash} (admin only) and MetadataApi
+/// keywords update.
+#[tokio::test]
+async fn e2e_resources_and_metadata_keywords() {
+    let server = start_with_admin().await;
+    let response = server
+        .admin
+        .post(format!("{}/Marti/sync/upload?name=k.txt&keywords=old", server.api_url))
+        .body(b"keyword file".to_vec())
         .send()
         .await
         .unwrap();
-    assert_eq!(download_response.status(), 200);
-    let downloaded = download_response.bytes().await.unwrap();
-    assert_eq!(&downloaded[..], &file_bytes[..]);
+    let metadata: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    let hash = metadata["Hash"].as_str().unwrap().to_string();
 
-    // A hash nothing was ever uploaded under is a clean 404.
-    let missing_response = client
-        .get(format!(
-            "{base_url}/Marti/api/sync/content?hash={}",
-            "f".repeat(64)
-        ))
+    let response = server
+        .admin
+        .put(format!("{}/Marti/api/sync/metadata/{hash}/keywords", server.api_url))
+        .json(&serde_json::json!(["new", "two"]))
         .send()
         .await
         .unwrap();
-    assert_eq!(missing_response.status(), 404);
+    assert_eq!(response.status(), 200);
+
+    let (status, resources) = server.admin_get(&format!("/Marti/api/resources/{hash}")).await;
+    assert_eq!(status, 200);
+    assert_envelope(&resources, "Resource");
+    assert_eq!(resources["data"][0]["keywords"], serde_json::json!(["new", "two"]));
+    assert_eq!(resources["data"][0]["hash"], hash.as_str());
 }
 
 /// TC-MARTI-10's residual gap, closed and verified end-to-end: a real,
@@ -1804,9 +1943,9 @@ async fn e2e_metrics_report_what_the_server_holds() {
     let client = mtls_reqwest_client(&ca_cert_pem, &cert, api_key, marti_api_addr);
     let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
     let png = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0u8; 64]].concat();
-    for body in [png, b"plain text, not a picture".to_vec()] {
+    for (name, body) in [("photo.png", png), ("notes.txt", b"plain text, not a picture".to_vec())] {
         let status = client
-            .post(format!("{base_url}/Marti/api/sync/missionupload"))
+            .post(format!("{base_url}/Marti/sync/upload?name={name}"))
             .body(body)
             .send()
             .await

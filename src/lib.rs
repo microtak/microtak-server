@@ -24,6 +24,7 @@ pub mod missions;
 pub mod pki;
 pub mod ratelimit;
 pub mod servernames;
+pub mod sync;
 pub mod registry;
 pub mod transport;
 pub mod users;
