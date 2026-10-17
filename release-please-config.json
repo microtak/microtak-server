@@ -9,7 +9,16 @@
   "packages": {
     ".": {
       "extra-files": [
-        "charts/microtak-server/Chart.yaml"
+        {
+          "type": "yaml",
+          "path": "charts/microtak-server/Chart.yaml",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "yaml",
+          "path": "charts/microtak-server/Chart.yaml",
+          "jsonpath": "$.appVersion"
+        }
       ]
     }
   },
