@@ -38,7 +38,7 @@ use super::admission::Admission;
 use super::hub::{Outbound, RelayHub};
 use super::identity::{self, Verdict};
 use crate::groups::{Direction, GroupStore};
-use crate::registry::DeviceRegistry;
+use crate::registry::{Access, DeviceRegistry};
 
 /// Build a server TLS config that requires a client certificate signed by
 /// `ca_cert_der`, presenting `server_cert_chain`/`server_key` as this
@@ -194,6 +194,7 @@ impl TlsRelay {
                         }
                     };
 
+                let peer_cert = peer_cert_der(&tls_stream);
                 let Some(cn) = peer_common_name(&tls_stream) else {
                     warn!(%peer, "client cert has no extractable Common Name, disconnecting");
                     // Send a proper TLS close_notify rather than an abrupt
@@ -204,17 +205,29 @@ impl TlsRelay {
                     return;
                 };
 
-                if registry.is_revoked(&cn) {
-                    warn!(%peer, cn, "rejecting connection from revoked device");
+                let access = registry.access(&cn, &peer_cert);
+                if access != Access::Allowed {
+                    warn!(%peer, cn, ?access, "rejecting connection: certificate revoked or identity blocked");
                     let _ = tls_stream.shutdown().await;
                     return;
                 }
 
                 info!(%peer, cn, "mTLS client connected");
-                handle_client(tls_stream, peer, cn, tx, rx, registry, clients, groups).await;
+                handle_client(tls_stream, peer, cn, peer_cert, tx, rx, registry, clients, groups).await;
             });
         }
     }
+}
+
+/// The DER bytes of the client's leaf certificate (empty if none, which the
+/// verifier doesn't let through).
+fn peer_cert_der(stream: &TlsStream<TcpStream>) -> Vec<u8> {
+    let (_, connection) = stream.get_ref();
+    connection
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(|cert| cert.as_ref().to_vec())
+        .unwrap_or_default()
 }
 
 fn peer_common_name(stream: &TlsStream<TcpStream>) -> Option<String> {
@@ -225,12 +238,13 @@ fn peer_common_name(stream: &TlsStream<TcpStream>) -> Option<String> {
 }
 
 // One connection's whole context; bundling it into a struct would only
-// move the same eight fields around.
+// move the same nine fields around.
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
     stream: TlsStream<TcpStream>,
     peer: SocketAddr,
     cn: String,
+    peer_cert: Vec<u8>,
     tx: broadcast::Sender<Outbound>,
     mut rx: broadcast::Receiver<Outbound>,
     registry: Arc<DeviceRegistry>,
@@ -254,9 +268,20 @@ async fn handle_client(
     let mut decoder = StreamDecoder::new();
     let mut read_buf = [0u8; 4096];
     let (mut reader, mut writer) = split(stream);
+    let mut revocations = registry.revocations();
 
     loop {
         tokio::select! {
+            // Revoking this certificate or blocking this identity cuts the
+            // live session, not just future connections.
+            Ok(()) = revocations.changed() => {
+                let access = registry.access(&cn, &peer_cert);
+                if access != Access::Allowed {
+                    warn!(%peer, cn, ?access, "certificate revoked or identity blocked, disconnecting client");
+                    let _ = writer.shutdown().await;
+                    return;
+                }
+            }
             read_result = reader.read(&mut read_buf) => {
                 let n = match read_result {
                     Ok(0) => {

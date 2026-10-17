@@ -402,7 +402,8 @@ impl App {
         let marti_api =
             MtlsHttpServer::bind(config.marti_api_addr, Arc::clone(&tls_server_config), marti_router)
                 .await?
-                .with_admission(admission.clone());
+                .with_admission(admission.clone())
+                .with_registry(Arc::clone(&registry));
         let tcp = if config.plain_tcp_enabled {
             Some(
                 TcpRelay::bind(config.plain_tcp_addr, hub.clone(), clients.clone())

@@ -1551,3 +1551,295 @@ async fn e2e_groups_decide_who_receives_what() {
     say(&mut streams, "red-1").await;
     assert!(heard(&mut streams, "red-2", "red-1").await, "Red still on");
 }
+
+// ---------------------------------------------------------------------
+// Revocation: certificates (lost devices) and identity blocks
+// ---------------------------------------------------------------------
+
+/// A running server with its admin enrolled via the bootstrap token.
+struct Running {
+    ca_cert_pem: String,
+    enrollment_url: String,
+    api_url: String,
+    marti_api_addr: SocketAddr,
+    mtls_addr: SocketAddr,
+    admin: reqwest::Client,
+}
+
+async fn start_with_admin() -> Running {
+    let config = AppConfig {
+        admin_common_name: Some("admin".to_string()),
+        enrollment_mode: AppConfig::default().enrollment_mode,
+        ..test_config()
+    };
+    let app = App::bind(config).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let mtls_addr = app.mtls_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    let token = std::fs::read_to_string(app.bootstrap_token_path().unwrap())
+        .unwrap()
+        .trim()
+        .to_string();
+    tokio::spawn(app.run());
+
+    let enrollment_url = format!("https://{enrollment_addr}");
+    let (csr, admin_key) = pki::build_csr("admin").unwrap();
+    let response = enrollment_client()
+        .post(format!("{enrollment_url}/Marti/api/tls/signClient/v2?token={token}"))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(csr)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let admin_cert = wrap_pem(body["signedCert"].as_str().unwrap());
+    Running {
+        admin: mtls_reqwest_client(&ca_cert_pem, &admin_cert, admin_key, marti_api_addr),
+        ca_cert_pem,
+        enrollment_url,
+        api_url: format!("https://{SERVER_NAME}:{}", marti_api_addr.port()),
+        marti_api_addr,
+        mtls_addr,
+    }
+}
+
+impl Running {
+    /// Mint a password account `username` and return its password.
+    async fn mint_user(&self, username: &str) -> String {
+        let response = self
+            .admin
+            .post(format!("{}/Marti/api/admin/users", self.api_url))
+            .json(&serde_json::json!({ "username": username }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let body: serde_json::Value = response.json().await.unwrap();
+        body["password"].as_str().unwrap().to_string()
+    }
+
+    /// Enroll (or re-enroll) `cn` with its password account. Returns the
+    /// status and, on success, the certificate + key.
+    async fn enroll_with_password(&self, cn: &str, password: &str) -> (u16, Option<(String, rcgen::KeyPair)>) {
+        let (csr, key) = pki::build_csr(cn).unwrap();
+        let response = enrollment_client()
+            .post(format!("{}/Marti/api/tls/signClient/v2", self.enrollment_url))
+            .basic_auth(cn, Some(password))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(csr)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        if status != 200 {
+            return (status, None);
+        }
+        let body: serde_json::Value = response.json().await.unwrap();
+        (status, Some((wrap_pem(body["signedCert"].as_str().unwrap()), key)))
+    }
+
+    fn client(&self, cert: &str, key: &rcgen::KeyPair) -> reqwest::Client {
+        let key = rcgen::KeyPair::from_pem(&key.serialize_pem()).unwrap();
+        mtls_reqwest_client(&self.ca_cert_pem, cert, key, self.marti_api_addr)
+    }
+
+    /// Whether `client` can still use the Marti API (a fresh connection).
+    async fn api_works(&self, cert: &str, key: &rcgen::KeyPair) -> bool {
+        match self
+            .client(cert, key)
+            .get(format!("{}/Marti/api/version", self.api_url))
+            .send()
+            .await
+        {
+            Ok(response) => response.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
+    async fn stream(&self, cert: &str, key: &rcgen::KeyPair) -> TlsStream<TcpStream> {
+        let key = rcgen::KeyPair::from_pem(&key.serialize_pem()).unwrap();
+        connect_mtls(self.mtls_addr, &self.ca_cert_pem, cert, key).await.unwrap()
+    }
+}
+
+/// The server closes `stream` (EOF or error) within `wait`.
+async fn closed_within(stream: &mut TlsStream<TcpStream>, wait: Duration) -> bool {
+    let mut buf = vec![0u8; 8192];
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match timeout(remaining, stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return true,
+            Ok(Ok(_)) => continue,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// A lost phone: the admin revokes its certificate. The live CoT session is
+/// cut, the old certificate no longer works anywhere, and the owner
+/// enrolls a new phone under the same identity with their account.
+#[tokio::test]
+async fn e2e_revoking_a_certificate_cuts_the_device_off_and_it_re_enrolls() {
+    let server = start_with_admin().await;
+    let password = server.mint_user("alice").await;
+    let (status, enrolled) = server.enroll_with_password("alice", &password).await;
+    assert_eq!(status, 200);
+    let (old_cert, old_key) = enrolled.unwrap();
+    assert!(server.api_works(&old_cert, &old_key).await);
+    let mut live = server.stream(&old_cert, &old_key).await;
+    live.write_all(event_xml("ALICE-UID").as_bytes()).await.unwrap();
+
+    let response = server
+        .admin
+        .post(format!("{}/Marti/api/admin/devices/alice/revokeCertificate", server.api_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["fingerprint"].as_str().unwrap(),
+        pki::fingerprint_sha256_colon_hex(&old_cert).unwrap()
+    );
+
+    assert!(closed_within(&mut live, Duration::from_secs(2)).await, "the live CoT session is cut");
+    assert!(!server.api_works(&old_cert, &old_key).await, "the revoked cert can't use the API");
+    let mut again = server.stream(&old_cert, &old_key).await;
+    assert!(closed_within(&mut again, Duration::from_secs(2)).await, "nor open a new CoT session");
+
+    let (status, enrolled) = server.enroll_with_password("alice", &password).await;
+    assert_eq!(status, 200, "the identity itself isn't blocked");
+    let (new_cert, new_key) = enrolled.unwrap();
+    assert!(server.api_works(&new_cert, &new_key).await, "the new certificate works");
+    assert!(!server.api_works(&old_cert, &old_key).await, "the old one stays revoked");
+}
+
+/// Blocking an identity locks it out entirely -- current certificate,
+/// live session, re-enrollment -- until the admin unblocks it.
+#[tokio::test]
+async fn e2e_blocking_an_identity_locks_it_out_until_unblocked() {
+    let server = start_with_admin().await;
+    let password = server.mint_user("bob").await;
+    let (cert, key) = server.enroll_with_password("bob", &password).await.1.unwrap();
+    let mut live = server.stream(&cert, &key).await;
+
+    let block = server
+        .admin
+        .put(format!("{}/Marti/api/admin/devices/bob/block", server.api_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(block.status(), 204);
+    assert!(closed_within(&mut live, Duration::from_secs(2)).await);
+    assert!(!server.api_works(&cert, &key).await);
+    let (status, _) = server.enroll_with_password("bob", &password).await;
+    assert_eq!(status, 403, "a blocked identity can't get a new certificate");
+
+    let unblock = server
+        .admin
+        .delete(format!("{}/Marti/api/admin/devices/bob/block", server.api_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unblock.status(), 204);
+    assert!(server.api_works(&cert, &key).await, "unblocked: the certificate works again");
+}
+
+/// The device list shows what the admin needs to decide, and only the
+/// admin may see or change it.
+#[tokio::test]
+async fn e2e_device_admin_api_lists_devices_and_is_admin_only() {
+    let server = start_with_admin().await;
+    let password = server.mint_user("carol").await;
+    let (cert, key) = server.enroll_with_password("carol", &password).await.1.unwrap();
+
+    let carol = server.client(&cert, &key);
+    for request in [
+        carol.get(format!("{}/Marti/api/admin/devices", server.api_url)),
+        carol.post(format!("{}/Marti/api/admin/devices/carol/revokeCertificate", server.api_url)),
+        carol.put(format!("{}/Marti/api/admin/devices/carol/block", server.api_url)),
+    ] {
+        assert_eq!(request.send().await.unwrap().status(), 403);
+    }
+
+    let devices: serde_json::Value = server
+        .admin
+        .get(format!("{}/Marti/api/admin/devices", server.api_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = devices
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["commonName"] == "carol")
+        .expect("carol is listed");
+    assert_eq!(entry["blocked"], false);
+    assert_eq!(entry["certificateRevoked"], false);
+    assert_eq!(
+        entry["certificateFingerprint"].as_str().unwrap(),
+        pki::fingerprint_sha256_colon_hex(&cert).unwrap()
+    );
+
+    let missing = server
+        .admin
+        .put(format!("{}/Marti/api/admin/devices/nobody/block", server.api_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+}
+
+/// The official TAK Server's certificate-admin revoke, by fingerprint.
+#[tokio::test]
+async fn e2e_certadmin_revoke_by_hash() {
+    let server = start_with_admin().await;
+    let password = server.mint_user("dave").await;
+    let (cert, key) = server.enroll_with_password("dave", &password).await.1.unwrap();
+    let hash = pki::fingerprint_sha256_colon_hex(&cert).unwrap();
+
+    let response = server
+        .admin
+        .delete(format!("{}/Marti/api/certadmin/cert/revoke/{hash}", server.api_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(!server.api_works(&cert, &key).await);
+
+    let lookup: serde_json::Value = server
+        .admin
+        .get(format!("{}/Marti/api/certadmin/cert/{hash}", server.api_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(lookup["data"]["revocationDate"].is_string(), "{lookup}");
+}
+
+/// Revoking a password account also revokes the certificate issued to it --
+/// before, the account couldn't log in any more but its device kept full
+/// access for the certificate's lifetime.
+#[tokio::test]
+async fn e2e_revoking_a_user_account_revokes_its_certificate() {
+    let server = start_with_admin().await;
+    let password = server.mint_user("erin").await;
+    let (cert, key) = server.enroll_with_password("erin", &password).await.1.unwrap();
+
+    let response = server
+        .admin
+        .delete(format!("{}/Marti/api/admin/users/erin", server.api_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    assert!(!server.api_works(&cert, &key).await);
+}

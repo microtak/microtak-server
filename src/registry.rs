@@ -15,7 +15,7 @@
 //! TC-TLS-04 (rejecting a connection that claims a `uid` belonging to a
 //! different, already-enrolled device).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::RwLock;
 
@@ -40,6 +40,10 @@ pub enum RegistryError {
         existing: String,
         claimed: String,
     },
+    #[error("'{0}' is not a SHA-256 certificate fingerprint")]
+    InvalidFingerprint(String),
+    #[error("device '{0}' has no readable certificate on record")]
+    NoCertificate(String),
     #[error("event log error: {0}")]
     EventLog(#[from] EventLogError),
 }
@@ -74,11 +78,41 @@ enum RegistryEvent {
         common_name: String,
         uid: String,
     },
+    /// One certificate (by SHA-256 fingerprint) is revoked for good, e.g. a
+    /// lost device's. The identity stays usable with a new certificate.
+    CertRevoked {
+        fingerprint: String,
+    },
+    /// Lifts a `Revoked` (identity block). Revoked certificates stay revoked.
+    Unblocked {
+        common_name: String,
+    },
+}
+
+/// Whether a connecting certificate may be used -- see
+/// [`DeviceRegistry::access`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Allowed,
+    /// The identity is blocked (any certificate).
+    Blocked,
+    /// This particular certificate is revoked.
+    CertRevoked,
+}
+
+#[derive(Debug, Default)]
+struct RegistryState {
+    devices: HashMap<String, DeviceRecord>,
+    /// Revoked certificate fingerprints (uppercase colon hex).
+    revoked_certs: HashSet<String>,
 }
 
 pub struct DeviceRegistry {
-    devices: RwLock<HashMap<String, DeviceRecord>>,
+    state: RwLock<RegistryState>,
     log: Option<EventLog<RegistryEvent>>,
+    /// Bumped on every revocation, block or unblock, so live connections
+    /// re-check their access -- see [`Self::revocations`].
+    revocations: tokio::sync::watch::Sender<u64>,
 }
 
 impl DeviceRegistry {
@@ -86,8 +120,9 @@ impl DeviceRegistry {
     /// stateless run.
     pub fn in_memory() -> Self {
         Self {
-            devices: RwLock::new(HashMap::new()),
+            state: RwLock::new(RegistryState::default()),
             log: None,
+            revocations: tokio::sync::watch::Sender::new(0),
         }
     }
 
@@ -95,11 +130,12 @@ impl DeviceRegistry {
     /// or start empty if the file doesn't exist yet. Every subsequent
     /// mutation appends to this same log.
     pub fn load_or_create(path: impl Into<PathBuf>) -> Result<Self, RegistryError> {
-        let mut devices = HashMap::new();
-        let log = EventLog::open_and_replay(path, &mut devices, apply_event)?;
+        let mut state = RegistryState::default();
+        let log = EventLog::open_and_replay(path, &mut state, apply_event)?;
         Ok(Self {
-            devices: RwLock::new(devices),
+            state: RwLock::new(state),
             log: Some(log),
+            revocations: tokio::sync::watch::Sender::new(0),
         })
     }
 
@@ -116,7 +152,7 @@ impl DeviceRegistry {
         cert_pem: &str,
         now_unix: i64,
     ) -> Result<DeviceRecord, RegistryError> {
-        let mut devices = self.devices.write().unwrap();
+        let mut state = self.state.write().unwrap();
         let event = RegistryEvent::Enrolled {
             common_name: common_name.to_string(),
             cert_pem: cert_pem.to_string(),
@@ -125,8 +161,8 @@ impl DeviceRegistry {
         if let Some(log) = &self.log {
             log.append(&event)?;
         }
-        apply_event(&mut devices, &event);
-        Ok(devices.get(common_name).unwrap().clone())
+        apply_event(&mut state, &event);
+        Ok(state.devices.get(common_name).unwrap().clone())
     }
 
     /// Enroll a *new* device, failing with
@@ -142,8 +178,8 @@ impl DeviceRegistry {
         cert_pem: &str,
         now_unix: i64,
     ) -> Result<DeviceRecord, RegistryError> {
-        let mut devices = self.devices.write().unwrap();
-        if devices.contains_key(common_name) {
+        let mut state = self.state.write().unwrap();
+        if state.devices.contains_key(common_name) {
             return Err(RegistryError::AlreadyEnrolled(common_name.to_string()));
         }
         let event = RegistryEvent::Enrolled {
@@ -154,22 +190,23 @@ impl DeviceRegistry {
         if let Some(log) = &self.log {
             log.append(&event)?;
         }
-        apply_event(&mut devices, &event);
-        Ok(devices.get(common_name).unwrap().clone())
+        apply_event(&mut state, &event);
+        Ok(state.devices.get(common_name).unwrap().clone())
     }
 
     /// The common name of the device that has bound `uid`, if any.
     pub fn owner_of_uid(&self, uid: &str) -> Option<String> {
-        self.devices
+        self.state
             .read()
             .unwrap()
+            .devices
             .values()
             .find(|d| d.uid.as_deref() == Some(uid))
             .map(|d| d.common_name.clone())
     }
 
     pub fn find(&self, common_name: &str) -> Option<DeviceRecord> {
-        self.devices.read().unwrap().get(common_name).cloned()
+        self.state.read().unwrap().devices.get(common_name).cloned()
     }
 
     /// Every enrolled device, in no particular order. Used by
@@ -177,21 +214,25 @@ impl DeviceRegistry {
     /// a matching cert fingerprint -- fine at this project's scale (see
     /// this module's own doc comment).
     pub fn all(&self) -> Vec<DeviceRecord> {
-        self.devices.read().unwrap().values().cloned().collect()
+        self.state.read().unwrap().devices.values().cloned().collect()
     }
 
     pub fn is_revoked(&self, common_name: &str) -> bool {
-        self.devices
+        self.state
             .read()
             .unwrap()
+            .devices
             .get(common_name)
             .map(|d| d.revoked)
             .unwrap_or(false)
     }
 
+    /// Block an identity: every certificate it holds or gets is refused
+    /// until [`Self::unblock`]. (For a lost device, revoke just its
+    /// certificate instead: [`Self::revoke_current_cert`].)
     pub fn revoke(&self, common_name: &str) -> Result<(), RegistryError> {
-        let mut devices = self.devices.write().unwrap();
-        if !devices.contains_key(common_name) {
+        let mut state = self.state.write().unwrap();
+        if !state.devices.contains_key(common_name) {
             return Err(RegistryError::NotFound(common_name.to_string()));
         }
         let event = RegistryEvent::Revoked {
@@ -200,8 +241,93 @@ impl DeviceRegistry {
         if let Some(log) = &self.log {
             log.append(&event)?;
         }
-        apply_event(&mut devices, &event);
+        apply_event(&mut state, &event);
+        drop(state);
+        self.signal_revocation();
         Ok(())
+    }
+
+    /// Whether `common_name` presenting the certificate `cert_der` may
+    /// connect or call the API: not if the identity is blocked, or this
+    /// certificate is revoked. Checked at every connection and request.
+    pub fn access(&self, common_name: &str, cert_der: &[u8]) -> Access {
+        let state = self.state.read().unwrap();
+        if state.devices.get(common_name).is_some_and(|d| d.revoked) {
+            return Access::Blocked;
+        }
+        let fingerprint = crate::pki::fingerprint_sha256_colon_hex_der(cert_der);
+        if state.revoked_certs.contains(&fingerprint) {
+            return Access::CertRevoked;
+        }
+        Access::Allowed
+    }
+
+    /// Whether the certificate with this fingerprint (any format accepted by
+    /// [`crate::pki::normalize_fingerprint`]) is revoked.
+    pub fn is_cert_revoked(&self, fingerprint: &str) -> bool {
+        crate::pki::normalize_fingerprint(fingerprint)
+            .is_some_and(|fp| self.state.read().unwrap().revoked_certs.contains(&fp))
+    }
+
+    /// Revoke one certificate by SHA-256 fingerprint -- the official
+    /// `certadmin` revoke. Idempotent.
+    pub fn revoke_cert(&self, fingerprint: &str) -> Result<(), RegistryError> {
+        let fingerprint = crate::pki::normalize_fingerprint(fingerprint)
+            .ok_or_else(|| RegistryError::InvalidFingerprint(fingerprint.to_string()))?;
+        let mut state = self.state.write().unwrap();
+        if !state.revoked_certs.contains(&fingerprint) {
+            let event = RegistryEvent::CertRevoked { fingerprint };
+            if let Some(log) = &self.log {
+                log.append(&event)?;
+            }
+            apply_event(&mut state, &event);
+        }
+        drop(state);
+        self.signal_revocation();
+        Ok(())
+    }
+
+    /// Revoke the certificate `common_name` currently holds (a lost or
+    /// compromised device). Returns its fingerprint. The identity can
+    /// enroll a new certificate with its credentials.
+    pub fn revoke_current_cert(&self, common_name: &str) -> Result<String, RegistryError> {
+        let cert_pem = self
+            .find(common_name)
+            .ok_or_else(|| RegistryError::NotFound(common_name.to_string()))?
+            .cert_pem;
+        let fingerprint = crate::pki::fingerprint_sha256_colon_hex(&cert_pem)
+            .ok_or_else(|| RegistryError::NoCertificate(common_name.to_string()))?;
+        self.revoke_cert(&fingerprint)?;
+        Ok(fingerprint)
+    }
+
+    /// Lift an identity block ([`Self::revoke`]). Certificates revoked
+    /// individually stay revoked.
+    pub fn unblock(&self, common_name: &str) -> Result<(), RegistryError> {
+        let mut state = self.state.write().unwrap();
+        if !state.devices.contains_key(common_name) {
+            return Err(RegistryError::NotFound(common_name.to_string()));
+        }
+        let event = RegistryEvent::Unblocked {
+            common_name: common_name.to_string(),
+        };
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply_event(&mut state, &event);
+        drop(state);
+        self.signal_revocation();
+        Ok(())
+    }
+
+    /// Changes whenever a certificate is revoked or an identity blocked or
+    /// unblocked; connections watch it and re-check [`Self::access`].
+    pub fn revocations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revocations.subscribe()
+    }
+
+    fn signal_revocation(&self) {
+        self.revocations.send_modify(|generation| *generation += 1);
     }
 
     /// Bind `uid` to `common_name`, enforcing TC-TLS-04: a `uid` already
@@ -218,9 +344,10 @@ impl DeviceRegistry {
     /// app reinstall); revoking and re-enrolling is the escape hatch for
     /// that case.
     pub fn bind_uid(&self, common_name: &str, uid: &str) -> Result<(), RegistryError> {
-        let mut devices = self.devices.write().unwrap();
+        let mut state = self.state.write().unwrap();
 
-        if let Some(owner) = devices
+        if let Some(owner) = state
+            .devices
             .values()
             .find(|d| d.uid.as_deref() == Some(uid) && d.common_name != common_name)
         {
@@ -230,7 +357,8 @@ impl DeviceRegistry {
             });
         }
 
-        let device = devices
+        let device = state
+            .devices
             .get(common_name)
             .ok_or_else(|| RegistryError::NotFound(common_name.to_string()))?;
 
@@ -253,7 +381,7 @@ impl DeviceRegistry {
         if let Some(log) = &self.log {
             log.append(&event)?;
         }
-        apply_event(&mut devices, &event);
+        apply_event(&mut state, &event);
         Ok(())
     }
 }
@@ -261,7 +389,8 @@ impl DeviceRegistry {
 /// The reducer: apply one durable event to in-memory state. Used both for
 /// live mutations and for replaying the log on startup — one
 /// implementation of "what does this event mean," not two.
-fn apply_event(devices: &mut HashMap<String, DeviceRecord>, event: &RegistryEvent) {
+fn apply_event(state: &mut RegistryState, event: &RegistryEvent) {
+    let devices = &mut state.devices;
     match event {
         RegistryEvent::Enrolled {
             common_name,
@@ -290,6 +419,14 @@ fn apply_event(devices: &mut HashMap<String, DeviceRecord>, event: &RegistryEven
         RegistryEvent::UidBound { common_name, uid } => {
             if let Some(device) = devices.get_mut(common_name) {
                 device.uid = Some(uid.clone());
+            }
+        }
+        RegistryEvent::CertRevoked { fingerprint } => {
+            state.revoked_certs.insert(fingerprint.clone());
+        }
+        RegistryEvent::Unblocked { common_name } => {
+            if let Some(device) = devices.get_mut(common_name) {
+                device.revoked = false;
             }
         }
     }
@@ -445,6 +582,129 @@ mod tests {
         let path = dir.join("does-not-exist.log");
         let registry = DeviceRegistry::load_or_create(&path).unwrap();
         assert!(registry.find("anything").is_none());
+    }
+
+    /// A real CA-issued certificate for `cn`: (PEM, DER) -- revocation by
+    /// certificate needs real fingerprints.
+    fn issue(ca: &crate::pki::CertificateAuthority, cn: &str) -> (String, Vec<u8>) {
+        let (csr, _key) = crate::pki::build_csr(cn).unwrap();
+        let signed = ca.sign_csr(&csr, time::Duration::days(1)).unwrap();
+        let der = crate::pki::cert_pem_to_der(&signed.cert_pem).unwrap().as_ref().to_vec();
+        (signed.cert_pem, der)
+    }
+
+    fn test_ca() -> crate::pki::CertificateAuthority {
+        crate::pki::CertificateAuthority::generate("Registry Test CA").unwrap()
+    }
+
+    /// A lost phone: its certificate stops working, but the identity can
+    /// enroll a new certificate (e.g. via its password account) and use it.
+    #[test]
+    fn revoking_a_certificate_rejects_only_that_certificate() {
+        let ca = test_ca();
+        let registry = DeviceRegistry::in_memory();
+        let (old_pem, old_der) = issue(&ca, "alice");
+        registry.enroll("alice", &old_pem, 1).unwrap();
+        assert_eq!(registry.access("alice", &old_der), Access::Allowed);
+
+        registry.revoke_current_cert("alice").unwrap();
+        assert_eq!(registry.access("alice", &old_der), Access::CertRevoked);
+        assert!(!registry.is_revoked("alice"), "the identity itself is not blocked");
+
+        let (new_pem, new_der) = issue(&ca, "alice");
+        registry.enroll("alice", &new_pem, 2).unwrap();
+        assert_eq!(registry.access("alice", &new_der), Access::Allowed);
+        assert_eq!(registry.access("alice", &old_der), Access::CertRevoked);
+    }
+
+    /// Blocking locks the identity out whatever certificate it presents,
+    /// until it's explicitly unblocked.
+    #[test]
+    fn blocking_rejects_every_certificate_until_unblocked() {
+        let ca = test_ca();
+        let registry = DeviceRegistry::in_memory();
+        let (pem, der) = issue(&ca, "bob");
+        registry.enroll("bob", &pem, 1).unwrap();
+
+        registry.revoke("bob").unwrap();
+        assert_eq!(registry.access("bob", &der), Access::Blocked);
+
+        registry.unblock("bob").unwrap();
+        assert_eq!(registry.access("bob", &der), Access::Allowed);
+        assert!(!registry.is_revoked("bob"));
+    }
+
+    #[test]
+    fn unblocking_does_not_revive_a_revoked_certificate() {
+        let ca = test_ca();
+        let registry = DeviceRegistry::in_memory();
+        let (pem, der) = issue(&ca, "carol");
+        registry.enroll("carol", &pem, 1).unwrap();
+        registry.revoke_current_cert("carol").unwrap();
+        registry.revoke("carol").unwrap();
+        registry.unblock("carol").unwrap();
+        assert_eq!(registry.access("carol", &der), Access::CertRevoked);
+    }
+
+    #[test]
+    fn revoking_by_fingerprint_matches_the_certadmin_hash_format() {
+        let ca = test_ca();
+        let registry = DeviceRegistry::in_memory();
+        let (pem, der) = issue(&ca, "dave");
+        registry.enroll("dave", &pem, 1).unwrap();
+        let hash = crate::pki::fingerprint_sha256_colon_hex(&pem).unwrap();
+        registry.revoke_cert(&hash.to_lowercase()).unwrap();
+        assert_eq!(registry.access("dave", &der), Access::CertRevoked);
+        assert!(registry.is_cert_revoked(&hash));
+    }
+
+    #[test]
+    fn unblocking_or_revoking_the_cert_of_an_unknown_device_errors() {
+        let registry = DeviceRegistry::in_memory();
+        assert!(matches!(registry.unblock("nobody"), Err(RegistryError::NotFound(_))));
+        assert!(matches!(registry.revoke_current_cert("nobody"), Err(RegistryError::NotFound(_))));
+    }
+
+    /// Live connections re-check their access when this changes.
+    #[test]
+    fn revocations_are_signalled() {
+        let ca = test_ca();
+        let registry = DeviceRegistry::in_memory();
+        let (pem, _) = issue(&ca, "erin");
+        registry.enroll("erin", &pem, 1).unwrap();
+        let mut changes = registry.revocations();
+        changes.mark_unchanged();
+
+        registry.revoke_current_cert("erin").unwrap();
+        assert!(changes.has_changed().unwrap());
+        changes.mark_unchanged();
+        registry.revoke("erin").unwrap();
+        assert!(changes.has_changed().unwrap());
+        changes.mark_unchanged();
+        registry.unblock("erin").unwrap();
+        assert!(changes.has_changed().unwrap());
+    }
+
+    #[test]
+    fn certificate_revocations_and_unblocks_survive_a_reload() {
+        let ca = test_ca();
+        let dir = std::env::temp_dir().join(format!("microtak-registry-revoke-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("devices.log");
+        let (pem_a, der_a) = issue(&ca, "frank");
+        let (pem_b, der_b) = issue(&ca, "grace");
+        {
+            let registry = DeviceRegistry::load_or_create(&path).unwrap();
+            registry.enroll("frank", &pem_a, 1).unwrap();
+            registry.enroll("grace", &pem_b, 1).unwrap();
+            registry.revoke_current_cert("frank").unwrap();
+            registry.revoke("grace").unwrap();
+            registry.unblock("grace").unwrap();
+        }
+        let replayed = DeviceRegistry::load_or_create(&path).unwrap();
+        assert_eq!(replayed.access("frank", &der_a), Access::CertRevoked);
+        assert_eq!(replayed.access("grace", &der_b), Access::Allowed);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The whole point: replaying the log reproduces identical state,

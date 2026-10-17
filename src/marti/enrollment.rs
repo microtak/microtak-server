@@ -287,6 +287,11 @@ async fn sign_client_v2(
             if let Some(missing) = state.groups.first_missing(&grants) {
                 return missing_group(common_name, &missing);
             }
+            // A blocked identity gets no new certificate, credentials or not.
+            if state.registry.is_revoked(common_name) {
+                warn!(common_name, "signClient/v2 rejected: the identity is blocked");
+                return error_response(StatusCode::FORBIDDEN, "this identity is blocked");
+            }
             // Proven owner of this identity: may create or rotate it.
             state.registry.enroll(common_name, &signed.cert_pem, now)
         }

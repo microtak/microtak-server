@@ -52,7 +52,7 @@ The single most important interoperability risk identified during research.
 
 ## 3. TLS / mTLS & Certificate Identity
 
-**Implemented** (`src/transport/tls.rs` + `src/registry.rs`): TC-TLS-01, TC-TLS-02, TC-TLS-04, and TC-TLS-05 (connect-time only), each as a real `rustls`/`tokio-rustls` mTLS handshake over an actual TCP socket, using certs issued by `src/pki.rs` and identities tracked in the device registry. TC-TLS-02/04/05's rejection tests all account for the same TLS 1.3 subtlety: a client can consider its handshake/read "succeeded" locally before the server's rejection (a TLS close_notify, sent explicitly on every disconnect path) actually arrives, so each test treats a failed handshake, a failed write, or a failed/EOF read as a pass. TC-TLS-03 is implemented as "require a client cert" only (not the "or allow anonymous" branch). TC-TLS-06/07 are not yet implemented.
+**Implemented** (`src/transport/tls.rs` + `src/registry.rs`): TC-TLS-01, TC-TLS-02, TC-TLS-04, and TC-TLS-05 (at connect, and live sessions are cut on revocation -- see §24), each as a real `rustls`/`tokio-rustls` mTLS handshake over an actual TCP socket, using certs issued by `src/pki.rs` and identities tracked in the device registry. TC-TLS-02/04/05's rejection tests all account for the same TLS 1.3 subtlety: a client can consider its handshake/read "succeeded" locally before the server's rejection (a TLS close_notify, sent explicitly on every disconnect path) actually arrives, so each test treats a failed handshake, a failed write, or a failed/EOF read as a pass. TC-TLS-03 is implemented as "require a client cert" only (not the "or allow anonymous" branch). TC-TLS-06/07 are not yet implemented.
 
 | ID | Case | Type |
 |---|---|---|
@@ -170,7 +170,7 @@ Added alongside the enrollment endpoint (§4) — tracks enrolled devices by cer
 
 **Implemented** (`src/registry.rs`), each with a passing unit test: enroll and find a device; re-enrollment (cert rotation) preserves an existing `uid` binding; re-enrollment preserves an existing revocation (does **not** silently un-revoke — a real bug caught by the mTLS integration tests during development, see TC-TLS-05 above); bind a `uid` on first use; idempotent re-assertion of an already-owned `uid`; reject binding a `uid` already owned by a different device; reject a device rebinding to a *different* `uid` than the one it already owns; revoke a device; revoking an unknown device errors; the registry persists across a reload from its JSON file; loading a nonexistent path starts empty rather than erroring.
 
-**Not yet implemented**: an explicit `unrevoke` action (revocation is currently one-way); any capacity/pagination concerns (irrelevant at this project's target scale, see `docs/ARCHITECTURE.md`).
+**Not yet implemented**: any capacity/pagination concerns (irrelevant at this project's target scale, see `docs/ARCHITECTURE.md`).
 
 ## 13. End-to-End Test Suite (`tests/e2e.rs`)
 
@@ -314,3 +314,17 @@ See `docs/ARCHITECTURE.md` "Groups". Mutation-tested: 8/8 caught (plus a deliber
 
 - MeshCore throughput figures — needed to finalize TC-MESH-03/05's concrete bandwidth budget.
 - Native Rust Reticulum (RNS) crate maturity/interoperability — needs hands-on verification before TC-MESH-06 can specify which integration path to actually build against.
+
+## 24. Certificate revocation and identity blocks (2026-10-17)
+
+Before this, `DeviceRegistry::revoke` existed but nothing called it, revoking a user account left its certificate working, and only the CoT relay checked revocation (at connect). Now two levels (`src/registry.rs` `Access`): **revoke a certificate** by fingerprint (a lost device; the identity can enroll a new one with its password account) and **block an identity** (every certificate, re-enrollment included, until unblocked). Checked on every CoT connection, every Marti API connection *and* request, and live CoT sessions are cut when a revocation lands (registry change signal).
+
+| ID | Test |
+|---|---|
+| TC-REVOKE-01 | `registry::revoking_a_certificate_rejects_only_that_certificate`, `e2e_revoking_a_certificate_cuts_the_device_off_and_it_re_enrolls` |
+| TC-REVOKE-02 | `registry::blocking_rejects_every_certificate_until_unblocked`, `unblocking_does_not_revive_a_revoked_certificate`, `e2e_blocking_an_identity_locks_it_out_until_unblocked` |
+| TC-REVOKE-03 | `registry::revocations_are_signalled`, live-session cut in both e2e tests above |
+| TC-REVOKE-04 | `registry::certificate_revocations_and_unblocks_survive_a_reload` |
+| TC-REVOKE-05 | `e2e_device_admin_api_lists_devices_and_is_admin_only` (`GET /Marti/api/admin/devices`, `POST …/:cn/revokeCertificate`, `PUT/DELETE …/:cn/block`) |
+| TC-REVOKE-06 | `e2e_certadmin_revoke_by_hash` (official `DELETE /Marti/api/certadmin/cert/revoke/:hashes`) |
+| TC-REVOKE-07 | `e2e_revoking_a_user_account_revokes_its_certificate` |

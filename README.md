@@ -89,6 +89,24 @@ account can log in via `POST /oauth/token` and self-enroll a device cert
 via `Authorization: Basic` on the enrollment endpoint, bypassing the
 invite-token gate entirely.
 
+### Revoking access
+
+- **Lost or compromised device:** revoke its certificate —
+  `POST /Marti/api/admin/devices/<name>/revokeCertificate` (CLI:
+  `device revoke-cert`). That certificate stops working immediately,
+  including the device's live connection. The identity itself stays
+  usable: its owner enrolls a new device with their password account.
+- **Lock someone out:** block the identity —
+  `PUT /Marti/api/admin/devices/<name>/block` (CLI: `device block`). Every
+  certificate of that identity is refused and it can't re-enroll, until
+  `DELETE …/block` (`device unblock`). Certificates revoked individually
+  stay revoked.
+- Revoking a password account (`DELETE /Marti/api/admin/users/<name>`) also
+  revokes the certificate issued to it.
+- `GET /Marti/api/admin/devices` lists every identity with its certificate
+  fingerprint and status; the official TAK Server's
+  `DELETE /Marti/api/certadmin/cert/revoke/<fingerprints>` works too.
+
 ## System requirements
 
 MicroTAK is deliberately lightweight — it's built to run on the kind of

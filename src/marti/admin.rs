@@ -33,7 +33,7 @@ use time::OffsetDateTime;
 use super::PeerIdentity;
 use crate::enrollment_tokens::{EnrollmentTokenError, EnrollmentTokenStore};
 use crate::pki;
-use crate::registry::DeviceRegistry;
+use crate::registry::{DeviceRegistry, RegistryError};
 use crate::groups::{grants_from, GroupError, GroupGrant, GroupStore, Membership};
 use crate::users::UserStore;
 
@@ -68,7 +68,20 @@ pub fn router(state: AdminState) -> Router {
             "/Marti/api/admin/groups/:name/members/:identity",
             axum::routing::put(set_group_member).delete(remove_group_member),
         )
+        .route("/Marti/api/admin/devices", axum::routing::get(list_devices))
+        .route(
+            "/Marti/api/admin/devices/:common_name/revokeCertificate",
+            post(revoke_device_certificate),
+        )
+        .route(
+            "/Marti/api/admin/devices/:common_name/block",
+            axum::routing::put(block_device).delete(unblock_device),
+        )
         .route("/Marti/api/certadmin/cert/:hash", axum::routing::get(get_cert_by_hash))
+        .route(
+            "/Marti/api/certadmin/cert/revoke/:hashes",
+            axum::routing::delete(revoke_certs_by_hash),
+        )
         .with_state(state)
 }
 
@@ -293,16 +306,149 @@ async fn revoke_user(
     if let Some(response) = require_admin(&state, &identity) {
         return response;
     }
-    match state.users.revoke(&username) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => user_error_response(error),
+    if let Err(error) = state.users.revoke(&username) {
+        return user_error_response(error);
     }
+    // The account's device keeps no access either: its certificate was
+    // issued on this account's credentials.
+    if state.registry.find(&username).is_some()
+        && let Err(error) = state.registry.revoke_current_cert(&username)
+    {
+        return registry_error_response(error);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 fn random_password() -> String {
     let mut bytes = [0u8; 16];
     getrandom::getrandom(&mut bytes).expect("OS RNG must be available");
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ---------------------------------------------------------------------
+// Devices: certificate revocation and identity blocks -- see
+// `crate::registry::Access`
+// ---------------------------------------------------------------------
+
+fn registry_error_response(error: RegistryError) -> Response {
+    match error {
+        RegistryError::NotFound(name) => {
+            error_response(StatusCode::NOT_FOUND, format!("unknown device '{name}'"))
+        }
+        RegistryError::InvalidFingerprint(hash) => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("'{hash}' is not a SHA-256 certificate fingerprint"),
+        ),
+        other => error_response(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    }
+}
+
+/// `GET /Marti/api/admin/devices`: every enrolled identity with its current
+/// certificate and whether it (or the identity) is revoked.
+async fn list_devices(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    let mut devices = state.registry.all();
+    devices.sort_by(|a, b| a.common_name.cmp(&b.common_name));
+    let list: Vec<_> = devices
+        .into_iter()
+        .map(|device| {
+            let fingerprint = pki::fingerprint_sha256_colon_hex(&device.cert_pem);
+            let revoked = fingerprint
+                .as_deref()
+                .is_some_and(|fp| state.registry.is_cert_revoked(fp));
+            serde_json::json!({
+                "commonName": device.common_name,
+                "uid": device.uid,
+                "enrolledAt": device.enrolled_at_unix,
+                "blocked": device.revoked,
+                "certificateFingerprint": fingerprint,
+                "certificateRevoked": revoked,
+            })
+        })
+        .collect();
+    Json(list).into_response()
+}
+
+/// `POST /Marti/api/admin/devices/:cn/revokeCertificate`: a lost or
+/// compromised device. Its current certificate stops working everywhere
+/// (live sessions are cut); the identity can enroll a new one.
+async fn revoke_device_certificate(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(common_name): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    match state.registry.revoke_current_cert(&common_name) {
+        Ok(fingerprint) => Json(serde_json::json!({ "fingerprint": fingerprint })).into_response(),
+        Err(error) => registry_error_response(error),
+    }
+}
+
+/// `PUT /Marti/api/admin/devices/:cn/block`: lock the identity out entirely
+/// (any certificate, re-enrollment included) until unblocked.
+async fn block_device(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(common_name): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    if state.admin_common_name.as_deref() == Some(common_name.as_str()) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "the admin identity can't block itself".to_string(),
+        );
+    }
+    match state.registry.revoke(&common_name) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => registry_error_response(error),
+    }
+}
+
+/// `DELETE /Marti/api/admin/devices/:cn/block`: lift the block. Certificates
+/// revoked individually stay revoked.
+async fn unblock_device(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(common_name): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    match state.registry.unblock(&common_name) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => registry_error_response(error),
+    }
+}
+
+/// `DELETE /Marti/api/certadmin/cert/revoke/:hashes` -- the official TAK
+/// Server's certificate revoke: comma-separated SHA-256 fingerprints.
+async fn revoke_certs_by_hash(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(hashes): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    let hashes: Vec<&str> = hashes.split(',').map(str::trim).filter(|h| !h.is_empty()).collect();
+    if let Some(bad) = hashes.iter().find(|h| pki::normalize_fingerprint(h).is_none()) {
+        return registry_error_response(RegistryError::InvalidFingerprint(bad.to_string()));
+    }
+    for hash in &hashes {
+        if let Err(error) = state.registry.revoke_cert(hash) {
+            return registry_error_response(error);
+        }
+    }
+    Json(serde_json::json!({ "revoked": hashes })).into_response()
 }
 
 /// `GET /Marti/api/certadmin/cert/:hash` -- confirmed from real client
@@ -334,7 +480,11 @@ async fn get_cert_by_hash(
             "subjectDn": format!("CN={}", record.common_name),
             "userDn": format!("CN={}", record.common_name),
             "clientUid": record.common_name,
-            "revocationDate": if record.revoked { Some("revoked") } else { None },
+            "revocationDate": if record.revoked || state.registry.is_cert_revoked(&hash) {
+                Some("revoked")
+            } else {
+                None
+            },
         },
     }))
     .into_response()

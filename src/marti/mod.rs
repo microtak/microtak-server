@@ -40,6 +40,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::response::IntoResponse;
 use axum::{Extension, Router};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
@@ -48,6 +49,7 @@ use rustls::ServerConfig;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+use crate::registry::{Access, DeviceRegistry};
 use crate::transport::admission::Admission;
 use tracing::warn;
 
@@ -241,6 +243,7 @@ pub struct MtlsHttpServer {
     acceptor: TlsAcceptor,
     router: Router,
     admission: Admission,
+    registry: Option<Arc<DeviceRegistry>>,
 }
 
 impl MtlsHttpServer {
@@ -255,6 +258,7 @@ impl MtlsHttpServer {
             acceptor: TlsAcceptor::from(tls_config),
             router,
             admission: Admission::default(),
+            registry: None,
         })
     }
 
@@ -262,6 +266,14 @@ impl MtlsHttpServer {
     /// [`AdmissionLimits::default`](crate::transport::admission::AdmissionLimits)).
     pub fn with_admission(mut self, admission: Admission) -> Self {
         self.admission = admission;
+        self
+    }
+
+    /// Refuse revoked certificates and blocked identities -- at connect and
+    /// on every request, since a keep-alive connection can outlive a
+    /// revocation. See [`DeviceRegistry::access`].
+    pub fn with_registry(mut self, registry: Arc<DeviceRegistry>) -> Self {
+        self.registry = Some(registry);
         self
     }
 
@@ -283,9 +295,10 @@ impl MtlsHttpServer {
             let admission = self.admission.clone();
             let acceptor = self.acceptor.clone();
             let router = self.router.clone();
+            let registry = self.registry.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let tls_stream =
+                let mut tls_stream =
                     match tokio::time::timeout(admission.handshake_timeout(), acceptor.accept(stream)).await {
                         Ok(Ok(stream)) => stream,
                         Ok(Err(error)) => {
@@ -298,19 +311,46 @@ impl MtlsHttpServer {
                         }
                     };
 
-                let cn = {
+                let peer_cert: Option<Vec<u8>> = {
                     let (_, connection) = tls_stream.get_ref();
                     connection
                         .peer_certificates()
                         .and_then(|certs| certs.first())
-                        .and_then(|cert| crate::pki::common_name_from_cert_der(cert.as_ref()))
+                        .map(|cert| cert.as_ref().to_vec())
                 };
-                let Some(cn) = cn else {
+                let Some((cn, peer_cert)) = peer_cert.and_then(|der| {
+                    crate::pki::common_name_from_cert_der(&der).map(|cn| (cn, der))
+                }) else {
                     warn!(%peer, "client cert has no extractable Common Name, disconnecting");
                     return;
                 };
 
-                let router = router.layer(Extension(PeerIdentity(cn)));
+                let mut router = router.layer(Extension(PeerIdentity(cn.clone())));
+                if let Some(registry) = registry {
+                    let access = registry.access(&cn, &peer_cert);
+                    if access != Access::Allowed {
+                        warn!(%peer, cn, ?access, "refusing Marti API connection: certificate revoked or identity blocked");
+                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut tls_stream).await;
+                        return;
+                    }
+                    router = router.layer(axum::middleware::from_fn(move |request, next: axum::middleware::Next| {
+                        let registry = Arc::clone(&registry);
+                        let cn = cn.clone();
+                        let peer_cert = peer_cert.clone();
+                        async move {
+                            if registry.access(&cn, &peer_cert) != Access::Allowed {
+                                return (
+                                    axum::http::StatusCode::FORBIDDEN,
+                                    axum::Json(serde_json::json!({
+                                        "error": "certificate revoked or identity blocked"
+                                    })),
+                                )
+                                    .into_response();
+                            }
+                            next.run(request).await
+                        }
+                    }));
+                }
                 let io = TokioIo::new(tls_stream);
                 let service = TowerToHyperService::new(router);
                 if let Err(error) = http_builder(&admission)

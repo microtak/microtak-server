@@ -235,11 +235,35 @@ pub fn cert_pem_to_der(pem_str: &str) -> Result<CertificateDer<'static>, PkiErro
 /// `node-tak` client computes locally and sends us for a
 /// `GET /Marti/api/certadmin/cert/:hash` lookup (see `marti::admin`).
 pub fn fingerprint_sha256_colon_hex(cert_pem: &str) -> Option<String> {
-    use sha2::{Digest, Sha256};
     let der = cert_pem_to_der(cert_pem).ok()?;
-    let digest = Sha256::digest(der.as_ref());
+    Some(fingerprint_sha256_colon_hex_der(der.as_ref()))
+}
+
+/// [`fingerprint_sha256_colon_hex`] of DER bytes, e.g. an mTLS peer
+/// certificate as presented in the handshake.
+pub fn fingerprint_sha256_colon_hex_der(der: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(der);
     let hex_pairs: Vec<String> = digest.iter().map(|byte| format!("{byte:02X}")).collect();
-    Some(hex_pairs.join(":"))
+    hex_pairs.join(":")
+}
+
+/// Normalize a SHA-256 fingerprint to the uppercase colon-separated form
+/// (accepts any case, with or without colons). `None` if it isn't one.
+pub fn normalize_fingerprint(hash: &str) -> Option<String> {
+    let hex: String = hash.chars().filter(|c| *c != ':').collect();
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let upper = hex.to_ascii_uppercase();
+    Some(
+        upper
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| std::str::from_utf8(pair).unwrap())
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
 }
 
 /// Extract the Common Name from a DER-encoded certificate, e.g. an mTLS
