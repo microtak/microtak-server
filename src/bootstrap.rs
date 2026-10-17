@@ -150,6 +150,13 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Create (or replace) `path` with `contents`, readable and writable by the
 /// owner only.
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    write_private_file(path, format!("{contents}\n").as_bytes())
+}
+
+/// Create (or replace) `path` with exactly `bytes`, readable and writable by
+/// the owner only (also tightens an existing file). Used for every secret in
+/// `data_dir`: the bootstrap token and the CA private key.
+pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -166,9 +173,21 @@ fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
         // existing file too.
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    file.write_all(contents.as_bytes())?;
-    file.write_all(b"\n")?;
+    file.write_all(bytes)?;
     file.sync_all()
+}
+
+/// Remove group/other permissions from an existing secret file, e.g. one
+/// written before secrets were created owner-only. Returns whether it had to.
+#[cfg(unix)]
+pub(crate) fn tighten_to_owner_only(path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    if mode & 0o077 == 0 {
+        return Ok(false);
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o700))?;
+    Ok(true)
 }
 
 #[cfg(test)]

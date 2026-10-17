@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use rustls::ServerConfig;
 use time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::backup::{BackupRunner, OffsiteTarget};
 use crate::bootstrap::{BootstrapToken, BOOTSTRAP_TOKEN_FILE};
@@ -526,12 +526,17 @@ fn load_or_generate_ca(
         std::fs::read_to_string(&cert_path),
         std::fs::read_to_string(&key_path),
     ) {
+        #[cfg(unix)]
+        if crate::bootstrap::tighten_to_owner_only(&key_path)? {
+            warn!(path = %key_path.display(), "CA private key was readable by other users; restricted it to the owner");
+        }
         return Ok(CertificateAuthority::from_pem(&cert_pem, &key_pem)?);
     }
 
     let ca = CertificateAuthority::generate(ca_common_name)?;
     std::fs::write(&cert_path, ca.ca_cert_pem())?;
-    std::fs::write(&key_path, ca.ca_key_pem())?;
+    // The key signs every identity, the admin's included: owner-only.
+    crate::bootstrap::write_private_file(&key_path, ca.ca_key_pem().as_bytes())?;
     Ok(ca)
 }
 
@@ -637,6 +642,39 @@ mod tests {
         .await
         .unwrap();
         assert!(enabled.plain_tcp_addr().is_ok());
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The CA key signs every identity, the admin's included -- readable by
+    /// the server's own user only, like the bootstrap token.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_generated_ca_key_is_readable_by_the_owner_only() {
+        let data_dir = unique_temp_dir("ca-key-mode");
+        App::bind(ephemeral_config(data_dir.clone())).await.unwrap();
+        assert_eq!(mode_of(&data_dir.join("ca-key.pem")), 0o600);
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    /// Data dirs created before the key was written privately get fixed on
+    /// the next start instead of staying world-readable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_existing_world_readable_ca_key_is_tightened_on_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let data_dir = unique_temp_dir("ca-key-tighten");
+        App::bind(ephemeral_config(data_dir.clone())).await.unwrap();
+        let key_path = data_dir.join("ca-key.pem");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        App::bind(ephemeral_config(data_dir.clone())).await.unwrap();
+        assert_eq!(mode_of(&key_path), 0o600);
         std::fs::remove_dir_all(&data_dir).ok();
     }
 
