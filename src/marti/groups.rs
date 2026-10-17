@@ -95,13 +95,9 @@ impl From<MemberGroup> for GroupJson {
     }
 }
 
+/// The groups API names the full class (`Group.class.getName()`).
 fn api_response(groups: Vec<GroupJson>) -> Response {
-    Json(json!({
-        "version": "3",
-        "type": "com.bbn.marti.remote.groups.Group",
-        "data": groups,
-    }))
-    .into_response()
+    super::envelope::api_response("com.bbn.marti.remote.groups.Group", groups).into_response()
 }
 
 #[derive(Deserialize)]
