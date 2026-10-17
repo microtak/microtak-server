@@ -62,3 +62,65 @@ jobs:
           context: .
           push: false
           tags: microtak-server:ci
+
+  # The black-box suite (tests/blackbox.rs) against the real Docker image,
+  # driven only over the network: admin bootstrap, accounts, ATAK-style
+  # enrollment, CoT/GeoChat/markers, missions, revocation. `cargo test` in
+  # the job above also runs it against the bare binary.
+  blackbox:
+    name: Black-box suite against the image (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: microtak-server:blackbox
+
+      - name: Start the server
+        run: |
+          mkdir -p blackbox-config
+          cat > blackbox-config/microtak.toml <<'TOML'
+          bind_host = "0.0.0.0"
+          admin_common_name = "admin"
+          server_names = ["localhost"]
+          server_names_from_interfaces = false
+          TOML
+          docker run -d --name microtak \
+            -v "$PWD/blackbox-config:/etc/microtak:ro" \
+            -p 127.0.0.1:18446:8446 -p 127.0.0.1:18443:8443 -p 127.0.0.1:18089:8089 \
+            microtak-server:blackbox
+          for _ in $(seq 1 60); do
+            docker exec microtak test -s /var/lib/microtak-server/data/bootstrap-token && break
+            sleep 1
+          done
+          echo "MICROTAK_BLACKBOX_BOOTSTRAP_TOKEN=$(docker exec microtak cat /var/lib/microtak-server/data/bootstrap-token)" >> "$GITHUB_ENV"
+
+      - name: Run the black-box suite against the container
+        env:
+          MICROTAK_BLACKBOX_HOST: 127.0.0.1
+          MICROTAK_BLACKBOX_ENROLLMENT_PORT: "18446"
+          MICROTAK_BLACKBOX_API_PORT: "18443"
+          MICROTAK_BLACKBOX_STREAM_PORT: "18089"
+        run: cargo test --locked --test blackbox -- --nocapture
+
+      - name: Server log
+        if: always()
+        run: docker logs microtak 2>&1 | tail -200
