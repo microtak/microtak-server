@@ -148,6 +148,8 @@ pub fn router_with(state: MissionsState) -> Router {
         .route("/Marti/api/missions/:name/layers/:layer/name", put(rename_layer_by_name))
         .route("/Marti/api/missions/guid/:guid/layers/:layer/name", put(rename_layer_by_guid))
         .route("/Marti/api/missions/:name/archive", get(archive_mission))
+        .route("/Marti/api/missions/:name/contacts", get(contacts_by_name))
+        .route("/Marti/api/missions/guid/:guid/contacts", get(contacts_by_guid))
         .route("/Marti/api/missions/:name/contents/missionpackage", put(add_mission_package))
         .route("/Marti/api/missions/:name/password", put(set_password_by_name).delete(remove_password_by_name))
         .route("/Marti/api/missions/guid/:guid/password", put(set_password_by_guid).delete(remove_password_by_guid))
@@ -1629,6 +1631,19 @@ async fn rename_layer_by_guid(
     let mission = existing(&state, &caller, Key::Guid(&guid))?;
     rename_layer_impl(&state, &caller, mission, &layer, &Params::parse(query)?)
 }
+
+// --- contacts ----------------------------------------------------------------------------------
+
+/// `getMissionContacts`: the connected clients the mission's groups reach,
+/// as a bare `RemoteSubscription` list (no envelope).
+fn contacts_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, _params: &Params) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionRead)?;
+    let reachable = super::contacts::reachable(&state.clients, &state.groups, Some(&mission.groups));
+    let list: Vec<Value> = reachable.iter().map(|c| super::contacts::remote_subscription(c, &state.latest_cot)).collect();
+    Ok(Json(list).into_response())
+}
+
+layer_handlers!(contacts_by_name, contacts_by_guid, contacts_impl);
 
 // --- mission packages --------------------------------------------------------------------------
 

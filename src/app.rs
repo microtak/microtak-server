@@ -449,7 +449,7 @@ impl App {
             admin_common_name: config.admin_common_name.clone(),
             tokens: mission_tokens,
             resources: Arc::clone(&resources),
-            latest_cot,
+            latest_cot: Arc::clone(&latest_cot),
             notifier: Arc::clone(&mission_notifier),
             clients: clients.clone(),
             content: Arc::clone(&content_store),
@@ -465,7 +465,12 @@ impl App {
             }))
             .merge(admin::router(admin_state))
             .merge(discovery::router())
-            .merge(contacts::router(clients.clone()))
+            .merge(contacts::router(contacts::ContactsState {
+                clients: clients.clone(),
+                latest_cot: Arc::clone(&latest_cot),
+                groups: Arc::clone(&groups),
+                admin_common_name: config.admin_common_name.clone(),
+            }))
             .merge(groups::router(GroupsState {
                 groups: Arc::clone(&groups),
                 admin_common_name: config.admin_common_name.clone(),

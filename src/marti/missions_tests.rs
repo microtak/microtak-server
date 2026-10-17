@@ -834,3 +834,22 @@ async fn a_data_package_imports_into_a_mission() {
         "creatorUid is required"
     );
 }
+
+/// `getMissionContacts`: the clients the mission's groups reach, no envelope.
+#[tokio::test]
+async fn mission_contacts_are_a_bare_list() {
+    let h = harness();
+    h.create("Ops", "jz", "").await;
+    h.state.clients.register(crate::transport::connections::ClientEndpoint {
+        remote_addr: "127.0.0.1:9".parse().unwrap(),
+        transport: crate::transport::connections::Transport::Tls,
+        common_name: Some("dev".into()),
+        uid: Some("ANDROID-9".into()),
+        connected_at_unix: 0,
+    });
+    let reply = h.get("/Marti/api/missions/Ops/contacts", "jz").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let list = reply.json();
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list[0]["uid"], "ANDROID-9");
+}
