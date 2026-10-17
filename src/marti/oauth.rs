@@ -36,16 +36,110 @@ use tracing::warn;
 #[derive(Clone)]
 pub struct OAuthState {
     pub users: Arc<UserStore>,
-    /// Shared with enrollment -- failed logins here and failed password
-    /// enrollments there count against the same per-IP/per-user budget.
     pub limiter: Arc<AuthLimiter>,
+    pub signer: Arc<JwtSigner>,
 }
 
-pub fn router(users: Arc<UserStore>, limiter: Arc<AuthLimiter>) -> Router {
+pub fn router(users: Arc<UserStore>, limiter: Arc<AuthLimiter>, signer: Arc<JwtSigner>) -> Router {
     Router::new()
         .route("/oauth/token", post(token))
         .layer(DefaultBodyLimit::max(super::enrollment::MAX_REQUEST_BODY_BYTES))
-        .with_state(OAuthState { users, limiter })
+        .with_state(OAuthState { users, limiter, signer })
+}
+
+/// Access-token lifetime: the official default `httpSessionTimeoutMinutes`
+/// (60), which the official login client's token settings use.
+const TOKEN_TTL_SECONDS: i64 = 60 * 60;
+
+/// Signs access tokens the way the official server does: Spring
+/// Authorization Server's `JwtGenerator` with a `NimbusJwtEncoder` over an
+/// RSA key whose `kid` is a random UUID per server start
+/// (`ServerConfiguration.jwkSource`). RS256, header `{"kid", "alg"}`.
+pub struct JwtSigner {
+    key: ring::signature::RsaKeyPair,
+    kid: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum JwtSignerError {
+    #[error("generating the RSA signing key failed: {0}")]
+    Generate(#[from] rcgen::Error),
+    #[error("invalid RSA signing key: {0}")]
+    Key(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+impl JwtSigner {
+    /// A fresh 2048-bit RSA key (tests; servers use [`Self::load_or_create`]).
+    pub fn generate() -> Result<Self, JwtSignerError> {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)?;
+        Self::from_pkcs8(&key.serialize_der())
+    }
+
+    /// The server's signing key from `data_dir/oauth-signing-key.pem`,
+    /// created (owner-only) on first start.
+    pub fn load_or_create(data_dir: &std::path::Path) -> Result<Self, JwtSignerError> {
+        let path = data_dir.join("oauth-signing-key.pem");
+        if let Ok(pem) = std::fs::read_to_string(&path) {
+            let key = rcgen::KeyPair::from_pem(&pem).map_err(|e| JwtSignerError::Key(e.to_string()))?;
+            return Self::from_pkcs8(&key.serialize_der());
+        }
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)?;
+        crate::bootstrap::write_private_file(&path, key.serialize_pem().as_bytes())?;
+        Self::from_pkcs8(&key.serialize_der())
+    }
+
+    fn from_pkcs8(der: &[u8]) -> Result<Self, JwtSignerError> {
+        let key = ring::signature::RsaKeyPair::from_pkcs8(der).map_err(|e| JwtSignerError::Key(e.to_string()))?;
+        Ok(Self { key, kid: random_uuid() })
+    }
+
+    /// DER `RSAPublicKey` (PKCS#1), for verifying.
+    pub fn public_key_der(&self) -> &[u8] {
+        use ring::signature::KeyPair;
+        self.key.public_key().as_ref()
+    }
+
+    /// An access token for `username` issued at `now` (Unix seconds), with
+    /// the official claims: sub and aud are the username (the login client's
+    /// id is the username), nbf = iat, exp = iat + TTL, jti; no iss, no
+    /// scope (no authorization server context, no authorized scopes).
+    pub fn token(&self, username: &str, now: i64) -> String {
+        // Written out by hand: serde_json's map sorts keys, and the official
+        // header order matters -- clients such as node-tak find the claims by
+        // decoding the whole token as one base64 string, which only works
+        // because this 60-byte header encodes to a whole number of base64
+        // quanta.
+        let username = serde_json::Value::from(username).to_string();
+        let header = format!(r#"{{"kid":"{}","alg":"RS256"}}"#, self.kid);
+        let claims = format!(
+            r#"{{"sub":{username},"aud":{username},"nbf":{now},"exp":{},"iat":{now},"jti":"{}"}}"#,
+            now + TOKEN_TTL_SECONDS,
+            random_uuid()
+        );
+        let encode = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
+        let signing_input = format!("{}.{}", encode(&header), encode(&claims));
+        let mut signature = vec![0u8; self.key.public().modulus_len()];
+        self.key
+            .sign(
+                &ring::signature::RSA_PKCS1_SHA256,
+                &ring::rand::SystemRandom::new(),
+                signing_input.as_bytes(),
+                &mut signature,
+            )
+            .expect("RSA signing with a valid key");
+        format!("{signing_input}.{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature))
+    }
+}
+
+fn random_uuid() -> String {
+    let mut b = [0u8; 16];
+    getrandom::getrandom(&mut b).expect("OS RNG must be available");
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
 }
 
 #[derive(Deserialize)]
@@ -89,47 +183,122 @@ async fn token(
             .into_response();
     }
 
-    let access_token = make_jwt(&request.username);
-    (StatusCode::OK, Json(json!({ "access_token": access_token }))).into_response()
-}
-
-/// A real, standard base64url 3-segment JWT -- header.payload.signature.
-/// The signature is a throwaway HMAC over a session-local random key: no
-/// real client verifies it (see this module's own doc comment), so nothing
-/// beyond "looks like a real JWT" is required, but producing an actually
-/// well-formed one (rather than a fake placeholder) means `node-tak`'s own
-/// `OAuthCommands.parse()` -- which does a real (if crude) base64 decode of
-/// the token -- reads it correctly.
-fn make_jwt(username: &str) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-
-    let header = json!({ "alg": "none", "typ": "JWT" });
-    let payload = json!({
-        "sub": username,
-        "aud": "microtak-server",
-        "iat": now,
-        "nbf": now,
-        "exp": now + 3600,
-    });
-
-    let encode = |value: &serde_json::Value| {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
-    };
-    format!("{}.{}.", encode(&header), encode(&payload))
+    let access_token = state.signer.token(&request.username, now);
+    // As the official PasswordGrantAuthenticationSuccessHandler answers: the
+    // OAuth2 token response, plus the token as an `access_token` cookie.
+    let cookie = format!("access_token={access_token}; Path=/; Secure; HttpOnly; SameSite=Strict");
+    (
+        StatusCode::OK,
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Json(json!({
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": TOKEN_TTL_SECONDS,
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// node-tak's `OAuthCommands.parse` (what CloudTAK runs on login),
+    /// byte for byte: Node's lenient base64 decoder over the *whole* token
+    /// (dots skipped, decoding straight across the segments), split at `}`,
+    /// the second piece parsed as JSON. Works only if the header's base64
+    /// length is a multiple of 4 -- true for the official
+    /// `{"kid":"<uuid>","alg":"RS256"}` (60 bytes, 80 characters).
+    fn node_tak_parse(jwt: &str) -> serde_json::Value {
+        const ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let sextets: Vec<u8> = jwt
+            .chars()
+            .filter_map(|c| match c {
+                '-' => Some(62),
+                '_' => Some(63),
+                c => ALPHABET.find(c).map(|i| i as u8),
+            })
+            .collect();
+        let mut bytes = Vec::new();
+        for chunk in sextets.chunks(4) {
+            let n = chunk.iter().fold(0u32, |acc, s| (acc << 6) | *s as u32) << (6 * (4 - chunk.len()));
+            let out = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+            bytes.extend_from_slice(&out[..chunk.len().saturating_sub(1)]);
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let pieces: Vec<String> = text.split('}').map(|p| format!("{p}}}")).collect();
+        serde_json::from_str(&pieces[1]).expect("node-tak would fail here with 'is not valid JSON'")
+    }
+
+    fn decode_segment(segment: &str) -> serde_json::Value {
+        serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(segment).unwrap()).unwrap()
+    }
+
+    /// The official token (Spring Authorization Server JwtGenerator +
+    /// NimbusJwtEncoder over an RSA key with a random UUID kid): header
+    /// {kid, alg: RS256}; claims sub/aud = username, nbf, exp, iat, jti; no
+    /// iss, no scope. RS256-signed. And node-tak can read it.
+    #[test]
+    fn tokens_have_the_official_shape_and_node_tak_can_parse_them() {
+        let signer = JwtSigner::generate().unwrap();
+        let token = signer.token("jz", 1_760_000_000);
+        let segments: Vec<&str> = token.split('.').collect();
+        assert_eq!(segments.len(), 3);
+
+        let header = decode_segment(segments[0]);
+        assert_eq!(header["alg"], "RS256");
+        assert_eq!(header["kid"].as_str().unwrap().len(), 36);
+        assert_eq!(segments[0].len() % 4, 0, "header must decode on a 4-char boundary");
+        let raw_header = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(segments[0]).unwrap();
+        let raw_header = String::from_utf8(raw_header).unwrap();
+        assert!(raw_header.starts_with(r#"{"kid":""#), "Spring/Nimbus header order: {raw_header}");
+        assert!(raw_header.ends_with(r#"","alg":"RS256"}"#), "Spring/Nimbus header order: {raw_header}");
+
+        let claims = decode_segment(segments[1]);
+        assert_eq!(claims["sub"], "jz");
+        assert_eq!(claims["aud"], "jz");
+        assert_eq!(claims["iat"], 1_760_000_000);
+        assert_eq!(claims["nbf"], 1_760_000_000);
+        assert_eq!(claims["exp"], 1_760_000_000 + 3600);
+        assert_eq!(claims["jti"].as_str().unwrap().len(), 36);
+        assert!(claims.get("iss").is_none() && claims.get("scope").is_none());
+
+        let parsed = node_tak_parse(&token);
+        assert_eq!(parsed["sub"], "jz");
+        assert_eq!(parsed["exp"], 1_760_000_000 + 3600);
+
+        let signing_input = format!("{}.{}", segments[0], segments[1]);
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(segments[2]).unwrap();
+        ring::signature::UnparsedPublicKey::new(&ring::signature::RSA_PKCS1_2048_8192_SHA256, signer.public_key_der())
+            .verify(signing_input.as_bytes(), &signature)
+            .expect("a valid RS256 signature");
+    }
+
+    #[test]
+    fn the_signing_key_is_persisted_owner_only() {
+        let dir = std::env::temp_dir().join(format!("microtak-oauth-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = JwtSigner::load_or_create(&dir).unwrap();
+        let second = JwtSigner::load_or_create(&dir).unwrap();
+        assert_eq!(first.public_key_der(), second.public_key_der());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("oauth-signing-key.pem")).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
     fn app_with(users: Arc<UserStore>) -> Router {
-        router(users, Arc::new(AuthLimiter::default()))
+        router(users, Arc::new(AuthLimiter::default()), Arc::new(JwtSigner::generate().unwrap()))
     }
 
     async fn post_token(app: Router, username: &str, password: &str) -> Response {
@@ -218,6 +387,7 @@ mod tests {
         let app = router(
             users,
             Arc::new(AuthLimiter::new(3, std::time::Duration::from_secs(300), 100, 1)),
+            Arc::new(JwtSigner::generate().unwrap()),
         );
 
         for _ in 0..3 {

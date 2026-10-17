@@ -225,6 +225,8 @@ pub enum AppError {
     EnrollmentCert(#[from] CertLoadError),
     #[error("group store setup failed: {0}")]
     Groups(#[from] crate::groups::GroupError),
+    #[error("OAuth signing key: {0}")]
+    OAuthKey(#[from] oauth::JwtSignerError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -385,7 +387,11 @@ impl App {
         });
 
         let plain_router = enrollment::router(enrollment_state)
-            .merge(oauth::router(Arc::clone(&users), limiter))
+            .merge(oauth::router(
+                Arc::clone(&users),
+                limiter,
+                Arc::new(oauth::JwtSigner::load_or_create(&config.data_dir)?),
+            ))
             .layer(axum::Extension(Arc::new(config.trusted_proxies.clone())));
         // One instance for every listener, so the total cap is server-wide.
         let admission =
