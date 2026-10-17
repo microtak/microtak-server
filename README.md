@@ -6,7 +6,11 @@ a small VPS, a laptop in a go-bag.
 
 MicroTAK speaks the same protocols as the official TAK Server (CoT over
 TLS/TCP, certificate enrollment, the Marti mission/Data Sync API), so
-existing ATAK, iTAK, and WinTAK clients connect to it without modification.
+existing ATAK, iTAK, WinTAK and CloudTAK clients connect to it without
+modification. **Compatibility with the official TAK Server and its clients
+is the first rule**: every API follows the official server's source
+(`TAK-Product-Center/Server`), including its JSON shapes, status codes and
+URL authorization, not a re-interpretation of it.
 It's a from-scratch implementation, not a fork — built after studying the
 official TAK Server, [taky](https://github.com/tkuester/taky), and
 [OpenTAKServer](https://github.com/brian7704/OpenTAKServer) for protocol
@@ -30,8 +34,14 @@ still on the drawing board.
   bootstrap token and every other device via an invite token or a password
   account. See "Enrollment & access control" below.
 - Missions (Data Sync) — shared folders of markers and files that sync
-  across devices, through the official TAK Server Mission API (roles,
-  mission tokens, change notifications, layers, invitations, logs).
+  across devices, through the official TAK Server Mission API: roles and
+  mission tokens, password-protected and invite-only missions, change
+  notifications on the CoT stream, layers, invitations, logs, data package
+  export/import, and content streamed in with `<marti><dest mission=…>`.
+- Enterprise Sync (file sharing) with the official servlets
+  (`/Marti/sync/*`), GeoChat and direct messages, contacts and
+  subscriptions lists, groups ("channels"), ping/pong, and the OAuth login
+  CloudTAK uses.
 - Everything persists to disk and survives a restart, with optional
   periodic backups (local or offsite via a command you control, e.g.
   `rsync`).
@@ -276,7 +286,11 @@ if that's unset, and falls back to sensible defaults if neither exists.
 - [microtak-admin-cli](https://github.com/microtak/microtak-admin-cli) — a
   command-line tool for enrolling devices, minting/managing invite tokens,
   and managing mission roles, with terminal QR codes for handoff.
-- microtak-admin-web — a web-based admin UI, in progress.
+- [microtak-admin-web](https://github.com/microtak/microtak-admin-web) — a
+  web-based admin UI: invite tokens with QR codes, devices,
+  groups and mission roles.
+- [CloudTAK](https://github.com/dfpc-coe/CloudTAK) (third-party) works as
+  a web map against MicroTAK.
 
 ## Documentation
 
@@ -287,15 +301,44 @@ if that's unset, and falls back to sensible defaults if neither exists.
 - [docs/PACKAGING.md](docs/PACKAGING.md) — the plan for making the whole
   ecosystem installable via apt, Nix, and the AUR.
 
-## Contributing
+## Testing
 
-Every feature is expected to come with tests before it's considered done —
-see the test plan for what "tested" means for a given area.
+Every feature comes with tests before it's considered done — see the test
+plan for what "tested" means for a given area.
 
 ```sh
-cargo test               # unit + module-level integration tests
-cargo test --test e2e    # end-to-end suite against a fully assembled server
+cargo test                    # everything below
+cargo test --lib              # unit and module-level tests
+cargo test --test e2e         # end-to-end suite against an in-process server
+cargo test --test blackbox    # black-box suite against the real microtakd
 ```
+
+The **black-box suite** (`tests/blackbox.rs`) starts the `microtakd` binary
+and drives it only over the network, the way devices do: admin bootstrap,
+password accounts, ATAK-style enrollment, the CoT stream (position
+reports, ping/pong, GeoChat, direct messages, markers), a full mission and
+certificate revocation. Point it at any running server instead with:
+
+```sh
+MICROTAK_BLACKBOX_HOST=127.0.0.1 \
+MICROTAK_BLACKBOX_ENROLLMENT_PORT=8446 MICROTAK_BLACKBOX_API_PORT=8443 \
+MICROTAK_BLACKBOX_STREAM_PORT=8089 \
+MICROTAK_BLACKBOX_BOOTSTRAP_TOKEN="$(cat data/bootstrap-token)" \
+cargo test --test blackbox
+```
+
+(a fresh server with `admin_common_name = "admin"` and `localhost` among
+its `server_names`). CI runs it against the Docker image on amd64 and
+arm64.
+
+## Contributing
+
+Contributions are welcome; please keep to the official TAK Server's
+behaviour (cite the source you followed) and add tests.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
 
 ## License
 
