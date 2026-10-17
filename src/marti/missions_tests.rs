@@ -711,3 +711,63 @@ async fn invitations_and_role_changes_are_sent_to_the_client() {
     assert_eq!(sent[0].dest_uids.as_deref(), Some(&["ANDROID-D".to_string()][..]));
     assert!(sent[0].xml.contains(r#"<role type="MISSION_OWNER">"#));
 }
+
+// --- mission layers (`hydrateMissionLayers`) ---------------------------------------------------
+
+/// Layers as CloudTAK builds them: a GROUP, a UID layer under it, uids
+/// filed into it through `paths` (ITEM layers, folded into the parent's
+/// `uids`); rename, move, delete -- deleting removes the filed content.
+#[tokio::test]
+async fn layers_like_cloudtak_uses_them() {
+    let (h, mut rx) = harness_with_hub();
+    h.create("Ops", "jz", "").await;
+    let reply = h.call("PUT", "/Marti/api/missions/Ops/layers?name=Recon&type=GROUP&creatorUid=A", "jz", &[], "").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json()["type"], "MissionLayer");
+    let recon = reply.data();
+    assert_eq!((recon["name"].as_str(), recon["type"].as_str()), (Some("Recon"), Some("GROUP")));
+    assert!(recon.get("mission_layers").is_none(), "NON_EMPTY");
+    let recon_uid = recon["uid"].as_str().unwrap().to_string();
+    let markers = h
+        .call("PUT", &format!("/Marti/api/missions/Ops/layers?name=Markers&type=UID&parentUid={recon_uid}&creatorUid=A"), "jz", &[], "")
+        .await
+        .data();
+    assert_eq!(markers["parentUid"], recon_uid.as_str());
+    let markers_uid = markers["uid"].as_str().unwrap().to_string();
+    assert_eq!(
+        h.call("PUT", "/Marti/api/missions/Ops/layers?name=x&creatorUid=A", "jz", &[], "").await.status,
+        StatusCode::BAD_REQUEST,
+        "type is required"
+    );
+
+    let body = format!(r#"{{"paths":{{"{markers_uid}":[{{"uids":["m-1","m-2"]}}]}}}}"#);
+    assert_eq!(h.call("PUT", "/Marti/api/missions/Ops/contents?creatorUid=A", "jz", &[], &body).await.status, StatusCode::OK);
+    let layers = h.get("/Marti/api/missions/Ops/layers", "jz").await.data();
+    assert_eq!(layers.as_array().unwrap().len(), 1, "only the top level");
+    let nested = &layers[0]["mission_layers"];
+    assert_eq!(nested.as_array().unwrap().len(), 1, "ITEM layers are not listed as layers");
+    let uids: Vec<&str> = nested[0]["uids"].as_array().unwrap().iter().map(|u| u["data"].as_str().unwrap()).collect();
+    assert_eq!(uids, ["m-1", "m-2"], "filed in order");
+    let one = h.get(&format!("/Marti/api/missions/Ops/layers/{markers_uid}"), "jz").await.data();
+    assert_eq!(one["parentUid"], recon_uid.as_str());
+    assert_eq!(one["uids"].as_array().unwrap().len(), 2);
+    assert_eq!(h.get("/Marti/api/missions/Ops/layers/nope", "jz").await.status, StatusCode::NOT_FOUND);
+
+    h.call("PUT", &format!("/Marti/api/missions/Ops/layers/{markers_uid}/name?name=Pins&creatorUid=A"), "jz", &[], "").await;
+    let reply = h.call("PUT", &format!("/Marti/api/missions/Ops/layers/parent?layerUid={markers_uid}&creatorUid=A"), "jz", &[], "").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let names: Vec<String> = h.get("/Marti/api/missions/Ops/layers", "jz").await.data().as_array().unwrap().iter().map(|l| l["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&"Pins".to_string()) && names.contains(&"Recon".to_string()), "{names:?}");
+    assert_eq!(
+        h.call("PUT", "/Marti/api/missions/Ops/layers/parent?layerUid=nope&creatorUid=A", "jz", &[], "").await.status,
+        StatusCode::NOT_FOUND
+    );
+
+    drain(&mut rx);
+    h.call("DELETE", &format!("/Marti/api/missions/Ops/layers?uid={markers_uid}&creatorUid=A"), "jz", &[], "").await;
+    let mission = h.get("/Marti/api/missions/Ops", "jz").await.data()[0].clone();
+    assert_eq!(mission["uids"], json!([]), "content filed in the layer is removed");
+    let types: Vec<String> = drain(&mut rx).iter().map(|m| cot_type(&m.xml)).collect();
+    assert_eq!(types, ["t-x-m-c", "t-x-m-c", "t-x-m-c-h"], "two removals, then the layer");
+}

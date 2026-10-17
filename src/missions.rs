@@ -290,6 +290,51 @@ pub struct LogEntryRecord {
     pub keywords: Vec<String>,
 }
 
+/// `MissionLayer.Type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LayerType {
+    Group,
+    Uid,
+    Contents,
+    Maplayer,
+    Item,
+}
+
+impl LayerType {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "GROUP" => Some(Self::Group),
+            "UID" => Some(Self::Uid),
+            "CONTENTS" => Some(Self::Contents),
+            "MAPLAYER" => Some(Self::Maplayer),
+            "ITEM" => Some(Self::Item),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Group => "GROUP",
+            Self::Uid => "UID",
+            Self::Contents => "CONTENTS",
+            Self::Maplayer => "MAPLAYER",
+            Self::Item => "ITEM",
+        }
+    }
+}
+
+/// A row of the official `mission_layer` table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayerRecord {
+    pub uid: String,
+    pub name: Option<String>,
+    pub layer_type: LayerType,
+    /// `parent_node_uid` as stored (not checked to exist).
+    pub parent: Option<String>,
+    pub after: Option<String>,
+}
+
 /// A time window over `servertime` (`TimeUtils.validateTimeInterval`).
 #[derive(Debug, Clone, Copy)]
 pub struct Window {
@@ -324,6 +369,11 @@ enum Event {
     Uninvited { guid: String, invitee: String, invitation_type: InvitationType },
     LogEntrySaved { entry: LogEntryRecord },
     LogEntryDeleted { id: String },
+    LayerSaved { guid: String, layer: LayerRecord },
+    LayerNamed { guid: String, uid: String, name: String },
+    LayerParentSet { guid: String, uid: String, parent: Option<String> },
+    LayerAfterSet { guid: String, uid: String, after: Option<String> },
+    LayerDeleted { guid: String, uid: String },
 }
 
 #[derive(Default)]
@@ -333,6 +383,8 @@ struct State {
     subscriptions: BTreeMap<String, Vec<SubscriptionRecord>>,
     invitations: Vec<InvitationRecord>,
     logs: BTreeMap<String, LogEntryRecord>,
+    /// mission guid → layers, in insertion order.
+    layers: BTreeMap<String, Vec<LayerRecord>>,
     next_change_id: u64,
 }
 
@@ -474,7 +526,97 @@ fn apply(state: &mut State, event: &Event) {
         Event::LogEntryDeleted { id } => {
             state.logs.remove(&id);
         }
+        Event::LayerSaved { guid, layer } => {
+            state.layers.entry(guid).or_default().push(layer);
+        }
+        Event::LayerNamed { guid, uid, name } => {
+            if let Some(l) = layer_mut(state, &guid, &uid) {
+                l.name = Some(name);
+            }
+        }
+        Event::LayerParentSet { guid, uid, parent } => {
+            if let Some(l) = layer_mut(state, &guid, &uid) {
+                l.parent = parent;
+                // `setParent` also clears `after`.
+                l.after = None;
+            }
+        }
+        Event::LayerAfterSet { guid, uid, after } => {
+            if let Some(l) = layer_mut(state, &guid, &uid) {
+                l.after = after;
+            }
+        }
+        Event::LayerDeleted { guid, uid } => {
+            if let Some(layers) = state.layers.get_mut(&guid) {
+                layers.retain(|l| l.uid != uid);
+            }
+        }
     }
+}
+
+fn layer_mut<'a>(state: &'a mut State, guid: &str, uid: &str) -> Option<&'a mut LayerRecord> {
+    state.layers.get_mut(guid)?.iter_mut().find(|l| l.uid == uid)
+}
+
+/// A layer with its children, as `MissionLayer` hydrates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerTree {
+    pub layer: LayerRecord,
+    pub children: Vec<LayerTree>,
+}
+
+/// `MissionLayer.sort`: siblings ordered by their `after` chain; left as
+/// they are if two point to the same `after`, a uid repeats, there's a
+/// cycle, or an `after` names no sibling.
+pub fn sort_layers(unsorted: Vec<LayerRecord>) -> Vec<LayerRecord> {
+    let mut afters = BTreeSet::new();
+    let mut uids = BTreeSet::new();
+    for l in &unsorted {
+        if afters.contains(&l.after) || uids.contains(&l.uid) || has_cycle(l, &unsorted) {
+            return unsorted;
+        }
+        afters.insert(l.after.clone());
+        uids.insert(l.uid.clone());
+    }
+    if afters.iter().flatten().any(|a| !uids.contains(a)) {
+        return unsorted;
+    }
+    let mut sorted = unsorted;
+    loop {
+        let mut moved = false;
+        'outer: for outer in 0..sorted.len() {
+            for inner in 0..sorted.len() {
+                if inner == outer {
+                    continue;
+                }
+                if sorted[inner].after.as_deref() == Some(sorted[outer].uid.as_str()) && inner != outer + 1 {
+                    if outer + 1 == sorted.len() {
+                        let item = sorted.remove(inner);
+                        sorted.push(item);
+                    } else {
+                        sorted.swap(inner, outer + 1);
+                    }
+                    moved = true;
+                    break 'outer;
+                }
+            }
+        }
+        if !moved {
+            return sorted;
+        }
+    }
+}
+
+fn has_cycle(check: &LayerRecord, layers: &[LayerRecord]) -> bool {
+    let mut seen = BTreeSet::from([check.uid.clone()]);
+    let mut current = check;
+    while let Some(prev) = current.after.as_ref().and_then(|a| layers.iter().find(|l| &l.uid == a)) {
+        if !seen.insert(prev.uid.clone()) {
+            return true;
+        }
+        current = prev;
+    }
+    false
 }
 
 /// What a new mission is created with.
@@ -870,6 +1012,108 @@ impl MissionStore {
         state.invitations.iter().find(|i| i.token == token).cloned()
     }
 
+    // --- layers -----------------------------------------------------------------
+
+    pub fn layer(&self, guid: &str, uid: &str) -> Option<LayerRecord> {
+        let state = self.state.read().unwrap();
+        state.layers.get(guid)?.iter().find(|l| l.uid == uid).cloned()
+    }
+
+    /// `findMissionLayers` + `sortMissionLayers`: the top-level layers with
+    /// their descendants, each level sorted.
+    pub fn layer_trees(&self, guid: &str) -> Vec<LayerTree> {
+        let state = self.state.read().unwrap();
+        let all = state.layers.get(guid).cloned().unwrap_or_default();
+        fn build(all: &[LayerRecord], parent: Option<&str>) -> Vec<LayerTree> {
+            let level: Vec<LayerRecord> = all.iter().filter(|l| l.parent.as_deref() == parent).cloned().collect();
+            sort_layers(level)
+                .into_iter()
+                .map(|layer| {
+                    let children = build(all, Some(&layer.uid));
+                    LayerTree { layer, children }
+                })
+                .collect()
+        }
+        build(&all, None)
+    }
+
+    /// One layer and its descendants (`hydrateMissionLayer`).
+    pub fn layer_tree(&self, guid: &str, uid: &str) -> Option<LayerTree> {
+        let layer = self.layer(guid, uid)?;
+        let state = self.state.read().unwrap();
+        let all = state.layers.get(guid).cloned().unwrap_or_default();
+        fn children(all: &[LayerRecord], parent: &str) -> Vec<LayerTree> {
+            let level: Vec<LayerRecord> = all.iter().filter(|l| l.parent.as_deref() == Some(parent)).cloned().collect();
+            sort_layers(level).into_iter().map(|layer| LayerTree { children: children(all, &layer.uid), layer }).collect()
+        }
+        Some(LayerTree { children: children(&all, uid), layer })
+    }
+
+    /// `MissionLayerRepository.fixupAfter(uid, parent, after)`: the sibling
+    /// (under `parent`) whose `after` is `after` now comes after `uid`.
+    fn fixup_after(&self, state: &mut State, guid: &str, uid: Option<&str>, parent: Option<&str>, after: Option<&str>) -> Result<(), MissionError> {
+        let targets: Vec<String> = state
+            .layers
+            .get(guid)
+            .map(|layers| {
+                layers
+                    .iter()
+                    .filter(|l| uid.is_none_or(|u| u != l.uid) && l.parent.as_deref() == parent && l.after.as_deref() == after)
+                    .map(|l| l.uid.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for target in targets {
+            self.record(state, Event::LayerAfterSet { guid: guid.into(), uid: target, after: uid.map(String::from) })?;
+        }
+        Ok(())
+    }
+
+    /// `addMissionLayer` for a layer that doesn't exist yet: insert it
+    /// after `after` under `parent`.
+    pub fn add_layer(&self, guid: &str, layer: LayerRecord) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        self.fixup_after(&mut state, guid, Some(&layer.uid), layer.parent.as_deref(), layer.after.as_deref())?;
+        self.record(&mut state, Event::LayerSaved { guid: guid.into(), layer })
+    }
+
+    pub fn rename_layer(&self, guid: &str, uid: &str, name: &str) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        self.record(&mut state, Event::LayerNamed { guid: guid.into(), uid: uid.into(), name: name.into() })
+    }
+
+    /// `setLayerParent`: take the layer out of its place, insert it after
+    /// `after` under `parent`.
+    pub fn move_layer(&self, guid: &str, uid: &str, parent: Option<&str>, after: Option<&str>) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        let Some(layer) = state.layers.get(guid).and_then(|ls| ls.iter().find(|l| l.uid == uid)).cloned() else {
+            return Err(MissionError::NotFound(uid.into()));
+        };
+        self.fixup_after(&mut state, guid, layer.after.as_deref(), layer.parent.as_deref(), Some(uid))?;
+        self.fixup_after(&mut state, guid, Some(uid), parent, after)?;
+        if layer.parent.as_deref() != parent || layer.parent.is_none() {
+            self.record(&mut state, Event::LayerParentSet { guid: guid.into(), uid: uid.into(), parent: parent.map(String::from) })?;
+        }
+        // `setAfter` only matches when the stored parent equals `parent`.
+        let current_parent = state.layers.get(guid).and_then(|ls| ls.iter().find(|l| l.uid == uid)).and_then(|l| l.parent.clone());
+        if current_parent.as_deref() == parent {
+            self.record(&mut state, Event::LayerAfterSet { guid: guid.into(), uid: uid.into(), after: after.map(String::from) })?;
+        }
+        Ok(())
+    }
+
+    /// Close the gap a layer leaves (`fixupAfter(layer.after, parent, uid)`)
+    /// and delete it.
+    pub fn delete_layer(&self, guid: &str, uid: &str) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        let Some(layer) = state.layers.get(guid).and_then(|ls| ls.iter().find(|l| l.uid == uid)).cloned() else {
+            return Ok(());
+        };
+        self.fixup_after(&mut state, guid, layer.after.as_deref(), layer.parent.as_deref(), Some(uid))?;
+        self.record(&mut state, Event::LayerDeleted { guid: guid.into(), uid: uid.into() })
+    }
+
     // --- log entries ----------------------------------------------------------
 
     pub fn save_log_entry(&self, entry: LogEntryRecord) -> Result<LogEntryRecord, MissionError> {
@@ -1065,6 +1309,54 @@ mod tests {
         assert!(store.invitations_for("Alpha", InvitationType::UserName).is_empty());
         store.uninvite(&m.guid, "alpha", InvitationType::Callsign).unwrap();
         assert!(store.invitations(&m.guid).is_empty());
+    }
+
+    fn layer(uid: &str, after: Option<&str>, parent: Option<&str>) -> LayerRecord {
+        LayerRecord {
+            uid: uid.into(),
+            name: Some(uid.into()),
+            layer_type: LayerType::Group,
+            parent: parent.map(String::from),
+            after: after.map(String::from),
+        }
+    }
+
+    fn order(trees: &[LayerTree]) -> Vec<String> {
+        trees.iter().map(|t| t.layer.uid.clone()).collect()
+    }
+
+    /// `MissionLayer.sort` and `fixupAfter`: inserting after a layer pushes
+    /// its old follower behind the new one; moving and deleting close the
+    /// gap.
+    #[test]
+    fn layers_keep_the_official_order() {
+        let store = MissionStore::in_memory();
+        let m = new_mission(&store, "Ops", 1_000);
+        store.add_layer(&m.guid, layer("a", None, None)).unwrap();
+        store.add_layer(&m.guid, layer("c", Some("a"), None)).unwrap();
+        store.add_layer(&m.guid, layer("b", Some("a"), None)).unwrap();
+        assert_eq!(order(&store.layer_trees(&m.guid)), ["a", "b", "c"], "b went between a and c");
+        store.add_layer(&m.guid, layer("first", None, None)).unwrap();
+        assert_eq!(order(&store.layer_trees(&m.guid)), ["first", "a", "b", "c"]);
+
+        store.add_layer(&m.guid, layer("child", None, Some("b"))).unwrap();
+        assert_eq!(order(&store.layer_trees(&m.guid)[2].children), ["child"]);
+
+        store.move_layer(&m.guid, "a", Some("b"), Some("child")).unwrap();
+        let trees = store.layer_trees(&m.guid);
+        assert_eq!(order(&trees), ["first", "b", "c"]);
+        assert_eq!(order(&trees[1].children), ["child", "a"]);
+
+        store.delete_layer(&m.guid, "b").unwrap();
+        assert_eq!(order(&store.layer_trees(&m.guid)), ["first", "c"], "c now follows first");
+    }
+
+    #[test]
+    fn a_broken_after_chain_stays_unsorted() {
+        let unsorted = vec![layer("x", Some("missing"), None), layer("y", None, None)];
+        assert_eq!(sort_layers(unsorted.clone()), unsorted);
+        let cycle = vec![layer("p", Some("q"), None), layer("q", Some("p"), None)];
+        assert_eq!(sort_layers(cycle.clone()), cycle);
     }
 
     #[test]

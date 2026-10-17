@@ -38,7 +38,7 @@ use super::PeerIdentity;
 use crate::groups::GroupStore;
 use crate::latest_cot::LatestCot;
 use crate::missions::{
-    ChangeRecord, Content, InvitationRecord, InvitationType, LogEntryRecord, MissionError, MissionFields,
+    ChangeRecord, Content, InvitationRecord, LayerRecord, LayerTree, LayerType, InvitationType, LogEntryRecord, MissionError, MissionFields,
     MissionRecord, MissionStore, NewMission, Permission, Role, SubscriptionRecord, Window,
 };
 use crate::sync::ResourceStore;
@@ -133,6 +133,14 @@ pub fn router_with(state: MissionsState) -> Router {
         .route("/Marti/api/missions/:name/log", get(logs_for_mission))
         .route("/Marti/api/missions/:name/cot", get(cot_by_name))
         .route("/Marti/api/missions/guid/:guid/cot", get(cot_by_guid))
+        .route("/Marti/api/missions/:name/layers", get(layers_by_name).put(create_layer_by_name).delete(delete_layers_by_name))
+        .route("/Marti/api/missions/guid/:guid/layers", get(layers_by_guid).put(create_layer_by_guid).delete(delete_layers_by_guid))
+        .route("/Marti/api/missions/:name/layers/parent", put(set_layer_parent_by_name))
+        .route("/Marti/api/missions/guid/:guid/layers/parent", put(set_layer_parent_by_guid))
+        .route("/Marti/api/missions/:name/layers/:layer", get(layer_by_name))
+        .route("/Marti/api/missions/guid/:guid/layers/:layer", get(layer_by_guid))
+        .route("/Marti/api/missions/:name/layers/:layer/name", put(rename_layer_by_name))
+        .route("/Marti/api/missions/guid/:guid/layers/:layer/name", put(rename_layer_by_guid))
         .route("/Marti/api/missions/:name/password", put(set_password_by_name).delete(remove_password_by_name))
         .route("/Marti/api/missions/guid/:guid/password", put(set_password_by_guid).delete(remove_password_by_guid))
         .route("/Marti/api/missions/:name/expiration", put(set_expiration_by_name))
@@ -1021,8 +1029,36 @@ fn add_contents_impl(state: &MissionsState, caller: &Caller, mission: MissionRec
         state.store.add_content(&mission.guid, Content::Uid(uid), &creator, now)?;
         added += 1;
     }
+    announce_latest_changes(state, &mission, added, &creator)?;
+    // `paths`: each item is also filed as an ITEM layer under the path's
+    // layer, chained by `after` (`addMissionContentImpl`).
+    if let Some(paths) = content.get("paths").and_then(|p| p.as_object()) {
+        for (path, contents) in paths {
+            for item in contents.as_array().into_iter().flatten() {
+                let list = |k: &str| -> Vec<String> {
+                    item.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
+                };
+                let mut after = item.get("after").and_then(|a| a.as_str()).map(String::from);
+                let mut filed = Vec::new();
+                for hash in list("hashes") {
+                    if !state.resources.by_hash(&hash, None).is_empty() {
+                        filed.push(Content::Hash(hash));
+                    }
+                }
+                filed.extend(list("uids").into_iter().map(Content::Uid));
+                for content in filed {
+                    state.store.add_content(&mission.guid, content.clone(), &creator, now)?;
+                    announce_latest_changes(state, &mission, 1, &creator)?;
+                    let uid = match &content {
+                        Content::Hash(h) | Content::Uid(h) => h.clone(),
+                    };
+                    add_layer(state, &mission, Some(uid.clone()), None, LayerType::Item, Some(path.clone()), after.clone(), &creator)?;
+                    after = Some(uid);
+                }
+            }
+        }
+    }
     let updated = state.store.by_guid(&mission.guid).ok_or(ApiError::Internal)?;
-    announce_latest_changes(state, &updated, added, &creator)?;
     // The official response copies the mission and clears its groups.
     let json = mission_json(state, &updated, &BTreeSet::new(), MissionExtras::default());
     ok("Mission", json!([json]))
@@ -1293,6 +1329,297 @@ async fn clear_hash_keywords(
     RawQuery(query): RawQuery,
 ) -> ApiResult {
     clear_content_keywords_impl(state, identity, headers, name, Content::Hash(hash), query).await
+}
+
+// --- layers ----------------------------------------------------------------------------------
+
+/// `addMissionLayer`: an existing uid is moved instead; a new layer is
+/// inserted after `after` under `parent` (stored as given) and announced.
+#[allow(clippy::too_many_arguments)]
+fn add_layer(
+    state: &MissionsState,
+    mission: &MissionRecord,
+    uid: Option<String>,
+    name: Option<String>,
+    layer_type: LayerType,
+    parent: Option<String>,
+    after: Option<String>,
+    creator: &str,
+) -> Result<Value, ApiError> {
+    if let Some(uid) = &uid
+        && let Some(existing) = state.store.layer(&mission.guid, uid) {
+            move_layer(state, mission, uid, parent.as_deref(), after.as_deref(), creator)?;
+            return Ok(layer_json(&existing, state.store.layer(&mission.guid, existing.parent.as_deref().unwrap_or("")).map(|p| p.uid)));
+        }
+    let layer = LayerRecord { uid: uid.unwrap_or_else(random_uuid), name, layer_type, parent: parent.clone(), after };
+    state.store.add_layer(&mission.guid, layer.clone())?;
+    // The announced object's parent is the parent *found* (null if none).
+    let found_parent = parent.as_deref().and_then(|p| state.store.layer(&mission.guid, p)).map(|p| p.uid);
+    let xml = MissionNotifier::layer_xml(&layer, found_parent.as_deref());
+    state.notifier.announce(mission, ChangeKind::MissionLayer, creator, Some(&xml));
+    Ok(layer_json(&layer, found_parent))
+}
+
+/// `setLayerParent`: 404 if the layer, or a given parent, doesn't exist.
+fn move_layer(state: &MissionsState, mission: &MissionRecord, uid: &str, parent: Option<&str>, after: Option<&str>, creator: &str) -> Result<(), ApiError> {
+    let Some(layer) = state.store.layer(&mission.guid, uid) else {
+        return Err(ApiError::NotFound(String::new()));
+    };
+    if let Some(parent) = parent
+        && state.store.layer(&mission.guid, parent).is_none() {
+            return Err(ApiError::NotFound(String::new()));
+        }
+    state.store.move_layer(&mission.guid, uid, parent, after)?;
+    let updated = LayerRecord { parent: parent.map(String::from), after: after.map(String::from), ..layer };
+    let xml = MissionNotifier::layer_xml(&updated, parent);
+    state.notifier.announce(mission, ChangeKind::MissionLayer, creator, Some(&xml));
+    Ok(())
+}
+
+/// `MissionLayer` JSON (`NON_EMPTY`) without children or content.
+fn layer_json(layer: &LayerRecord, parent_uid: Option<String>) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("uid".into(), layer.uid.clone().into());
+    if let Some(name) = layer.name.as_ref().filter(|n| !n.is_empty()) {
+        out.insert("name".into(), name.clone().into());
+    }
+    out.insert("type".into(), layer.layer_type.name().into());
+    if let Some(parent) = parent_uid {
+        out.insert("parentUid".into(), parent.into());
+    }
+    Value::Object(out)
+}
+
+/// `hydrateMissionLayers`: each level as `MissionLayer` JSON; ITEM children
+/// are folded into their UID / CONTENTS parent's `uids` / `contents` (and
+/// dropped from `mission_layers`) wherever they have a parent.
+fn hydrated_layers(state: &MissionsState, mission: &MissionRecord, trees: &[LayerTree], parent: Option<&LayerTree>) -> Vec<Value> {
+    let adds = mission_json(state, mission, &BTreeSet::new(), MissionExtras { details: true, ..Default::default() });
+    hydrate_level(&adds, trees, parent)
+}
+
+fn hydrate_level(adds: &Value, trees: &[LayerTree], parent: Option<&LayerTree>) -> Vec<Value> {
+    trees
+        .iter()
+        .filter(|t| parent.is_none() || t.layer.layer_type != LayerType::Item)
+        .map(|tree| {
+            let mut json = layer_json(&tree.layer, tree.layer.parent.clone().filter(|_| parent.is_some()));
+            let map = json.as_object_mut().expect("object");
+            let items: Vec<&LayerTree> = tree.children.iter().filter(|c| c.layer.layer_type == LayerType::Item).collect();
+            let pick = |key: &str, id: &dyn Fn(&Value) -> Option<String>| -> Vec<Value> {
+                items
+                    .iter()
+                    .filter_map(|item| adds[key].as_array()?.iter().find(|a| id(a).as_deref() == Some(item.layer.uid.as_str())).cloned())
+                    .collect()
+            };
+            match tree.layer.layer_type {
+                LayerType::Uid => {
+                    let uids = pick("uids", &|a| a["data"].as_str().map(String::from));
+                    if !uids.is_empty() {
+                        map.insert("uids".into(), uids.into());
+                    }
+                }
+                LayerType::Contents => {
+                    let contents = pick("contents", &|a| a["data"]["hash"].as_str().map(String::from));
+                    if !contents.is_empty() {
+                        map.insert("contents".into(), contents.into());
+                    }
+                }
+                _ => {}
+            }
+            let children = hydrate_level(adds, &tree.children, Some(tree));
+            if !children.is_empty() {
+                map.insert("mission_layers".into(), children.into());
+            }
+            json
+        })
+        .collect()
+}
+
+fn layers_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionRead)?;
+    let trees = state.store.layer_trees(&mission.guid);
+    ok("MissionLayer", hydrated_layers(state, &mission, &trees, None).into())
+}
+
+fn layer_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, uid: &str) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionRead)?;
+    let tree = state.store.layer_tree(&mission.guid, uid).ok_or_else(|| ApiError::NotFound(String::new()))?;
+    let mut hydrated = hydrated_layers(state, &mission, std::slice::from_ref(&tree), None);
+    let mut layer = hydrated.remove(0);
+    if let Some(parent) = &tree.layer.parent {
+        layer["parentUid"] = parent.clone().into();
+    }
+    ok("MissionLayer", layer)
+}
+
+fn required<'a>(params: &'a Params, name: &str) -> Result<&'a str, ApiError> {
+    params.get(name).ok_or_else(|| ApiError::BadRequest(format!("Required request parameter '{name}' is not present")))
+}
+
+fn create_layer_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionWrite)?;
+    let name = required(params, "name")?.to_string();
+    let layer_type = required(params, "type")?;
+    let layer_type = LayerType::parse(layer_type).ok_or_else(|| ApiError::BadRequest(format!("invalid layer type '{layer_type}'")))?;
+    let creator = required(params, "creatorUid")?.to_string();
+    let opt = |k: &str| params.get(k).filter(|v| !v.is_empty()).map(String::from);
+    let json = add_layer(state, &mission, opt("uid"), Some(name), layer_type, opt("parentUid"), opt("afterUid"), &creator)?;
+    ok("MissionLayer", json)
+}
+
+fn rename_layer_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, uid: &str, params: &Params) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionWrite)?;
+    let name = required(params, "name")?.to_string();
+    let creator = required(params, "creatorUid")?.to_string();
+    let layer = state.store.layer(&mission.guid, uid).ok_or_else(|| ApiError::NotFound(String::new()))?;
+    state.store.rename_layer(&mission.guid, uid, &name)?;
+    let updated = LayerRecord { name: Some(name), ..layer };
+    let parent = updated.parent.as_deref().and_then(|p| state.store.layer(&mission.guid, p)).map(|p| p.uid);
+    let xml = MissionNotifier::layer_xml(&updated, parent.as_deref());
+    state.notifier.announce(&mission, ChangeKind::MissionLayer, &creator, Some(&xml));
+    Ok(StatusCode::OK.into_response())
+}
+
+fn set_layer_parent_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionWrite)?;
+    let creator = required(params, "creatorUid")?.to_string();
+    let layers = params.all("layerUid");
+    if layers.is_empty() {
+        return Err(ApiError::BadRequest("Required request parameter 'layerUid' is not present".into()));
+    }
+    let parent = params.get("parentUid").filter(|p| !p.is_empty()).map(String::from);
+    let mut after = params.get("afterUid").filter(|a| !a.is_empty()).map(String::from);
+    for uid in layers {
+        move_layer(state, &mission, &uid, parent.as_deref(), after.as_deref(), &creator)?;
+        after = Some(uid);
+    }
+    Ok(StatusCode::OK.into_response())
+}
+
+/// `removeMissionLayer`: the layer, its descendants, and the content filed
+/// in it (removed from the mission); an unknown layer is ignored.
+fn delete_layers_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionWrite)?;
+    let creator = required(params, "creatorUid")?.to_string();
+    let uids = params.all("uid");
+    if uids.is_empty() {
+        return Err(ApiError::BadRequest("Required request parameter 'uid' is not present".into()));
+    }
+    for uid in uids {
+        let Some(tree) = state.store.layer_tree(&mission.guid, &uid) else { continue };
+        remove_layer_tree(state, &mission, &tree, &creator)?;
+        let xml = MissionNotifier::layer_xml(&tree.layer, tree.layer.parent.as_deref());
+        state.notifier.announce(&mission, ChangeKind::MissionLayer, &creator, Some(&xml));
+    }
+    Ok(StatusCode::OK.into_response())
+}
+
+fn remove_layer_tree(state: &MissionsState, mission: &MissionRecord, tree: &LayerTree, creator: &str) -> Result<(), ApiError> {
+    for child in &tree.children {
+        remove_layer_tree(state, mission, child, creator)?;
+    }
+    let current = state.store.by_guid(&mission.guid).ok_or(ApiError::Internal)?;
+    let filed: Vec<Content> = tree
+        .children
+        .iter()
+        .filter(|c| c.layer.layer_type == LayerType::Item)
+        .filter_map(|c| match tree.layer.layer_type {
+            LayerType::Uid => Some(Content::Uid(c.layer.uid.clone())),
+            LayerType::Contents => Some(Content::Hash(c.layer.uid.clone())),
+            _ => None,
+        })
+        .filter(|c| current.has(c))
+        .collect();
+    for content in filed {
+        state.store.remove_content(&mission.guid, content, creator, now_ms())?;
+        announce_latest_changes(state, mission, 1, creator)?;
+    }
+    state.store.delete_layer(&mission.guid, &tree.layer.uid)?;
+    Ok(())
+}
+
+macro_rules! layer_handlers {
+    ($by_name:ident, $by_guid:ident, $impl_fn:ident) => {
+        async fn $by_name(
+            State(state): State<MissionsState>,
+            Extension(identity): Extension<PeerIdentity>,
+            headers: HeaderMap,
+            Path(name): Path<String>,
+            RawQuery(query): RawQuery,
+        ) -> ApiResult {
+            let caller = caller(&state, &identity, &headers);
+            let mission = existing(&state, &caller, Key::Name(&name))?;
+            $impl_fn(&state, &caller, mission, &Params::parse(query)?)
+        }
+
+        async fn $by_guid(
+            State(state): State<MissionsState>,
+            Extension(identity): Extension<PeerIdentity>,
+            headers: HeaderMap,
+            Path(guid): Path<String>,
+            RawQuery(query): RawQuery,
+        ) -> ApiResult {
+            let caller = caller(&state, &identity, &headers);
+            let mission = existing(&state, &caller, Key::Guid(&guid))?;
+            $impl_fn(&state, &caller, mission, &Params::parse(query)?)
+        }
+    };
+}
+
+fn layers_list_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, _params: &Params) -> ApiResult {
+    layers_impl(state, caller, mission)
+}
+
+layer_handlers!(layers_by_name, layers_by_guid, layers_list_impl);
+layer_handlers!(create_layer_by_name, create_layer_by_guid, create_layer_impl);
+layer_handlers!(delete_layers_by_name, delete_layers_by_guid, delete_layers_impl);
+layer_handlers!(set_layer_parent_by_name, set_layer_parent_by_guid, set_layer_parent_impl);
+
+async fn layer_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((name, layer)): Path<(String, String)>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    layer_impl(&state, &caller, mission, &layer)
+}
+
+async fn layer_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((guid, layer)): Path<(String, String)>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    layer_impl(&state, &caller, mission, &layer)
+}
+
+async fn rename_layer_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((name, layer)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    rename_layer_impl(&state, &caller, mission, &layer, &Params::parse(query)?)
+}
+
+async fn rename_layer_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((guid, layer)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    rename_layer_impl(&state, &caller, mission, &layer, &Params::parse(query)?)
 }
 
 // --- token / password / expiration ---------------------------------------------------------

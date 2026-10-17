@@ -45,6 +45,7 @@ pub enum ChangeKind {
     UidKeyword,
     ResourceKeyword,
     Metadata,
+    MissionLayer,
 }
 
 impl ChangeKind {
@@ -56,6 +57,7 @@ impl ChangeKind {
             ChangeKind::UidKeyword => "t-x-m-c-k-u",
             ChangeKind::ResourceKeyword => "t-x-m-c-k-c",
             ChangeKind::Metadata => "t-x-m-c-m",
+            ChangeKind::MissionLayer => "t-x-m-c-h",
         }
     }
 }
@@ -300,6 +302,23 @@ impl MissionNotifier {
         let xml = mission_message(&mission.guid, &mission.name, cot_type, msg_type, author_uid, &mission.tool, None, None, crate::cot::now_unix_millis());
         let skip = (!author_uid.is_empty()).then(|| author_uid.to_string());
         let _ = self.hub.send(Outbound::server_broadcast(mission.groups.clone(), skip, xml));
+    }
+
+    /// `commonUtil.toXml(missionLayer)`: JAXB `missionLayer`, properties in
+    /// name order (after, name, parentUid, type, uid), absent ones omitted.
+    pub fn layer_xml(layer: &crate::missions::LayerRecord, parent_uid: Option<&str>) -> String {
+        let mut xml = String::from("<missionLayer>");
+        if let Some(after) = &layer.after {
+            xml.push_str(&format!("<after>{}</after>", escape(after)));
+        }
+        if let Some(name) = &layer.name {
+            xml.push_str(&format!("<name>{}</name>", escape(name)));
+        }
+        if let Some(parent) = parent_uid {
+            xml.push_str(&format!("<parentUid>{}</parentUid>", escape(parent)));
+        }
+        xml.push_str(&format!("<type>{}</type><uid>{}</uid></missionLayer>", layer.layer_type.name(), escape(&layer.uid)));
+        xml
     }
 
     /// `commonUtil.toXml(role)`.
