@@ -157,7 +157,8 @@ pub fn extract(package: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
         }
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        files.push((entry.name().to_string(), bytes));
+        let name = entry.name().map_err(|e| e.to_string())?.into_owned();
+        files.push((name, bytes));
     }
     Ok(files)
 }
