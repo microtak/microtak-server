@@ -84,6 +84,11 @@ impl fmt::Display for DecodedItem {
 pub struct StreamDecoder {
     buf: Vec<u8>,
     max_buffered: usize,
+    /// How far into `buf` the search for the current item's terminator has
+    /// already looked without a match, so the next read resumes there
+    /// instead of rescanning everything (quadratic on a trickled event).
+    /// Reset whenever bytes are drained from the front.
+    scanned: usize,
 }
 
 impl Default for StreamDecoder {
@@ -101,6 +106,7 @@ impl StreamDecoder {
         Self {
             buf: Vec::new(),
             max_buffered,
+            scanned: 0,
         }
     }
 
@@ -114,24 +120,28 @@ impl StreamDecoder {
         let mut items = Vec::new();
 
         loop {
-            trim_leading_whitespace(&mut self.buf);
+            if trim_leading_whitespace(&mut self.buf) {
+                self.scanned = 0;
+            }
             if self.buf.is_empty() {
                 break;
             }
 
             match classify(&self.buf) {
                 Shape::Declaration => {
-                    if let Some(end) = find(&self.buf, b"?>") {
+                    if let Some(end) = self.find_terminator(b"?>") {
                         self.buf.drain(..end + 2);
+                        self.scanned = 0;
                         continue;
                     }
                     self.check_size_limit()?;
                     break; // need more data to complete the declaration
                 }
                 Shape::Event => {
-                    if let Some(end) = find(&self.buf, EVENT_CLOSE) {
+                    if let Some(end) = self.find_terminator(EVENT_CLOSE) {
                         let xml_bytes: Vec<u8> =
                             self.buf.drain(..end + EVENT_CLOSE.len()).collect();
+                        self.scanned = 0;
                         let xml = String::from_utf8_lossy(&xml_bytes).into_owned();
                         match Event::from_xml(&xml) {
                             Ok(event) => items.push(DecodedItem::Event {
@@ -160,6 +170,18 @@ impl StreamDecoder {
         }
 
         Ok(items)
+    }
+
+    /// Find `needle` in `buf`, starting where the previous search for it
+    /// stopped (backed off by `needle.len() - 1` so a needle split across
+    /// reads is still found), and remember how far this search got.
+    fn find_terminator(&mut self, needle: &[u8]) -> Option<usize> {
+        let start = self.scanned.saturating_sub(needle.len() - 1);
+        let found = find(&self.buf[start..], needle).map(|pos| start + pos);
+        if found.is_none() {
+            self.scanned = self.buf.len();
+        }
+        found
     }
 
     fn check_size_limit(&self) -> Result<(), StreamError> {
@@ -210,12 +232,14 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn trim_leading_whitespace(buf: &mut Vec<u8>) {
+/// Drop leading whitespace; returns whether anything was removed.
+fn trim_leading_whitespace(buf: &mut Vec<u8>) -> bool {
     let end = buf
         .iter()
         .position(|b| !b.is_ascii_whitespace())
         .unwrap_or(buf.len());
     buf.drain(..end);
+    end > 0
 }
 
 #[cfg(test)]
@@ -319,6 +343,37 @@ mod tests {
             .feed(b"<?xml version=\"1.0\" this never closes")
             .expect_err("should hit the size limit");
         assert!(matches!(err, StreamError::TooLarge { .. }));
+    }
+
+    /// A client trickling one large event a byte per read must not make the
+    /// decoder rescan everything buffered so far on every read: that's
+    /// quadratic (~2·10⁹ comparisons for 64 KB) and lets one connection burn
+    /// seconds of CPU per event. Scanning resumes where it left off.
+    #[test]
+    fn trickled_large_event_is_decoded_in_linear_time() {
+        let padding = "x".repeat(DEFAULT_MAX_BUFFERED - 1_024);
+        let xml = event_xml("TRICKLE").replace("</event>", &format!("<remarks>{padding}</remarks></event>"));
+        assert!(xml.len() < DEFAULT_MAX_BUFFERED);
+        let mut decoder = StreamDecoder::new();
+        let started = std::time::Instant::now();
+        let mut items = Vec::new();
+        for byte in xml.as_bytes() {
+            items.extend(decoder.feed(std::slice::from_ref(byte)).unwrap());
+        }
+        let elapsed = started.elapsed();
+        assert!(matches!(&items[..], [DecodedItem::Event { event, .. }] if event.uid == "TRICKLE"));
+        assert!(elapsed < std::time::Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    /// The resumed scan must still find a closing tag split across reads.
+    #[test]
+    fn closing_tag_split_across_reads_is_found() {
+        let xml = event_xml("SPLIT-CLOSE");
+        let (head, tail) = xml.split_at(xml.len() - 4); // "...</ev" | "ent>"
+        let mut decoder = StreamDecoder::new();
+        assert!(decoder.feed(head.as_bytes()).unwrap().is_empty());
+        let items = decoder.feed(tail.as_bytes()).unwrap();
+        assert!(matches!(&items[..], [DecodedItem::Event { event, .. }] if event.uid == "SPLIT-CLOSE"));
     }
 
     #[test]
