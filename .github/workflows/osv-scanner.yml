@@ -1,0 +1,27 @@
+name: OSV-Scanner
+
+# Known vulnerabilities and unmaintained crates in Cargo.lock, from
+# osv.dev (RustSec et al.). Trivy's database missed RustSec advisories
+# that this catches. Also runs weekly: new advisories appear without any
+# change here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Scan Cargo.lock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Exits non-zero on any finding, failing the job.
+      - name: OSV-Scanner
+        run: docker run --rm -v "$PWD:/src:ro" ghcr.io/google/osv-scanner:v2.2.3 scan source --lockfile /src/Cargo.lock

@@ -11,8 +11,16 @@ concurrency:
 
 jobs:
   test:
-    name: Build, test, and lint
-    runs-on: ubuntu-latest
+    name: Build, test, and lint (${{ matrix.arch }})
+    # arm64 natively too: Raspberry Pi-class boards are a stated target.
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -36,8 +44,15 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
   docker-build:
-    name: Docker image builds
-    runs-on: ubuntu-latest
+    name: Docker image builds (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 

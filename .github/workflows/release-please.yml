@@ -32,3 +32,14 @@ jobs:
     permissions:
       contents: read
       packages: write
+
+  # Release binaries (x86_64 + aarch64 Linux) attached to the draft release,
+  # which is then published -- see publish-binaries.yml.
+  publish-binaries:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    uses: ./.github/workflows/publish-binaries.yml
+    with:
+      tag_name: ${{ needs.release-please.outputs.tag_name }}
+    permissions:
+      contents: write

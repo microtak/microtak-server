@@ -16,7 +16,7 @@
 - A **systemd unit file** (`microtak-server.service`) with sensible restart/hardening settings.
 - A **dedicated system user** (matching the Docker image's own non-root `microtak` user, uid, and `/var/lib/microtak-server` layout) and a packaging-side postinstall step to create it.
 - A **packaged default config** (`/etc/microtak/microtak.toml`) and documented `MICROTAK_CONFIG` env var override, matching what the Docker image and Helm chart already assume.
-- **Standalone release binaries** for `microtak-server` itself (currently Docker-only) — `microtak-admin-cli` already has this pattern (`.github/workflows/publish-binaries.yml`); `microtak-server` needs the same.
+- ~~**Standalone release binaries** for `microtak-server` itself~~ — done 2026-10-17: `publish-binaries.yml`, x86_64 and aarch64 Linux, built natively on GitHub's arm64 runners.
 
 None of the three packaging targets below are meaningfully startable until this exists, so it's Phase 0, not optional polish.
 
@@ -69,3 +69,5 @@ Already partly done for `microtak-admin-cli`. Extend to `microtak-server` (Phase
 
 - One unified "MicroTAK ecosystem version" — `microtak-server`, `microtak-admin-cli`, and `microtak-admin-web` each version independently via their own `release-please` pipeline, same as any other multi-repo ecosystem (Kubernetes' own `kubectl`/`kubeadm`/`kubelet` version independently too). Packaging metadata for each tracks its own repo's tags, not a shared number.
 - Packaging `microtak-admin-web` is deliberately left out of this plan until it actually exists and its own deployment shape (likely another systemd service, or container-only) is settled.
+
+**Update 2026-10-17:** multi-arch is done for the non-Nix paths too: the Docker image (`linux/amd64` + `linux/arm64`) and release binaries of all three tools (x86_64 + aarch64 Linux) build natively on GitHub's `ubuntu-24.04-arm` runners (no QEMU, no `cross`), and CI runs the server's tests on both architectures. macOS binaries remain open.

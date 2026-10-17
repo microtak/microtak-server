@@ -1,0 +1,72 @@
+name: Publish release binaries
+
+# Releases here are immutable (org setting): assets can only be attached
+# *before* a release is published. So release-please creates the release as
+# a **draft** (release-please-config.json: "draft" + "force-tag-creation",
+# the latter so the tag exists immediately and the next release PR still
+# finds this release), this workflow builds and uploads the binaries to the
+# draft, and only then publishes it. A failed build leaves an unpublished
+# draft -- never a published release without binaries.
+#
+# Chained from release-please.yml via workflow_call (a release created with
+# the workflow's own GITHUB_TOKEN doesn't fire release events). Can also be
+# run by hand for a draft release that's still waiting for its binaries.
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Tag of the draft release to build, upload to, and publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Each target builds natively on its own runner (no cross toolchain).
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG: ${{ inputs.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ARCHIVE: microtakd-${{ matrix.target }}.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --locked --bin microtakd
+
+      - name: Package
+        run: tar czf "$ARCHIVE" -C target/release microtakd
+
+      # `gh` finds draft releases by tag (the REST "get release by tag"
+      # endpoint, which some upload actions rely on, doesn't return drafts).
+      - name: Upload to the draft release
+        run: gh release upload "$TAG" "$ARCHIVE" --clobber
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Publish the release
+        run: gh release edit "${{ inputs.tag_name }}" --draft=false --latest

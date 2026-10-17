@@ -123,11 +123,12 @@ hardware other TAK servers can't touch.
   content) is stored under `data_dir`; size scales with how much mission
   content you upload, not with client count. Add extra headroom if you
   enable periodic backups.
-- **OS / architecture**: Linux, x86_64. The Docker image and prebuilt
-  release binaries currently target `x86_64-linux` (glibc). ARM builds (for
-  a Pi) aren't packaged yet — see
-  [docs/PACKAGING.md](docs/PACKAGING.md) — so an ARM device today means
-  building from source with a stable Rust toolchain (edition 2024).
+- **OS / architecture**: Linux on x86_64 or 64-bit ARM (aarch64, e.g. a
+  Raspberry Pi 3/4/5 or Zero 2 W with a 64-bit OS). The Docker image is
+  multi-arch (`linux/amd64`, `linux/arm64`), and each release has
+  `microtakd` binaries for both (`x86_64-` / `aarch64-unknown-linux-gnu`,
+  glibc). Anything else: build from source with a stable Rust toolchain
+  (edition 2024).
 - **Network**: MicroTAK needs four ports reachable by your clients (see the
   table below) — no other services or databases required. It has no
   external runtime dependencies beyond what's in the Docker image.

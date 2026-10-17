@@ -6,6 +6,11 @@ name: Publish Docker image
 # avoid infinite trigger loops. The real trigger for the normal case is
 # release-please.yml calling this workflow directly via workflow_call once
 # it confirms a release was actually cut (see that file's `outputs`).
+#
+# Multi-arch (linux/amd64 + linux/arm64, e.g. a Raspberry Pi): each
+# platform builds natively on its own runner (QEMU emulation makes a Rust
+# build take most of an hour), pushes by digest, and a final job combines
+# the digests into one multi-arch tag set.
 on:
   release:
     types: [published]
@@ -19,9 +24,21 @@ permissions:
   contents: read
   packages: write
 
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
 jobs:
-  docker:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,31 +54,72 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # Registry-backed layer cache per platform -- reuses the Rust
+          # dependency-build layer across releases.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       # release-please-config.json sets include-component-in-tag: false, so
-      # tags are plain "vX.Y.Z" (not "microtak-server-vX.Y.Z") -- required
-      # for docker/metadata-action's semver pattern matching below to parse
-      # them at all. From "v1.2.3" this produces ghcr.io/<owner>/<repo>
-      # tagged :1.2.3, :1.2, :1, and :latest.
+      # tags are plain "vX.Y.Z" -- required for the semver patterns below.
+      # From "v1.2.3": :1.2.3, :1.2, :1 and :latest.
       - name: Compute image tags
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=semver,pattern={{version}},value=${{ inputs.tag_name || github.event.release.tag_name }}
             type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag_name || github.event.release.tag_name }}
             type=semver,pattern={{major}},value=${{ inputs.tag_name || github.event.release.tag_name }}
             type=raw,value=latest
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # Registry-backed layer cache -- reuses the Rust dependency-build
-          # layer across releases so an unrelated one-line doc change
-          # doesn't force a full ~25s dependency recompile from scratch.
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+      - name: Create the multi-arch manifest
+        working-directory: /tmp/digests
+        # Word splitting intended: one "-t tag" pair and one digest per word.
+        run: |
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      - name: Inspect
+        run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
