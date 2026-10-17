@@ -34,6 +34,7 @@ use tracing::{debug, info, warn};
 
 use super::codec::{DecodedItem, StreamDecoder};
 use super::connections::{ClientEndpoint, ConnectedClients, Transport, UnregisterOnDrop};
+use super::admission::Admission;
 use super::hub::{Outbound, RelayHub};
 use super::identity::{self, Verdict};
 use crate::groups::{Direction, GroupStore};
@@ -117,6 +118,7 @@ pub struct TlsRelay {
     registry: Arc<DeviceRegistry>,
     clients: ConnectedClients,
     groups: Arc<GroupStore>,
+    admission: Admission,
 }
 
 impl TlsRelay {
@@ -135,7 +137,16 @@ impl TlsRelay {
             registry,
             clients,
             groups: Arc::new(GroupStore::in_memory()),
+            admission: Admission::default(),
         })
+    }
+
+    /// Connection limits and handshake timeout (default:
+    /// [`AdmissionLimits::default`](crate::transport::admission::AdmissionLimits)).
+    /// Pass the server-wide instance so the total cap covers all listeners.
+    pub fn with_admission(mut self, admission: Admission) -> Self {
+        self.admission = admission;
+        self
     }
 
     /// Use `groups` for routing (default: an empty store, where every
@@ -157,6 +168,11 @@ impl TlsRelay {
     pub async fn run(self) -> std::io::Result<()> {
         loop {
             let (stream, peer) = self.listener.accept().await?;
+            let Some(permit) = self.admission.admit(peer.ip()) else {
+                warn!(%peer, "connection limit reached, refusing CoT connection");
+                continue;
+            };
+            let handshake_timeout = self.admission.handshake_timeout();
             let acceptor = self.acceptor.clone();
             let tx = self.hub.sender();
             let rx = self.hub.subscribe();
@@ -164,13 +180,19 @@ impl TlsRelay {
             let clients = self.clients.clone();
             let groups = Arc::clone(&self.groups);
             tokio::spawn(async move {
-                let mut tls_stream = match acceptor.accept(stream).await {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        warn!(%peer, %error, "TLS handshake failed, rejecting client");
-                        return;
-                    }
-                };
+                let _permit = permit;
+                let mut tls_stream =
+                    match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(error)) => {
+                            warn!(%peer, %error, "TLS handshake failed, rejecting client");
+                            return;
+                        }
+                        Err(_) => {
+                            warn!(%peer, "TLS handshake timed out, dropping client");
+                            return;
+                        }
+                    };
 
                 let Some(cn) = peer_common_name(&tls_stream) else {
                     warn!(%peer, "client cert has no extractable Common Name, disconnecting");
@@ -461,6 +483,73 @@ mod tests {
             .unwrap();
 
         TlsConnector::from(Arc::new(client_config))
+    }
+
+    /// A raw TCP connection that never starts the TLS handshake is dropped
+    /// once the handshake timeout passes -- no certificate needed to hold a
+    /// socket otherwise.
+    #[tokio::test]
+    async fn a_stalled_handshake_is_dropped_after_the_timeout() {
+        let fixture = build_fixture();
+        let admission = crate::transport::admission::Admission::new(
+            crate::transport::admission::AdmissionLimits {
+                handshake_timeout: StdDuration::from_millis(200),
+                ..Default::default()
+            },
+        );
+        let relay = TlsRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.server_config.clone(),
+            RelayHub::new(),
+            fixture.registry.clone(),
+            ConnectedClients::new(),
+        )
+        .await
+        .unwrap()
+        .with_admission(admission.clone());
+        let addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+
+        let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 16];
+        let read = timeout(StdDuration::from_secs(2), stalled.read(&mut buf))
+            .await
+            .expect("server must close a stalled handshake, not wait forever");
+        assert!(matches!(read, Ok(0) | Err(_)), "expected EOF/reset, got {read:?}");
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        assert_eq!(admission.open_connections(), 0, "the slot is released");
+    }
+
+    /// Connections beyond the per-address limit are closed right away.
+    #[tokio::test]
+    async fn connections_over_the_per_ip_limit_are_refused() {
+        let fixture = build_fixture();
+        let admission = crate::transport::admission::Admission::new(
+            crate::transport::admission::AdmissionLimits {
+                max_connections_per_ip: 1,
+                ..Default::default()
+            },
+        );
+        let relay = TlsRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.server_config.clone(),
+            RelayHub::new(),
+            fixture.registry.clone(),
+            ConnectedClients::new(),
+        )
+        .await
+        .unwrap()
+        .with_admission(admission);
+        let addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+
+        let _first = connect_client(addr, &fixture, "device-first").await;
+        let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 16];
+        let read = timeout(StdDuration::from_secs(2), second.read(&mut buf))
+            .await
+            .expect("the over-limit connection must be closed promptly");
+        assert!(matches!(read, Ok(0) | Err(_)), "expected EOF/reset, got {read:?}");
     }
 
     /// TC-TLS-01: a client presenting a cert signed by the configured CA

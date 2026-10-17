@@ -67,6 +67,16 @@ pub struct Config {
     /// very first start; `"open"` lets any *new* identity enroll without
     /// one.
     pub enrollment_mode: EnrollmentMode,
+    /// Open connections across all listeners -- see
+    /// `crate::transport::admission`.
+    pub max_connections: usize,
+    /// Open connections from one client address (needs real client
+    /// addresses: direct, or PROXY protocol from a trusted proxy).
+    pub max_connections_per_ip: usize,
+    /// Seconds a client gets to finish the TLS handshake.
+    pub handshake_timeout_seconds: u64,
+    /// Seconds an HTTP listener waits for a request's headers.
+    pub http_header_timeout_seconds: u64,
 }
 
 impl Default for Config {
@@ -94,6 +104,10 @@ impl Default for Config {
             backup_offsite_command: defaults.backup.offsite_command,
             admin_common_name: defaults.admin_common_name,
             enrollment_mode: defaults.enrollment_mode,
+            max_connections: defaults.admission.max_connections,
+            max_connections_per_ip: defaults.admission.max_connections_per_ip,
+            handshake_timeout_seconds: defaults.admission.handshake_timeout.as_secs(),
+            http_header_timeout_seconds: defaults.admission.http_header_timeout.as_secs(),
         }
     }
 }
@@ -191,6 +205,12 @@ impl Config {
             },
             admin_common_name: self.admin_common_name.clone(),
             enrollment_mode: self.enrollment_mode,
+            admission: crate::transport::admission::AdmissionLimits {
+                handshake_timeout: std::time::Duration::from_secs(self.handshake_timeout_seconds.max(1)),
+                http_header_timeout: std::time::Duration::from_secs(self.http_header_timeout_seconds.max(1)),
+                max_connections: self.max_connections.max(1),
+                max_connections_per_ip: self.max_connections_per_ip.max(1),
+            },
         })
     }
 }
@@ -287,6 +307,22 @@ mod tests {
             config.to_app_config(),
             Err(ConfigError::InvalidCertValidity(0))
         ));
+    }
+
+    #[test]
+    fn connection_limits_parse_and_default() {
+        let defaults = Config::default().to_app_config().unwrap().admission;
+        assert_eq!(defaults, crate::transport::admission::AdmissionLimits::default());
+
+        let config: Config = toml::from_str(
+            "max_connections = 200\nmax_connections_per_ip = 5\nhandshake_timeout_seconds = 3\nhttp_header_timeout_seconds = 4\n",
+        )
+        .unwrap();
+        let limits = config.to_app_config().unwrap().admission;
+        assert_eq!(limits.max_connections, 200);
+        assert_eq!(limits.max_connections_per_ip, 5);
+        assert_eq!(limits.handshake_timeout, std::time::Duration::from_secs(3));
+        assert_eq!(limits.http_header_timeout, std::time::Duration::from_secs(4));
     }
 
     #[test]

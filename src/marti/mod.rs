@@ -47,6 +47,8 @@ use hyper_util::service::TowerToHyperService;
 use rustls::ServerConfig;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+
+use crate::transport::admission::Admission;
 use tracing::warn;
 
 pub mod admin;
@@ -123,11 +125,8 @@ pub struct TlsHttpServer {
     listener: TcpListener,
     acceptor: TlsAcceptor,
     router: Router,
+    admission: Admission,
 }
-
-/// How long a client gets to complete the TLS handshake before the
-/// connection is dropped -- stops idle half-open connections from piling up.
-const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl TlsHttpServer {
     pub async fn bind(
@@ -140,7 +139,15 @@ impl TlsHttpServer {
             listener,
             acceptor: TlsAcceptor::from(tls_config),
             router,
+            admission: Admission::default(),
         })
+    }
+
+    /// Connection limits, handshake and request-header timeouts (default:
+    /// [`AdmissionLimits::default`](crate::transport::admission::AdmissionLimits)).
+    pub fn with_admission(mut self, admission: Admission) -> Self {
+        self.admission = admission;
+        self
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -152,11 +159,17 @@ impl TlsHttpServer {
     pub async fn run(self) -> std::io::Result<()> {
         loop {
             let (stream, peer) = self.listener.accept().await?;
+            let Some(permit) = self.admission.admit(peer.ip()) else {
+                warn!(%peer, "connection limit reached, refusing enrollment connection");
+                continue;
+            };
+            let admission = self.admission.clone();
             let acceptor = self.acceptor.clone();
             let router = self.router.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let tls_stream =
-                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    match tokio::time::timeout(admission.handshake_timeout(), acceptor.accept(stream)).await {
                         Ok(Ok(stream)) => stream,
                         Ok(Err(error)) => {
                             if is_plaintext_http(&error) {
@@ -175,7 +188,7 @@ impl TlsHttpServer {
                 let router = router.layer(Extension(axum::extract::ConnectInfo(peer)));
                 let io = TokioIo::new(tls_stream);
                 let service = TowerToHyperService::new(router);
-                if let Err(error) = ConnBuilder::new(TokioExecutor::new())
+                if let Err(error) = http_builder(&admission)
                     .serve_connection(io, service)
                     .await
                 {
@@ -184,6 +197,17 @@ impl TlsHttpServer {
             });
         }
     }
+}
+
+/// The HTTP connection builder both listeners use: request headers must
+/// arrive within the admission's header timeout (Slowloris).
+fn http_builder(admission: &Admission) -> ConnBuilder<TokioExecutor> {
+    let mut builder = ConnBuilder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(admission.http_header_timeout());
+    builder
 }
 
 /// rustls reports a plaintext HTTP request as a record with an invalid
@@ -216,6 +240,7 @@ pub struct MtlsHttpServer {
     listener: TcpListener,
     acceptor: TlsAcceptor,
     router: Router,
+    admission: Admission,
 }
 
 impl MtlsHttpServer {
@@ -229,7 +254,15 @@ impl MtlsHttpServer {
             listener,
             acceptor: TlsAcceptor::from(tls_config),
             router,
+            admission: Admission::default(),
         })
+    }
+
+    /// Connection limits, handshake and request-header timeouts (default:
+    /// [`AdmissionLimits::default`](crate::transport::admission::AdmissionLimits)).
+    pub fn with_admission(mut self, admission: Admission) -> Self {
+        self.admission = admission;
+        self
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -243,16 +276,27 @@ impl MtlsHttpServer {
     pub async fn run(self) -> std::io::Result<()> {
         loop {
             let (stream, peer) = self.listener.accept().await?;
+            let Some(permit) = self.admission.admit(peer.ip()) else {
+                warn!(%peer, "connection limit reached, refusing Marti API connection");
+                continue;
+            };
+            let admission = self.admission.clone();
             let acceptor = self.acceptor.clone();
             let router = self.router.clone();
             tokio::spawn(async move {
-                let tls_stream = match acceptor.accept(stream).await {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        warn!(%peer, %error, "TLS handshake failed for Marti API request, rejecting client");
-                        return;
-                    }
-                };
+                let _permit = permit;
+                let tls_stream =
+                    match tokio::time::timeout(admission.handshake_timeout(), acceptor.accept(stream)).await {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(error)) => {
+                            warn!(%peer, %error, "TLS handshake failed for Marti API request, rejecting client");
+                            return;
+                        }
+                        Err(_) => {
+                            warn!(%peer, "TLS handshake timed out on the Marti API port");
+                            return;
+                        }
+                    };
 
                 let cn = {
                     let (_, connection) = tls_stream.get_ref();
@@ -269,7 +313,7 @@ impl MtlsHttpServer {
                 let router = router.layer(Extension(PeerIdentity(cn)));
                 let io = TokioIo::new(tls_stream);
                 let service = TowerToHyperService::new(router);
-                if let Err(error) = ConnBuilder::new(TokioExecutor::new())
+                if let Err(error) = http_builder(&admission)
                     .serve_connection(io, service)
                     .await
                 {
@@ -277,5 +321,100 @@ impl MtlsHttpServer {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pki::{build_csr, CertificateAuthority};
+    use crate::transport::admission::{Admission, AdmissionLimits};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    fn short_limits() -> Admission {
+        Admission::new(AdmissionLimits {
+            handshake_timeout: Duration::from_millis(200),
+            http_header_timeout: Duration::from_millis(200),
+            ..AdmissionLimits::default()
+        })
+    }
+
+    fn server_cert(ca: &CertificateAuthority) -> (Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>) {
+        let (csr, key) = build_csr("microtak-server").unwrap();
+        let signed = ca
+            .sign_server_csr(&csr, &["microtak-server".to_string()], time::Duration::days(1))
+            .unwrap();
+        (
+            vec![crate::pki::cert_pem_to_der(&signed.cert_pem).unwrap()],
+            rustls::pki_types::PrivateKeyDer::from(key),
+        )
+    }
+
+    async fn assert_closed_within(stream: &mut (impl AsyncReadExt + Unpin), limit: Duration) {
+        let mut buf = [0u8; 64];
+        loop {
+            let read = tokio::time::timeout(limit, stream.read(&mut buf))
+                .await
+                .expect("the server must close the connection, not wait forever");
+            match read {
+                Ok(0) | Err(_) => return,
+                Ok(_) => continue, // e.g. a 408 response before the close
+            }
+        }
+    }
+
+    /// The mTLS API listener drops a connection that never starts the TLS
+    /// handshake (no certificate is needed to hold a socket otherwise).
+    #[tokio::test]
+    async fn mtls_api_drops_a_stalled_handshake() {
+        let ca = CertificateAuthority::generate("Listener Test CA").unwrap();
+        let (chain, key) = server_cert(&ca);
+        let ca_der = crate::pki::cert_pem_to_der(&ca.ca_cert_pem()).unwrap();
+        let tls = crate::transport::tls::server_config(ca_der, chain, key).unwrap();
+        let server = MtlsHttpServer::bind("127.0.0.1:0".parse().unwrap(), Arc::new(tls), Router::new())
+            .await
+            .unwrap()
+            .with_admission(short_limits());
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.run());
+
+        let mut stalled = TcpStream::connect(addr).await.unwrap();
+        assert_closed_within(&mut stalled, Duration::from_secs(2)).await;
+    }
+
+    /// The enrollment listener (no client cert, reachable by anyone) drops a
+    /// connection whose HTTP request headers never complete.
+    #[tokio::test]
+    async fn enrollment_listener_drops_a_never_finished_request() {
+        let ca = CertificateAuthority::generate("Listener Test CA").unwrap();
+        let (chain, key) = server_cert(&ca);
+        let cert = crate::certsource::certified_key(chain, key).unwrap();
+        let tls = crate::transport::tls::server_auth_only_config(Arc::new(
+            crate::certsource::SwappableCert::new(cert),
+        ));
+        let server = TlsHttpServer::bind("127.0.0.1:0".parse().unwrap(), Arc::new(tls), Router::new())
+            .await
+            .unwrap()
+            .with_admission(short_limits());
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.run());
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(crate::pki::cert_pem_to_der(&ca.ca_cert_pem()).unwrap()).unwrap();
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut tls = connector
+            .connect(rustls::pki_types::ServerName::try_from("microtak-server").unwrap(), tcp)
+            .await
+            .unwrap();
+        tls.write_all(b"GET /Marti/api/tls/config HTTP/1.1\r\nHost: microtak-server\r\n")
+            .await
+            .unwrap();
+        assert_closed_within(&mut tls, Duration::from_secs(2)).await;
     }
 }

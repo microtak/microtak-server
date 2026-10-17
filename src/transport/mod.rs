@@ -1,5 +1,7 @@
 //! Transport layer: turns raw byte streams into decoded CoT events and back.
 //!
+//! - [`admission`]: connection limits and the TLS handshake timeout every
+//!   listener applies.
 //! - [`codec`]: transport-agnostic incremental CoT XML stream decoder.
 //! - [`hub`]: the shared broadcast bus [`tcp`] and [`tls`] both relay
 //!   through, so a CoT event is delivered across transports, not just to
@@ -15,6 +17,7 @@
 //! Not yet implemented: TAK Protocol Version 1 binary framing (§2
 //! TC-STREAM-06..08).
 
+pub mod admission;
 pub mod codec;
 pub mod connections;
 pub mod hub;

@@ -18,6 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+use super::admission::Admission;
 use super::codec::{DecodedItem, StreamDecoder};
 use super::connections::{ClientEndpoint, ConnectedClients, Transport, UnregisterOnDrop};
 use super::hub::{Outbound, RelayHub};
@@ -29,6 +30,7 @@ pub struct TcpRelay {
     hub: RelayHub,
     clients: ConnectedClients,
     groups: Arc<GroupStore>,
+    admission: Admission,
 }
 
 impl TcpRelay {
@@ -43,7 +45,15 @@ impl TcpRelay {
             hub,
             clients,
             groups: Arc::new(GroupStore::in_memory()),
+            admission: Admission::default(),
         })
+    }
+
+    /// Connection limits (default:
+    /// [`AdmissionLimits::default`](crate::transport::admission::AdmissionLimits)).
+    pub fn with_admission(mut self, admission: Admission) -> Self {
+        self.admission = admission;
+        self
     }
 
     /// Use `groups` for routing (default: an empty store, where every
@@ -63,11 +73,16 @@ impl TcpRelay {
     pub async fn run(self) -> std::io::Result<()> {
         loop {
             let (stream, peer) = self.listener.accept().await?;
+            let Some(permit) = self.admission.admit(peer.ip()) else {
+                warn!(%peer, "connection limit reached, refusing plain-TCP connection");
+                continue;
+            };
             let tx = self.hub.sender();
             let rx = self.hub.subscribe();
             let clients = self.clients.clone();
             let groups = Arc::clone(&self.groups);
             tokio::spawn(async move {
+                let _permit = permit;
                 handle_client(stream, peer, tx, rx, clients, groups).await;
             });
         }
@@ -190,6 +205,36 @@ mod tests {
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?><event version="2.0" uid="{uid}" type="a-f-G-U-C" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/></event>"#
         )
+    }
+
+    /// The plain-TCP relay is unauthenticated: connections beyond the
+    /// per-address limit are closed right away.
+    #[tokio::test]
+    async fn connections_over_the_per_ip_limit_are_refused() {
+        let admission = crate::transport::admission::Admission::new(
+            crate::transport::admission::AdmissionLimits {
+                max_connections_per_ip: 1,
+                ..Default::default()
+            },
+        );
+        let relay = TcpRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            RelayHub::new(),
+            ConnectedClients::new(),
+        )
+        .await
+        .unwrap()
+        .with_admission(admission);
+        let addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+
+        let _first = TcpStream::connect(addr).await.unwrap();
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 16];
+        let read = timeout(Duration::from_secs(2), second.read(&mut buf))
+            .await
+            .expect("the over-limit connection must be closed promptly");
+        assert!(matches!(read, Ok(0) | Err(_)), "expected EOF/reset, got {read:?}");
     }
 
     /// TC-ROUTE-01: a real socket-level test — two actual TCP clients

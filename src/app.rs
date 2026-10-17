@@ -35,6 +35,7 @@ use crate::marti::{
 use crate::missions::{MissionError, MissionStore};
 use crate::pki::{self, CertificateAuthority, PkiError};
 use crate::registry::{DeviceRegistry, RegistryError};
+use crate::transport::admission::{Admission, AdmissionLimits};
 use crate::transport::connections::ConnectedClients;
 use crate::transport::hub::RelayHub;
 use crate::transport::tcp::TcpRelay;
@@ -107,6 +108,9 @@ pub struct AppConfig {
     /// comment -- `Auto` by default: secure by default without requiring
     /// the operator to separately remember to lock enrollment down.
     pub enrollment_mode: EnrollmentMode,
+    /// Connection limits and TLS/HTTP timeouts, shared by all listeners --
+    /// see [`crate::transport::admission`].
+    pub admission: AdmissionLimits,
 }
 
 /// Whether `/Marti/api/tls/signClient/v2` requires a valid enrollment
@@ -182,6 +186,7 @@ impl Default for AppConfig {
             data_dir: PathBuf::from("./data"),
             admin_common_name: Some("admin".to_string()),
             enrollment_mode: EnrollmentMode::default(),
+            admission: AdmissionLimits::default(),
         }
     }
 }
@@ -364,12 +369,15 @@ impl App {
         let plain_router = enrollment::router(enrollment_state)
             .merge(oauth::router(Arc::clone(&users), limiter))
             .layer(axum::Extension(Arc::new(config.trusted_proxies.clone())));
+        // One instance for every listener, so the total cap is server-wide.
+        let admission = Admission::new(config.admission);
         let enrollment = TlsHttpServer::bind(
             config.enrollment_addr,
             Arc::new(tls::server_auth_only_config(enrollment_cert)),
             plain_router,
         )
-        .await?;
+        .await?
+        .with_admission(admission.clone());
         let admin_state = AdminState {
             tokens: enrollment_tokens,
             users,
@@ -393,12 +401,14 @@ impl App {
             }));
         let marti_api =
             MtlsHttpServer::bind(config.marti_api_addr, Arc::clone(&tls_server_config), marti_router)
-                .await?;
+                .await?
+                .with_admission(admission.clone());
         let tcp = if config.plain_tcp_enabled {
             Some(
                 TcpRelay::bind(config.plain_tcp_addr, hub.clone(), clients.clone())
                     .await?
-                    .with_groups(Arc::clone(&groups)),
+                    .with_groups(Arc::clone(&groups))
+                    .with_admission(admission.clone()),
             )
         } else {
             None
@@ -411,7 +421,8 @@ impl App {
             clients,
         )
         .await?
-        .with_groups(Arc::clone(&groups));
+        .with_groups(Arc::clone(&groups))
+        .with_admission(admission);
 
         if config.backup.enabled {
             let offsite = OffsiteTarget::new(config.backup.offsite_command.clone());

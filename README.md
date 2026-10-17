@@ -143,6 +143,12 @@ can reach it can read every position and inject events — so it only runs
 with `plain_tcp_enabled = true`. Enable it only for a trusted local bridge
 (e.g. an APRS or mesh gateway on the same host).
 
+Every listener drops a client that doesn't finish the TLS handshake (or,
+on the HTTP ports, its request headers) within 10 seconds, and the server
+caps open connections at 1024 in total and 64 per client address. Tune
+with `handshake_timeout_seconds`, `http_header_timeout_seconds`,
+`max_connections` and `max_connections_per_ip` in `microtak.toml`.
+
 Data and backups live in Docker volumes so they survive container restarts.
 To customize settings, drop a `microtak.toml` next to `docker-compose.yml`
 and uncomment the volume mount for it.
