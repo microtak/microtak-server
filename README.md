@@ -30,8 +30,8 @@ still on the drawing board.
   bootstrap token and every other device via an invite token or a password
   account. See "Enrollment & access control" below.
 - Missions (Data Sync) — shared folders of markers and files that sync
-  across devices, with Owner/Subscriber permissions so not everyone can
-  delete or rewrite someone else's mission.
+  across devices, through the official TAK Server Mission API (roles,
+  mission tokens, change notifications, layers, invitations, logs).
 - Everything persists to disk and survives a restart, with optional
   periodic backups (local or offsite via a command you control, e.g.
   `rsync`).
