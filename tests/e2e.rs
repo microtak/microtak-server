@@ -743,7 +743,10 @@ async fn e2e_sync_visibility_and_delete() {
     assert_eq!(blue_search["resultCount"], 0);
     assert_eq!(red.get(format!("{base_url}/Marti/sync/content?hash={hash}")).send().await.unwrap().status(), 200);
 
-    let delete = red.delete(format!("{base_url}/Marti/sync/delete?Hash={hash}")).send().await.unwrap();
+    // The official URL table refuses DELETE here; the servlet deletes on POST.
+    let refused = red.delete(format!("{base_url}/Marti/sync/delete?Hash={hash}")).send().await.unwrap();
+    assert_eq!(refused.status(), 403);
+    let delete = red.post(format!("{base_url}/Marti/sync/delete?Hash={hash}")).send().await.unwrap();
     assert_eq!(delete.status(), 200);
     assert!(delete.text().await.unwrap().contains("Deleted 1 resource(s)."));
     assert_eq!(red.get(format!("{base_url}/Marti/sync/content?hash={hash}")).send().await.unwrap().status(), 404);

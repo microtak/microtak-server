@@ -25,7 +25,7 @@ use axum::body::Body;
 use axum::extract::{FromRequest, Path, Query, RawQuery, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -54,7 +54,12 @@ pub fn router(state: SyncState) -> Router {
         .route("/Marti/sync/content", get(content))
         .route("/Marti/sync/missionquery", get(mission_query))
         .route("/Marti/sync/search", get(search_servlet))
-        .route("/Marti/sync/delete", delete(delete_servlet))
+        .route(
+            "/Marti/sync/delete",
+            // `DeleteServlet`: doGet and doPost delete too; DELETE is refused by
+            // the official URL table (`/Marti/** DELETE`), see `super::access`.
+            get(delete_servlet).post(delete_servlet).delete(delete_servlet),
+        )
         .route("/Marti/api/sync/search", get(search_api))
         .route("/Marti/api/resources/:hash", get(get_resource))
         .route("/Marti/api/sync/metadata/:hash/keywords", put(set_keywords))

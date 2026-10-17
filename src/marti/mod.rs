@@ -53,6 +53,7 @@ use crate::registry::{Access, DeviceRegistry};
 use crate::transport::admission::Admission;
 use tracing::warn;
 
+pub mod access;
 pub mod admin;
 pub mod client_endpoints;
 pub mod contacts;

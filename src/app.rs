@@ -467,6 +467,11 @@ impl App {
             .merge(groups::router(GroupsState {
                 groups: Arc::clone(&groups),
                 admin_common_name: config.admin_common_name.clone(),
+            }))
+            // The official URL authorization table (security-context.xml).
+            .layer(axum::middleware::from_fn({
+                let admin = config.admin_common_name.clone();
+                move |request, next| crate::marti::access::enforce(admin.clone(), request, next)
             }));
         let marti_api =
             MtlsHttpServer::bind(config.marti_api_addr, Arc::clone(&tls_server_config), marti_router)
