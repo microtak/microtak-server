@@ -34,11 +34,27 @@ use serde::Deserialize;
 
 use crate::content_store::{ContentStore, ContentStoreError};
 
+/// Default upload size limit: 100 MB (photos, videos, data packages).
+pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
 pub fn router(store: Arc<ContentStore>) -> Router {
+    router_with_limit(store, DEFAULT_MAX_UPLOAD_BYTES)
+}
+
+/// Uploads are streamed to disk, so axum's default 2 MB body limit (which
+/// exists to bound in-memory buffering) is replaced by `max_upload_bytes`.
+pub fn router_with_limit(store: Arc<ContentStore>, max_upload_bytes: u64) -> Router {
     Router::new()
         .route("/Marti/api/sync/missionupload", post(upload))
         .route("/Marti/api/sync/content", get(download))
-        .with_state(store)
+        .layer(axum::extract::DefaultBodyLimit::disable())
+        .with_state(ContentState { store, max_upload_bytes })
+}
+
+#[derive(Clone)]
+struct ContentState {
+    store: Arc<ContentStore>,
+    max_upload_bytes: u64,
 }
 
 fn error_response(status: StatusCode, message: String) -> Response {
@@ -51,15 +67,20 @@ struct UploadQuery {
 }
 
 async fn upload(
-    State(store): State<Arc<ContentStore>>,
+    State(state): State<ContentState>,
     Query(query): Query<UploadQuery>,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Response {
-    match store.put(&body, query.hash.as_deref()) {
+    let chunks = body.into_data_stream();
+    match state.store.put_stream(chunks, query.hash.as_deref(), state.max_upload_bytes).await {
         Ok(hash) => Json(serde_json::json!({ "hash": hash })).into_response(),
         Err(ContentStoreError::HashMismatch { claimed, actual }) => error_response(
             StatusCode::BAD_REQUEST,
             format!("claimed hash {claimed} does not match uploaded content's actual hash {actual}"),
+        ),
+        Err(ContentStoreError::TooLarge { limit }) => error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("upload exceeds the {limit}-byte limit"),
         ),
         Err(error) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
@@ -73,14 +94,17 @@ struct DownloadQuery {
 }
 
 async fn download(
-    State(store): State<Arc<ContentStore>>,
+    State(state): State<ContentState>,
     Query(query): Query<DownloadQuery>,
 ) -> Response {
-    match store.get(&query.hash) {
-        Ok(Some(bytes)) => (
+    match state.store.open_file(&query.hash).await {
+        Ok(Some((file, len))) => (
             StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-            bytes,
+            [
+                (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                (axum::http::header::CONTENT_LENGTH, len.to_string()),
+            ],
+            axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
         )
             .into_response(),
         Ok(None) => error_response(
@@ -153,6 +177,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&downloaded[..], b"some file bytes");
+    }
+
+    /// Photos and data packages are often larger than axum's default 2 MB
+    /// body limit; uploads up to the configured limit (100 MB by default)
+    /// work, and the download streams them back with their length.
+    #[tokio::test]
+    async fn uploads_beyond_two_megabytes_round_trip() {
+        let app = router(temp_store());
+        let content: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let upload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/Marti/api/sync/missionupload")
+                    .body(Body::from(content.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(upload.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let hash = body["hash"].as_str().unwrap();
+
+        let download = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Marti/api/sync/content?hash={hash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(download.status(), StatusCode::OK);
+        assert_eq!(
+            download.headers()[axum::http::header::CONTENT_LENGTH],
+            content.len().to_string().as_str()
+        );
+        let downloaded = axum::body::to_bytes(download.into_body(), usize::MAX).await.unwrap();
+        assert!(downloaded[..] == content[..]);
+    }
+
+    #[tokio::test]
+    async fn uploads_over_the_configured_limit_get_413() {
+        let app = router_with_limit(temp_store(), 1024);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/Marti/api/sync/missionupload")
+                    .body(Body::from(vec![0u8; 2048]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     /// TC-MARTI-07: an upload whose claimed `hash` query param doesn't

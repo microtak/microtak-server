@@ -77,6 +77,8 @@ pub struct Config {
     pub handshake_timeout_seconds: u64,
     /// Seconds an HTTP listener waits for a request's headers.
     pub http_header_timeout_seconds: u64,
+    /// Largest DataSync upload accepted, in MB (default 100).
+    pub max_upload_mb: u64,
 }
 
 impl Default for Config {
@@ -108,6 +110,7 @@ impl Default for Config {
             max_connections_per_ip: defaults.admission.max_connections_per_ip,
             handshake_timeout_seconds: defaults.admission.handshake_timeout.as_secs(),
             http_header_timeout_seconds: defaults.admission.http_header_timeout.as_secs(),
+            max_upload_mb: defaults.max_upload_bytes / (1024 * 1024),
         }
     }
 }
@@ -211,6 +214,7 @@ impl Config {
                 max_connections: self.max_connections.max(1),
                 max_connections_per_ip: self.max_connections_per_ip.max(1),
             },
+            max_upload_bytes: self.max_upload_mb.max(1) * 1024 * 1024,
         })
     }
 }
@@ -323,6 +327,13 @@ mod tests {
         assert_eq!(limits.max_connections_per_ip, 5);
         assert_eq!(limits.handshake_timeout, std::time::Duration::from_secs(3));
         assert_eq!(limits.http_header_timeout, std::time::Duration::from_secs(4));
+    }
+
+    #[test]
+    fn upload_limit_defaults_to_100_mb_and_is_configurable() {
+        assert_eq!(Config::default().to_app_config().unwrap().max_upload_bytes, 100 * 1024 * 1024);
+        let config: Config = toml::from_str("max_upload_mb = 250\n").unwrap();
+        assert_eq!(config.to_app_config().unwrap().max_upload_bytes, 250 * 1024 * 1024);
     }
 
     #[test]

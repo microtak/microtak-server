@@ -111,6 +111,9 @@ pub struct AppConfig {
     /// Connection limits and TLS/HTTP timeouts, shared by all listeners --
     /// see [`crate::transport::admission`].
     pub admission: AdmissionLimits,
+    /// Largest DataSync upload accepted, in bytes (uploads are streamed to
+    /// disk, never buffered whole).
+    pub max_upload_bytes: u64,
 }
 
 /// Whether `/Marti/api/tls/signClient/v2` requires a valid enrollment
@@ -187,6 +190,7 @@ impl Default for AppConfig {
             admin_common_name: Some("admin".to_string()),
             enrollment_mode: EnrollmentMode::default(),
             admission: AdmissionLimits::default(),
+            max_upload_bytes: content_api::DEFAULT_MAX_UPLOAD_BYTES,
         }
     }
 }
@@ -391,7 +395,7 @@ impl App {
             admin_common_name: config.admin_common_name.clone(),
         })
             .merge(client_endpoints::router(clients.clone()))
-            .merge(content_api::router(Arc::clone(&content_store)))
+            .merge(content_api::router_with_limit(Arc::clone(&content_store), config.max_upload_bytes))
             .merge(admin::router(admin_state))
             .merge(discovery::router())
             .merge(contacts::router(clients.clone()))
