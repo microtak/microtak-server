@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.9.0](https://github.com/microtak/microtak-server/compare/v0.8.2...v0.9.0) (2026-10-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* GET /Marti/api/resources/{hash} is admin-only and DELETE /Marti/sync/delete is refused, as on the official server.
+* the old mission endpoints and their JSON are gone; missions created before (missions.log) are not migrated.
+* /Marti/api/sync/missionupload and /Marti/api/sync/content are gone; use the official paths.
+
+### Features
+
+* /Marti/api/subscriptions/all ([9f9b9cd](https://github.com/microtak/microtak-server/commit/9f9b9cdbaf06b302b68db3841c76689102565b08))
+* FileManagerApi delete and count ([5b8dc55](https://github.com/microtak/microtak-server/commit/5b8dc559dfc9ad46141ff8e1f0ff8602c3b355c6))
+* mission archive and data package import ([a1e9b07](https://github.com/microtak/microtak-server/commit/a1e9b07a1efe23e76138220431a7998733f2a83e))
+* official contacts and mission contacts ([e1c7a28](https://github.com/microtak/microtak-server/commit/e1c7a28c7937d1588505c954b1877da558bc40fe))
+* official Enterprise Sync file APIs ([23d66e0](https://github.com/microtak/microtak-server/commit/23d66e013dcc188a82265ce30b6cf1fa50de7746))
+* official Mission API ([b305882](https://github.com/microtak/microtak-server/commit/b30588242068f529333a881b33e515ebbb5ddbf5))
+* official mission layers ([a5cce9e](https://github.com/microtak/microtak-server/commit/a5cce9e9a4ff96780a940fbe0a57f1ed2e7b3069))
+* official mission notifications and streaming mission content ([7d46df5](https://github.com/microtak/microtak-server/commit/7d46df58e90b4d01c6f827e185a75b92aebac179))
+* official URL authorization table ([b61d7ec](https://github.com/microtak/microtak-server/commit/b61d7eccb9f04a50357d0c04cbc29215ac08ebd6))
+
+
+### Bug Fixes
+
+* **deps:** zip 9.0.5 ([d320bf0](https://github.com/microtak/microtak-server/commit/d320bf02e6fd6dfbd7e7daaa920b0a0bd5602966))
+
+
+### Documentation
+
+* SECURITY.md, README for 0.9.0 ([90d4eb6](https://github.com/microtak/microtak-server/commit/90d4eb6bba663ddd440823dc6091cc0de4e0c914))
+* the official Mission API replaces MicroTAK's own ([69e74b5](https://github.com/microtak/microtak-server/commit/69e74b59a5b43f9b0e75133ca6c4dea9d5a0262c))
+
 ## [0.8.2](https://github.com/microtak/microtak-server/compare/v0.8.1...v0.8.2) (2026-10-17)
 
 
