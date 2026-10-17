@@ -3,7 +3,7 @@ name: microtak-server
 description: A lightweight, mesh-federated TAK (Team Awareness Kit) server
 type: application
 version: 0.9.0
-appVersion: 0.7.0
+appVersion: "0.9.0" # x-release-please-version
 keywords:
   - tak
   - cot
