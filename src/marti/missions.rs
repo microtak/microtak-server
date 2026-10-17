@@ -2513,7 +2513,8 @@ fn log_entry_from(v: &Value, id: String, server_time_ms: i64) -> Result<LogEntry
         mission_names: strings(v.get("missionNames")),
         server_time_ms,
         dtg_ms: json_date(v.get("dtg"))?,
-        created_ms: json_date(v.get("created"))?,
+        // `addUpdateLogEntry(entry, new Date(), ...)` on every add/update.
+        created_ms: Some(server_time_ms),
         content_hashes: strings(v.get("contentHashes")),
         keywords: strings(v.get("keywords")),
     })

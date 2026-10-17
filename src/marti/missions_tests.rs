@@ -519,7 +519,7 @@ async fn log_entries() {
             "/Marti/api/missions/logs/entries",
             "jz",
             &[],
-            r#"{"content":"contact","creatorUid":"ANDROID-1","missionNames":["Ops"],"dtg":"2026-10-17T20:00:00.000Z"}"#,
+            r#"{"content":"contact","creatorUid":"ANDROID-1","missionNames":["Ops"],"dtg":"2026-10-17T20:00:00.000Z","created":"2020-01-01T00:00:00.000Z"}"#,
         )
         .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
@@ -528,6 +528,9 @@ async fn log_entries() {
     let id = entry["id"].as_str().unwrap().to_string();
     assert_eq!(entry["dtg"], "2026-10-17T20:00:00.000Z");
     assert!(is_pad_millis(&entry["servertime"]));
+    // `addUpdateLogEntry(entry, new Date(), ...)`: the server sets `created`.
+    assert!(is_pad_millis(&entry["created"]), "{entry}");
+    assert_ne!(entry["created"], "2020-01-01T00:00:00.000Z");
 
     let one = h.get(&format!("/Marti/api/missions/logs/entries/{id}"), "jz").await;
     assert_eq!(one.data()[0]["content"], "contact");
@@ -535,6 +538,7 @@ async fn log_entries() {
         .call("PUT", "/Marti/api/missions/logs/entries", "jz", &[], &format!(r#"{{"id":"{id}","content":"changed","missionNames":["Ops"]}}"#))
         .await;
     assert_eq!(put.data()["content"], "changed");
+    assert!(is_pad_millis(&put.data()["created"]));
     assert_eq!(h.get("/Marti/api/missions/Ops/log", "jz").await.data()[0]["content"], "changed");
     assert_eq!(h.get("/Marti/api/missions/all/logs", "jz").await.status, StatusCode::FORBIDDEN, "admin only");
     assert_eq!(h.get("/Marti/api/missions/all/logs", "admin").await.data().as_array().unwrap().len(), 1);
