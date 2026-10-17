@@ -43,7 +43,14 @@ pub fn random_uuid() -> String {
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 /// Read `data_dir/server-id`, creating it on first start, and make it this
@@ -95,7 +102,8 @@ pub fn cot_date(unix_seconds: i64) -> String {
 /// A Unix timestamp in milliseconds in the official COT date format.
 pub fn cot_date_millis(unix_millis: i64) -> String {
     let nanos = (unix_millis as i128) * 1_000_000;
-    let dt = time::OffsetDateTime::from_unix_timestamp_nanos(nanos).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let dt = time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{}Z",
         dt.year(),
@@ -115,8 +123,14 @@ mod tests {
     #[test]
     fn cot_dates_have_unpadded_milliseconds_like_java() {
         assert_eq!(cot_date_millis(1_760_716_800_005), "2025-10-17T16:00:00.5Z");
-        assert_eq!(cot_date_millis(1_760_716_800_042), "2025-10-17T16:00:00.42Z");
-        assert_eq!(cot_date_millis(1_760_716_800_689), "2025-10-17T16:00:00.689Z");
+        assert_eq!(
+            cot_date_millis(1_760_716_800_042),
+            "2025-10-17T16:00:00.42Z"
+        );
+        assert_eq!(
+            cot_date_millis(1_760_716_800_689),
+            "2025-10-17T16:00:00.689Z"
+        );
         assert_eq!(cot_date(0), "1970-01-01T00:00:00.0Z");
     }
 

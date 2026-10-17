@@ -113,9 +113,17 @@ pub struct Chat {
     pub id: String,
     #[serde(rename = "@chatroom")]
     pub chatroom: String,
-    #[serde(rename = "@senderCallsign", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "@senderCallsign",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub sender_callsign: Option<String>,
-    #[serde(rename = "@groupOwner", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "@groupOwner",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub group_owner: Option<String>,
     #[serde(rename = "chatgrp", skip_serializing_if = "Option::is_none", default)]
     pub chatgrp: Option<ChatGroup>,
@@ -180,7 +188,11 @@ pub struct Dest {
     /// Streaming mission content (`StreamingEndpointRewriteFilter.MISSION_ATTR`).
     #[serde(rename = "@mission", skip_serializing_if = "Option::is_none", default)]
     pub mission: Option<String>,
-    #[serde(rename = "@mission-guid", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "@mission-guid",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub mission_guid: Option<String>,
 }
 
@@ -198,7 +210,16 @@ pub const ALL_CHAT_ROOMS: &str = "All Chat Rooms";
 
 /// `SubmissionService.controlMsgTypes` of the official server.
 const CONTROL_TYPES: [&str; 11] = [
-    "t-b", "t-b-a", "t-b-c", "t-b-q", "t-x-c-f", "t-x-c-t", "t-x-c-t-r", "t-x-takp-q", "t-x-c-m", "t-x-c-i-e",
+    "t-b",
+    "t-b-a",
+    "t-b-c",
+    "t-b-q",
+    "t-x-c-f",
+    "t-x-c-t",
+    "t-x-c-t-r",
+    "t-x-takp-q",
+    "t-x-c-m",
+    "t-x-c-i-e",
     "t-x-c-i-d",
 ];
 
@@ -241,7 +262,10 @@ pub fn strip_marti(xml: &str) -> std::borrow::Cow<'_, str> {
                 let name = e.name().as_ref().to_vec();
                 if name == b"marti" && path == [b"event".to_vec(), b"detail".to_vec()] {
                     let end_name = e.name().as_ref().to_vec();
-                    if reader.read_to_end(quick_xml::name::QName(&end_name)).is_err() {
+                    if reader
+                        .read_to_end(quick_xml::name::QName(&end_name))
+                        .is_err()
+                    {
                         return std::borrow::Cow::Borrowed(xml);
                     }
                     let after = reader.buffer_position() as usize;
@@ -250,7 +274,8 @@ pub fn strip_marti(xml: &str) -> std::borrow::Cow<'_, str> {
                 path.push(name);
             }
             Ok(X::Empty(e)) => {
-                if e.name().as_ref() == b"marti" && path == [b"event".to_vec(), b"detail".to_vec()] {
+                if e.name().as_ref() == b"marti" && path == [b"event".to_vec(), b"detail".to_vec()]
+                {
                     let after = reader.buffer_position() as usize;
                     return std::borrow::Cow::Owned(format!("{}{}", &xml[..before], &xml[after..]));
                 }
@@ -316,7 +341,8 @@ impl Event {
         let Some(contact) = self.detail.as_ref().and_then(|d| d.contact.as_ref()) else {
             return false;
         };
-        let non_empty = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
+        let non_empty =
+            |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
         !self.uid.trim().is_empty() && non_empty(&contact.callsign) && non_empty(&contact.endpoint)
     }
 
@@ -342,8 +368,17 @@ impl Event {
         let Some(marti) = self.detail.as_ref().and_then(|d| d.marti.as_ref()) else {
             return (Vec::new(), Vec::new());
         };
-        let names = marti.dest.iter().filter_map(|d| d.mission.clone()).collect();
-        let guids = marti.dest.iter().filter(|d| d.mission.is_none()).filter_map(|d| d.mission_guid.clone()).collect();
+        let names = marti
+            .dest
+            .iter()
+            .filter_map(|d| d.mission.clone())
+            .collect();
+        let guids = marti
+            .dest
+            .iter()
+            .filter(|d| d.mission.is_none())
+            .filter_map(|d| d.mission_guid.clone())
+            .collect();
         (names, guids)
     }
 
@@ -361,11 +396,7 @@ impl Event {
             uids.extend(chatgrp.member_uids());
         }
 
-        if uids.is_empty() {
-            None
-        } else {
-            Some(uids)
-        }
+        if uids.is_empty() { None } else { Some(uids) }
     }
 }
 
@@ -430,19 +461,34 @@ pub(crate) mod tests {
         let mut event = Event::from_xml(MINIMAL_EVENT).unwrap();
         assert!(!event.is_control());
         for control in [
-            "t-b", "t-b-a", "t-b-c", "t-b-q", "t-x-c-f", "t-x-c-t", "t-x-c-t-r", "t-x-takp-q", "t-x-c-m",
-            "t-x-c-i-e", "t-x-c-i-d",
+            "t-b",
+            "t-b-a",
+            "t-b-c",
+            "t-b-q",
+            "t-x-c-f",
+            "t-x-c-t",
+            "t-x-c-t-r",
+            "t-x-takp-q",
+            "t-x-c-m",
+            "t-x-c-i-e",
+            "t-x-c-i-d",
         ] {
             event.cot_type = control.to_string();
             assert!(event.is_control(), "{control}");
             assert!(!event.is_chat(), "{control}");
         }
         event.cot_type = "T-X-C-T".to_string();
-        assert!(event.is_control(), "matched case-insensitively, as official");
+        assert!(
+            event.is_control(),
+            "matched case-insensitively, as official"
+        );
         event.cot_type = "t-x-c-t-x".to_string();
         assert!(!event.is_control(), "exact types only");
         event.cot_type = "t-x-takp-v".to_string();
-        assert!(!event.is_control(), "the server's own version announcement is not in the set");
+        assert!(
+            !event.is_control(),
+            "the server's own version announcement is not in the set"
+        );
     }
 
     /// `StreamingEndpointRewriteFilter`: the first `/event/detail/marti`
@@ -455,9 +501,15 @@ pub(crate) mod tests {
             r#"<?xml version="1.0"?><event version="2.0" uid="u" type="b-t-f" how="h-g-i-g-o" time="t" start="t" stale="t"><point lat="1" lon="2" hae="0" ce="0" le="0"/><detail><__chat id="c" chatroom="Ops"/><remarks>hi</remarks></detail></event>"#
         );
         let empty = r#"<event version="2.0" uid="u" type="a" how="h" time="t" start="t" stale="t"><detail><marti/></detail></event>"#;
-        assert_eq!(strip_marti(empty), r#"<event version="2.0" uid="u" type="a" how="h" time="t" start="t" stale="t"><detail></detail></event>"#);
+        assert_eq!(
+            strip_marti(empty),
+            r#"<event version="2.0" uid="u" type="a" how="h" time="t" start="t" stale="t"><detail></detail></event>"#
+        );
         let nested = r#"<event version="2.0" uid="u" type="a" how="h" time="t" start="t" stale="t"><detail><link><marti/></link></detail></event>"#;
-        assert!(matches!(strip_marti(nested), std::borrow::Cow::Borrowed(_)), "only /event/detail/marti");
+        assert!(
+            matches!(strip_marti(nested), std::borrow::Cow::Borrowed(_)),
+            "only /event/detail/marti"
+        );
         let event = Event::from_xml(strip_declaration_for_test(xml)).unwrap();
         assert_eq!(event.dest_missions(), (vec!["Ops".to_string()], vec![]));
     }
@@ -490,16 +542,29 @@ pub(crate) mod tests {
         assert!(!chat.is_situational_awareness());
         assert!(chat.is_chat(), "real GeoChat is b-t-f");
         let marker = Event::from_xml(ATAK_MARKER).unwrap();
-        assert!(!marker.is_situational_awareness(), "a marker has a callsign but no endpoint");
-        assert!(!Event::from_xml(MINIMAL_EVENT).unwrap().is_situational_awareness());
+        assert!(
+            !marker.is_situational_awareness(),
+            "a marker has a callsign but no endpoint"
+        );
+        assert!(
+            !Event::from_xml(MINIMAL_EVENT)
+                .unwrap()
+                .is_situational_awareness()
+        );
     }
 
     /// `<link>` elements interleaved with other detail children still parse
     /// (quick-xml `overlapped-lists`), and only `p-p` links name a producer.
     #[test]
     fn producer_uids_come_from_p_p_links_even_when_interleaved() {
-        assert_eq!(Event::from_xml(ATAK_MARKER).unwrap().producer_uids(), vec!["ANDROID-abc123"]);
-        assert_eq!(Event::from_xml(ATAK_CHAT).unwrap().producer_uids(), vec!["ANDROID-abc123"]);
+        assert_eq!(
+            Event::from_xml(ATAK_MARKER).unwrap().producer_uids(),
+            vec!["ANDROID-abc123"]
+        );
+        assert_eq!(
+            Event::from_xml(ATAK_CHAT).unwrap().producer_uids(),
+            vec!["ANDROID-abc123"]
+        );
         assert!(Event::from_xml(ATAK_SA).unwrap().producer_uids().is_empty());
     }
 
@@ -516,7 +581,12 @@ pub(crate) mod tests {
     /// lists the sender and the room name, not recipients.
     #[test]
     fn all_chat_rooms_messages_are_broadcast() {
-        assert!(Event::from_xml(ATAK_CHAT).unwrap().addressed_uids().is_none());
+        assert!(
+            Event::from_xml(ATAK_CHAT)
+                .unwrap()
+                .addressed_uids()
+                .is_none()
+        );
     }
 
     #[test]

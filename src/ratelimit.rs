@@ -79,8 +79,7 @@ impl AuthLimiter {
     fn is_blocked_at(&self, key: &str, now: Instant) -> bool {
         let failures = self.failures.lock().unwrap();
         failures.get(key).is_some_and(|entry| {
-            now.duration_since(entry.window_start) < self.window
-                && entry.count >= self.max_failures
+            now.duration_since(entry.window_start) < self.window && entry.count >= self.max_failures
         })
     }
 
@@ -92,7 +91,9 @@ impl AuthLimiter {
             if failures.len() >= self.max_tracked_keys {
                 // Still full of live entries: keep the ones already being
                 // tracked rather than evicting a key that may be mid-attack.
-                warn!("auth rate limiter is tracking its maximum number of keys; not tracking a new one");
+                warn!(
+                    "auth rate limiter is tracking its maximum number of keys; not tracking a new one"
+                );
                 return;
             }
         }
@@ -153,7 +154,10 @@ mod tests {
         assert!(!limiter.is_blocked_at("ip:1.2.3.4", start));
         limiter.record_failure_at("ip:1.2.3.4", start);
         assert!(limiter.is_blocked_at("ip:1.2.3.4", start));
-        assert!(!limiter.is_blocked_at("ip:5.6.7.8", start), "keys are independent");
+        assert!(
+            !limiter.is_blocked_at("ip:5.6.7.8", start),
+            "keys are independent"
+        );
     }
 
     #[test]
@@ -193,7 +197,11 @@ mod tests {
         let users = Arc::new(UserStore::in_memory());
         users.mint("alice", "correct horse", 0).unwrap();
         let limiter = AuthLimiter::default();
-        assert!(limiter.verify_password(&users, "alice", "correct horse").await);
+        assert!(
+            limiter
+                .verify_password(&users, "alice", "correct horse")
+                .await
+        );
         assert!(!limiter.verify_password(&users, "alice", "wrong").await);
         assert!(!limiter.verify_password(&users, "nobody", "x").await);
     }

@@ -47,7 +47,9 @@ pub const DEFAULT_MAX_BUFFERED: usize = 64 * 1024;
 pub enum StreamError {
     #[error("unexpected byte(s) in CoT stream (not an XML declaration or <event>): {0:?}")]
     UnexpectedContent(Vec<u8>),
-    #[error("buffered {buffered} bytes waiting for a closing tag, exceeding the {limit}-byte limit")]
+    #[error(
+        "buffered {buffered} bytes waiting for a closing tag, exceeding the {limit}-byte limit"
+    )]
     TooLarge { buffered: usize, limit: usize },
 }
 
@@ -253,7 +255,10 @@ mod tests {
         let original = crate::cot::tests::ATAK_MARKER;
         let mut decoder = StreamDecoder::new();
         let items = decoder
-            .feed(format!("<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n{original}").as_bytes())
+            .feed(
+                format!("<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\n{original}")
+                    .as_bytes(),
+            )
             .unwrap();
         match &items[..] {
             [DecodedItem::Event { xml, .. }] => assert_eq!(xml, original),
@@ -311,7 +316,9 @@ mod tests {
             items.extend(decoder.feed(&[*byte]).unwrap());
         }
         assert_eq!(items.len(), 1);
-        assert!(matches!(&items[0], DecodedItem::Event { event: e, .. } if e.uid == "BYTE-BY-BYTE"));
+        assert!(
+            matches!(&items[0], DecodedItem::Event { event: e, .. } if e.uid == "BYTE-BY-BYTE")
+        );
     }
 
     #[test]
@@ -352,7 +359,8 @@ mod tests {
     #[test]
     fn trickled_large_event_is_decoded_in_linear_time() {
         let padding = "x".repeat(DEFAULT_MAX_BUFFERED - 1_024);
-        let xml = event_xml("TRICKLE").replace("</event>", &format!("<remarks>{padding}</remarks></event>"));
+        let xml = event_xml("TRICKLE")
+            .replace("</event>", &format!("<remarks>{padding}</remarks></event>"));
         assert!(xml.len() < DEFAULT_MAX_BUFFERED);
         let mut decoder = StreamDecoder::new();
         let started = std::time::Instant::now();
@@ -362,7 +370,10 @@ mod tests {
         }
         let elapsed = started.elapsed();
         assert!(matches!(&items[..], [DecodedItem::Event { event, .. }] if event.uid == "TRICKLE"));
-        assert!(elapsed < std::time::Duration::from_secs(2), "took {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "took {elapsed:?}"
+        );
     }
 
     /// The resumed scan must still find a closing tag split across reads.
@@ -373,7 +384,9 @@ mod tests {
         let mut decoder = StreamDecoder::new();
         assert!(decoder.feed(head.as_bytes()).unwrap().is_empty());
         let items = decoder.feed(tail.as_bytes()).unwrap();
-        assert!(matches!(&items[..], [DecodedItem::Event { event, .. }] if event.uid == "SPLIT-CLOSE"));
+        assert!(
+            matches!(&items[..], [DecodedItem::Event { event, .. }] if event.uid == "SPLIT-CLOSE")
+        );
     }
 
     #[test]

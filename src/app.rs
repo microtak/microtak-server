@@ -17,26 +17,26 @@ use time::Duration;
 use tracing::{info, warn};
 
 use crate::backup::{BackupRunner, OffsiteTarget};
-use crate::bootstrap::{BootstrapToken, BOOTSTRAP_TOKEN_FILE};
+use crate::bootstrap::{BOOTSTRAP_TOKEN_FILE, BootstrapToken};
 use crate::certsource::{self, CertLoadError, CertSource, SwappableCert};
-use crate::groups::GroupStore;
-use crate::marti::groups::GroupsState;
 use crate::clientip::TrustedProxies;
-use crate::servernames::{self, ServerCertError};
-use crate::sync::{ResourceStore, SyncError};
-use crate::ratelimit::AuthLimiter;
 use crate::content_store::ContentStore;
 use crate::enrollment_tokens::{EnrollmentTokenError, EnrollmentTokenStore};
+use crate::groups::GroupStore;
 use crate::marti::admin::AdminState;
-use crate::metrics;
 use crate::marti::enrollment::EnrollmentState;
+use crate::marti::groups::GroupsState;
 use crate::marti::{
-    admin, client_endpoints, contacts, content as content_api, discovery, enrollment, groups,
-    missions as missions_api, oauth, MtlsHttpServer, TlsHttpServer,
+    MtlsHttpServer, TlsHttpServer, admin, client_endpoints, contacts, content as content_api,
+    discovery, enrollment, groups, missions as missions_api, oauth,
 };
+use crate::metrics;
 use crate::missions::{MissionError, MissionStore};
 use crate::pki::{self, CertificateAuthority, PkiError};
+use crate::ratelimit::AuthLimiter;
 use crate::registry::{DeviceRegistry, RegistryError};
+use crate::servernames::{self, ServerCertError};
+use crate::sync::{ResourceStore, SyncError};
 use crate::transport::admission::{Admission, AdmissionLimits};
 use crate::transport::connections::ConnectedClients;
 use crate::transport::hub::RelayHub;
@@ -289,20 +289,30 @@ impl App {
         let registry = Arc::new(DeviceRegistry::load_or_create(
             config.data_dir.join("devices.log"),
         )?);
-        let groups = Arc::new(GroupStore::load_or_create(config.data_dir.join("groups.log"))?);
+        let groups = Arc::new(GroupStore::load_or_create(
+            config.data_dir.join("groups.log"),
+        )?);
         // Missions in the official model; MicroTAK ≤ 0.8's `missions.log`
         // (a different model) is left alone, not migrated.
         let missions = Arc::new(MissionStore::load_or_create(
             config.data_dir.join("official-missions.log"),
         )?);
-        let latest_cot = Arc::new(crate::latest_cot::LatestCot::load(config.data_dir.join("latest-cot.json")));
-        let mission_tokens = Arc::new(crate::marti::mission_token::MissionTokenSigner::load_or_create(&config.data_dir)?);
+        let latest_cot = Arc::new(crate::latest_cot::LatestCot::load(
+            config.data_dir.join("latest-cot.json"),
+        ));
+        let mission_tokens = Arc::new(
+            crate::marti::mission_token::MissionTokenSigner::load_or_create(&config.data_dir)?,
+        );
         let content_store = Arc::new(ContentStore::open(config.data_dir.join("content"))?);
-        let resources = Arc::new(ResourceStore::load_or_create(config.data_dir.join("resources.log"))?);
+        let resources = Arc::new(ResourceStore::load_or_create(
+            config.data_dir.join("resources.log"),
+        )?);
         let enrollment_tokens = Arc::new(EnrollmentTokenStore::load_or_create(
             config.data_dir.join("enrollment_tokens.log"),
         )?);
-        let users = Arc::new(UserStore::load_or_create(config.data_dir.join("users.log"))?);
+        let users = Arc::new(UserStore::load_or_create(
+            config.data_dir.join("users.log"),
+        )?);
         let bootstrap = Arc::new(match &config.admin_common_name {
             Some(admin_cn) => {
                 let token = BootstrapToken::load_or_create(
@@ -369,7 +379,10 @@ impl App {
         // reuses the same server identity as the mTLS listeners.
         let (enrollment_cert, enrollment_cert_watch) = match &config.enrollment_cert {
             CertSource::Internal => (Arc::clone(&internal_cert), None),
-            CertSource::Files { cert_file, key_file } => {
+            CertSource::Files {
+                cert_file,
+                key_file,
+            } => {
                 let cert = Arc::new(SwappableCert::new(certsource::load_files(
                     cert_file, key_file,
                 )?));
@@ -402,8 +415,8 @@ impl App {
             ))
             .layer(axum::Extension(Arc::new(config.trusted_proxies.clone())));
         // One instance for every listener, so the total cap is server-wide.
-        let admission =
-            Admission::new(config.admission).with_proxy_protocol_from(config.proxy_protocol_from.clone());
+        let admission = Admission::new(config.admission)
+            .with_proxy_protocol_from(config.proxy_protocol_from.clone());
         let enrollment = TlsHttpServer::bind(
             config.enrollment_addr,
             Arc::new(tls::server_auth_only_config(enrollment_cert)),
@@ -454,44 +467,49 @@ impl App {
             clients: clients.clone(),
             content: Arc::clone(&content_store),
         })
-            .merge(client_endpoints::router(clients.clone()))
-            .merge(content_api::router(content_api::SyncState {
-                content: Arc::clone(&content_store),
-                resources: Arc::clone(&resources),
-                groups: Arc::clone(&groups),
-                admin_common_name: config.admin_common_name.clone(),
-                max_upload_bytes: config.max_upload_bytes,
-                missions: Arc::clone(&missions),
-                latest_cot: Arc::clone(&latest_cot),
-            }))
-            .merge(admin::router(admin_state))
-            .merge(discovery::router())
-            .merge(contacts::router(contacts::ContactsState {
+        .merge(client_endpoints::router(clients.clone()))
+        .merge(content_api::router(content_api::SyncState {
+            content: Arc::clone(&content_store),
+            resources: Arc::clone(&resources),
+            groups: Arc::clone(&groups),
+            admin_common_name: config.admin_common_name.clone(),
+            max_upload_bytes: config.max_upload_bytes,
+            missions: Arc::clone(&missions),
+            latest_cot: Arc::clone(&latest_cot),
+        }))
+        .merge(admin::router(admin_state))
+        .merge(discovery::router())
+        .merge(contacts::router(contacts::ContactsState {
+            clients: clients.clone(),
+            latest_cot: Arc::clone(&latest_cot),
+            groups: Arc::clone(&groups),
+            admin_common_name: config.admin_common_name.clone(),
+        }))
+        .merge(crate::marti::subscriptions::router(
+            contacts::ContactsState {
                 clients: clients.clone(),
                 latest_cot: Arc::clone(&latest_cot),
                 groups: Arc::clone(&groups),
                 admin_common_name: config.admin_common_name.clone(),
-            }))
-            .merge(crate::marti::subscriptions::router(contacts::ContactsState {
-                clients: clients.clone(),
-                latest_cot: Arc::clone(&latest_cot),
-                groups: Arc::clone(&groups),
-                admin_common_name: config.admin_common_name.clone(),
-            }))
-            .merge(groups::router(GroupsState {
-                groups: Arc::clone(&groups),
-                admin_common_name: config.admin_common_name.clone(),
-            }))
-            // The official URL authorization table (security-context.xml).
-            .layer(axum::middleware::from_fn({
-                let admin = config.admin_common_name.clone();
-                move |request, next| crate::marti::access::enforce(admin.clone(), request, next)
-            }));
-        let marti_api =
-            MtlsHttpServer::bind(config.marti_api_addr, Arc::clone(&tls_server_config), marti_router)
-                .await?
-                .with_admission(admission.clone())
-                .with_registry(Arc::clone(&registry));
+            },
+        ))
+        .merge(groups::router(GroupsState {
+            groups: Arc::clone(&groups),
+            admin_common_name: config.admin_common_name.clone(),
+        }))
+        // The official URL authorization table (security-context.xml).
+        .layer(axum::middleware::from_fn({
+            let admin = config.admin_common_name.clone();
+            move |request, next| crate::marti::access::enforce(admin.clone(), request, next)
+        }));
+        let marti_api = MtlsHttpServer::bind(
+            config.marti_api_addr,
+            Arc::clone(&tls_server_config),
+            marti_router,
+        )
+        .await?
+        .with_admission(admission.clone())
+        .with_registry(Arc::clone(&registry));
         let tcp = if config.plain_tcp_enabled {
             Some(
                 TcpRelay::bind(config.plain_tcp_addr, hub.clone(), clients.clone())
@@ -516,7 +534,11 @@ impl App {
 
         if config.backup.enabled {
             let offsite = OffsiteTarget::new(config.backup.offsite_command.clone());
-            let runner = BackupRunner::new(config.data_dir.clone(), config.backup.backup_dir.clone(), offsite);
+            let runner = BackupRunner::new(
+                config.data_dir.clone(),
+                config.backup.backup_dir.clone(),
+                offsite,
+            );
             tokio::spawn(runner.run_periodic(config.backup.interval));
         }
 
@@ -572,7 +594,9 @@ impl App {
 
     /// The metrics listener's address, if one is configured.
     pub fn metrics_addr(&self) -> Option<SocketAddr> {
-        self.metrics.as_ref().and_then(|(listener, _)| listener.local_addr().ok())
+        self.metrics
+            .as_ref()
+            .and_then(|(listener, _)| listener.local_addr().ok())
     }
 
     /// Run every listener concurrently until one of them hits a fatal
@@ -738,7 +762,9 @@ mod tests {
     async fn bootstrap_token_exists_until_the_admin_enrolls() {
         let data_dir = unique_temp_dir("bootstrap");
         let first = App::bind(ephemeral_config(data_dir.clone())).await.unwrap();
-        let path = first.bootstrap_token_path().expect("admin not enrolled yet");
+        let path = first
+            .bootstrap_token_path()
+            .expect("admin not enrolled yet");
         assert_eq!(path, data_dir.join(BOOTSTRAP_TOKEN_FILE));
         let token = std::fs::read_to_string(&path).unwrap();
         first.registry.enroll("admin", "admin-cert-pem", 1).unwrap();

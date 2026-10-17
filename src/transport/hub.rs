@@ -61,11 +61,14 @@ pub enum Origin {
     /// directly; broadcast ones reach connections sharing one of `groups`
     /// (always, if `groups` has `__ANON__`, which every official user
     /// holds), except `skip_uid` -- `submitBroadcastMissionAnnouncementCot`.
-    Server { skip_uid: Option<Arc<str>> },
+    Server {
+        skip_uid: Option<Arc<str>>,
+    },
 }
 
 /// The address server-originated messages carry as their sender.
-pub const SERVER_ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+pub const SERVER_ADDR: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 impl Outbound {
     /// A server message for exactly these client uids.
@@ -80,13 +83,19 @@ impl Outbound {
     }
 
     /// A server broadcast to everyone sharing one of `groups`, but `skip_uid`.
-    pub fn server_broadcast(groups: std::collections::BTreeSet<String>, skip_uid: Option<String>, xml: String) -> Self {
+    pub fn server_broadcast(
+        groups: std::collections::BTreeSet<String>,
+        skip_uid: Option<String>,
+        xml: String,
+    ) -> Self {
         Outbound {
             sender: SERVER_ADDR,
             xml: xml.into(),
             dest_uids: None,
             groups: Arc::new(groups),
-            origin: Origin::Server { skip_uid: skip_uid.map(Into::into) },
+            origin: Origin::Server {
+                skip_uid: skip_uid.map(Into::into),
+            },
         }
     }
 
@@ -96,7 +105,10 @@ impl Outbound {
         match self.origin {
             Origin::Server { .. } if self.dest_uids.is_some() => true,
             Origin::Server { .. } if self.groups.contains(crate::groups::ANON_GROUP) => true,
-            _ => self.groups.iter().any(|group| receiver_out_groups.contains(group)),
+            _ => self
+                .groups
+                .iter()
+                .any(|group| receiver_out_groups.contains(group)),
         }
     }
 
@@ -104,10 +116,13 @@ impl Outbound {
     /// this message: always true for a broadcast, otherwise only if
     /// `my_uid` is one of the addressed recipients.
     pub fn is_deliverable_to(&self, my_uid: Option<&str>) -> bool {
-        if let Origin::Server { skip_uid: Some(skip) } = &self.origin
-            && my_uid == Some(skip.as_ref()) {
-                return false;
-            }
+        if let Origin::Server {
+            skip_uid: Some(skip),
+        } = &self.origin
+            && my_uid == Some(skip.as_ref())
+        {
+            return false;
+        }
         match &self.dest_uids {
             None => true,
             Some(uids) => my_uid.is_some_and(|uid| uids.iter().any(|u| u == uid)),
@@ -122,7 +137,14 @@ pub trait StreamingMissions: Send + Sync {
     /// The event `event_uid` from `client_uid` / `username` is addressed to
     /// these missions: record it where the client may write, and return the
     /// live subscribers it goes to.
-    fn route(&self, client_uid: Option<&str>, username: &str, names: &[String], guids: &[String], event_uid: &str) -> Vec<String>;
+    fn route(
+        &self,
+        client_uid: Option<&str>,
+        username: &str,
+        names: &[String],
+        guids: &[String],
+        event_uid: &str,
+    ) -> Vec<String>;
     /// The client is gone: it stops receiving mission changes.
     fn client_disconnected(&self, client_uid: &str);
 }
@@ -165,8 +187,12 @@ mod tests {
         Outbound {
             sender: "127.0.0.1:1".parse().unwrap(),
             xml: "<event/>".into(),
-            dest_uids: dest_uids
-                .map(|uids| uids.into_iter().map(String::from).collect::<Vec<_>>().into()),
+            dest_uids: dest_uids.map(|uids| {
+                uids.into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+                    .into()
+            }),
             groups: Arc::new(std::collections::BTreeSet::from(["__ANON__".to_string()])),
             origin: Origin::Client,
         }

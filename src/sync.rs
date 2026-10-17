@@ -79,13 +79,29 @@ pub struct ResourceRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum SyncEvent {
-    Inserted { record: Box<ResourceRecord> },
-    Deleted { primary_key: i64 },
-    KeywordsSet { hash: String, keywords: Vec<String> },
-    ExpirationSet { hash: String, expiration: Option<i64> },
+    Inserted {
+        record: Box<ResourceRecord>,
+    },
+    Deleted {
+        primary_key: i64,
+    },
+    KeywordsSet {
+        hash: String,
+        keywords: Vec<String>,
+    },
+    ExpirationSet {
+        hash: String,
+        expiration: Option<i64>,
+    },
     /// `FileManagerApi.putMetadata` on the caller's rows.
-    SubmitterSet { keys: Vec<i64>, user: String },
-    ExpirationSetKeys { keys: Vec<i64>, expiration: Option<i64> },
+    SubmitterSet {
+        keys: Vec<i64>,
+        user: String,
+    },
+    ExpirationSetKeys {
+        keys: Vec<i64>,
+        expiration: Option<i64>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -100,7 +116,9 @@ fn apply(state: &mut SyncState, event: &SyncEvent) {
             state.next_key = state.next_key.max(record.primary_key);
             state.resources.push((**record).clone());
         }
-        SyncEvent::Deleted { primary_key } => state.resources.retain(|r| r.primary_key != *primary_key),
+        SyncEvent::Deleted { primary_key } => {
+            state.resources.retain(|r| r.primary_key != *primary_key)
+        }
         SyncEvent::KeywordsSet { hash, keywords } => {
             for r in state.resources.iter_mut().filter(|r| r.hash == *hash) {
                 r.keywords = keywords.clone();
@@ -112,12 +130,20 @@ fn apply(state: &mut SyncState, event: &SyncEvent) {
             }
         }
         SyncEvent::SubmitterSet { keys, user } => {
-            for r in state.resources.iter_mut().filter(|r| keys.contains(&r.primary_key)) {
+            for r in state
+                .resources
+                .iter_mut()
+                .filter(|r| keys.contains(&r.primary_key))
+            {
                 r.submission_user = user.clone();
             }
         }
         SyncEvent::ExpirationSetKeys { keys, expiration } => {
-            for r in state.resources.iter_mut().filter(|r| keys.contains(&r.primary_key)) {
+            for r in state
+                .resources
+                .iter_mut()
+                .filter(|r| keys.contains(&r.primary_key))
+            {
                 r.expiration = *expiration;
             }
         }
@@ -177,7 +203,13 @@ impl ResourceStore {
 
     /// Store the metadata of content already in the content store under
     /// `hash` (`size` bytes).
-    pub fn insert(&self, new: NewResource, hash: &str, size: u64, now_millis: i64) -> Result<ResourceRecord, SyncError> {
+    pub fn insert(
+        &self,
+        new: NewResource,
+        hash: &str,
+        size: u64,
+        now_millis: i64,
+    ) -> Result<ResourceRecord, SyncError> {
         let mut state = self.state.write().unwrap();
         let record = ResourceRecord {
             primary_key: state.next_key + 1,
@@ -201,7 +233,12 @@ impl ResourceStore {
             mission_name: new.mission_name,
             remarks: new.remarks,
         };
-        self.record(&mut state, SyncEvent::Inserted { record: Box::new(record.clone()) })?;
+        self.record(
+            &mut state,
+            SyncEvent::Inserted {
+                record: Box::new(record.clone()),
+            },
+        )?;
         Ok(record)
     }
 
@@ -209,7 +246,11 @@ impl ResourceStore {
     /// submission time descending).
     pub fn all(&self) -> Vec<ResourceRecord> {
         let mut all = self.state.read().unwrap().resources.clone();
-        all.sort_by(|a, b| b.submission_time_millis.cmp(&a.submission_time_millis).then(b.primary_key.cmp(&a.primary_key)));
+        all.sort_by(|a, b| {
+            b.submission_time_millis
+                .cmp(&a.submission_time_millis)
+                .then(b.primary_key.cmp(&a.primary_key))
+        });
         all
     }
 
@@ -226,15 +267,25 @@ impl ResourceStore {
 
     pub fn by_hash(&self, hash: &str, groups: Option<&BTreeSet<String>>) -> Vec<ResourceRecord> {
         let hash = hash.to_ascii_lowercase();
-        self.visible(groups).into_iter().filter(|r| r.hash == hash).collect()
+        self.visible(groups)
+            .into_iter()
+            .filter(|r| r.hash == hash)
+            .collect()
     }
 
     pub fn by_uid(&self, uid: &str, groups: Option<&BTreeSet<String>>) -> Vec<ResourceRecord> {
-        self.visible(groups).into_iter().filter(|r| r.uid == uid).collect()
+        self.visible(groups)
+            .into_iter()
+            .filter(|r| r.uid == uid)
+            .collect()
     }
 
     /// Delete by primary keys (only those visible); returns how many.
-    pub fn delete_keys(&self, keys: &[i64], groups: Option<&BTreeSet<String>>) -> Result<usize, SyncError> {
+    pub fn delete_keys(
+        &self,
+        keys: &[i64],
+        groups: Option<&BTreeSet<String>>,
+    ) -> Result<usize, SyncError> {
         let visible: Vec<i64> = self.visible(groups).iter().map(|r| r.primary_key).collect();
         let mut state = self.state.write().unwrap();
         let mut count = 0;
@@ -246,36 +297,77 @@ impl ResourceStore {
     }
 
     /// Delete every visible resource with `hash`; returns how many.
-    pub fn delete_hash(&self, hash: &str, groups: Option<&BTreeSet<String>>) -> Result<usize, SyncError> {
-        let keys: Vec<i64> = self.by_hash(hash, groups).iter().map(|r| r.primary_key).collect();
+    pub fn delete_hash(
+        &self,
+        hash: &str,
+        groups: Option<&BTreeSet<String>>,
+    ) -> Result<usize, SyncError> {
+        let keys: Vec<i64> = self
+            .by_hash(hash, groups)
+            .iter()
+            .map(|r| r.primary_key)
+            .collect();
         self.delete_keys(&keys, groups)
     }
 
     pub fn set_keywords(&self, hash: &str, keywords: Vec<String>) -> Result<(), SyncError> {
         let mut state = self.state.write().unwrap();
-        self.record(&mut state, SyncEvent::KeywordsSet { hash: hash.to_ascii_lowercase(), keywords })
+        self.record(
+            &mut state,
+            SyncEvent::KeywordsSet {
+                hash: hash.to_ascii_lowercase(),
+                keywords,
+            },
+        )
     }
 
     pub fn set_expiration(&self, hash: &str, expiration: Option<i64>) -> Result<(), SyncError> {
         let mut state = self.state.write().unwrap();
-        self.record(&mut state, SyncEvent::ExpirationSet { hash: hash.to_ascii_lowercase(), expiration })
+        self.record(
+            &mut state,
+            SyncEvent::ExpirationSet {
+                hash: hash.to_ascii_lowercase(),
+                expiration,
+            },
+        )
     }
 
     pub fn set_submission_user(&self, keys: &[i64], user: &str) -> Result<(), SyncError> {
         let mut state = self.state.write().unwrap();
-        self.record(&mut state, SyncEvent::SubmitterSet { keys: keys.to_vec(), user: user.to_string() })
+        self.record(
+            &mut state,
+            SyncEvent::SubmitterSet {
+                keys: keys.to_vec(),
+                user: user.to_string(),
+            },
+        )
     }
 
-    pub fn set_expiration_keys(&self, keys: &[i64], expiration: Option<i64>) -> Result<(), SyncError> {
+    pub fn set_expiration_keys(
+        &self,
+        keys: &[i64],
+        expiration: Option<i64>,
+    ) -> Result<(), SyncError> {
         let mut state = self.state.write().unwrap();
-        self.record(&mut state, SyncEvent::ExpirationSetKeys { keys: keys.to_vec(), expiration })
+        self.record(
+            &mut state,
+            SyncEvent::ExpirationSetKeys {
+                keys: keys.to_vec(),
+                expiration,
+            },
+        )
     }
 
     /// Whether any resource (of any visibility) still references `hash` --
     /// the content bytes may only be removed when none does.
     pub fn hash_in_use(&self, hash: &str) -> bool {
         let hash = hash.to_ascii_lowercase();
-        self.state.read().unwrap().resources.iter().any(|r| r.hash == hash)
+        self.state
+            .read()
+            .unwrap()
+            .resources
+            .iter()
+            .any(|r| r.hash == hash)
     }
 }
 
@@ -312,7 +404,10 @@ impl ResourceRecord {
         }
         put("SubmissionUser", self.submission_user.clone());
         put("PrimaryKey", self.primary_key.to_string());
-        put("SubmissionDateTime", crate::marti::envelope::cot_date_millis(self.submission_time_millis));
+        put(
+            "SubmissionDateTime",
+            crate::marti::envelope::cot_date_millis(self.submission_time_millis),
+        );
         put("UID", self.uid.clone());
         if let Some(creator) = &self.creator_uid {
             put("CreatorUid", creator.clone());
@@ -324,7 +419,15 @@ impl ResourceRecord {
         if let Some(mission) = &self.mission_name {
             put("MissionName", mission.clone());
         }
-        let list = |values: &[String]| serde_json::Value::Array(values.iter().cloned().map(serde_json::Value::String).collect());
+        let list = |values: &[String]| {
+            serde_json::Value::Array(
+                values
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            )
+        };
         json.insert("Keywords".to_string(), list(&self.keywords));
         if !self.groups_field.is_empty() {
             json.insert("Groups".to_string(), list(&self.groups_field));
@@ -351,7 +454,13 @@ impl ResourceRecord {
                 map.insert(key.to_string(), value);
             }
         };
-        opt("filename", self.download_path.clone().or_else(|| self.name.clone()).map(Into::into));
+        opt(
+            "filename",
+            self.download_path
+                .clone()
+                .or_else(|| self.name.clone())
+                .map(Into::into),
+        );
         opt("name", self.name.clone().map(Into::into));
         opt("mimeType", self.mime_type.clone().map(Into::into));
         opt("creatorUid", self.creator_uid.clone().map(Into::into));
@@ -388,8 +497,12 @@ mod tests {
     #[test]
     fn resources_are_visible_only_within_their_groups() {
         let store = ResourceStore::in_memory();
-        store.insert(new("a", &["Red"]), &"a".repeat(64), 10, 1).unwrap();
-        store.insert(new("b", &["__ANON__"]), &"b".repeat(64), 10, 2).unwrap();
+        store
+            .insert(new("a", &["Red"]), &"a".repeat(64), 10, 1)
+            .unwrap();
+        store
+            .insert(new("b", &["__ANON__"]), &"b".repeat(64), 10, 2)
+            .unwrap();
         assert_eq!(store.visible(Some(&groups(&["Red"]))).len(), 1);
         assert_eq!(store.visible(Some(&groups(&["Blue"]))).len(), 0);
         assert_eq!(store.visible(None).len(), 2, "admin sees all");
@@ -398,7 +511,14 @@ mod tests {
     #[test]
     fn metadata_json_uses_the_official_field_names_and_string_values() {
         let store = ResourceStore::in_memory();
-        let r = store.insert(new("pkg", &["__ANON__"]), &"c".repeat(64), 1234, 1_760_716_800_005).unwrap();
+        let r = store
+            .insert(
+                new("pkg", &["__ANON__"]),
+                &"c".repeat(64),
+                1234,
+                1_760_716_800_005,
+            )
+            .unwrap();
         let json = r.metadata_json();
         assert_eq!(json["UID"], "pkg");
         assert_eq!(json["Size"], "1234");
@@ -421,7 +541,9 @@ mod tests {
         {
             let store = ResourceStore::load_or_create(&path).unwrap();
             store.insert(new("x", &["__ANON__"]), &hash, 1, 1).unwrap();
-            store.insert(new("y", &["__ANON__"]), &"e".repeat(64), 1, 2).unwrap();
+            store
+                .insert(new("y", &["__ANON__"]), &"e".repeat(64), 1, 2)
+                .unwrap();
             store.set_keywords(&hash, vec!["k1".into()]).unwrap();
             store.set_expiration(&hash, Some(99)).unwrap();
             store.delete_hash(&"e".repeat(64), None).unwrap();
@@ -433,7 +555,13 @@ mod tests {
         assert_eq!(all[0].expiration, Some(99));
         assert!(store.hash_in_use(&hash) && !store.hash_in_use(&"e".repeat(64)));
         // Keys keep counting after a reload.
-        assert_eq!(store.insert(new("z", &["__ANON__"]), &hash, 1, 3).unwrap().primary_key, 3);
+        assert_eq!(
+            store
+                .insert(new("z", &["__ANON__"]), &hash, 1, 3)
+                .unwrap()
+                .primary_key,
+            3
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

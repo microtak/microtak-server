@@ -29,8 +29,8 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 
 const SERVER_NAME: &str = "microtak-server";
 
@@ -348,8 +348,7 @@ async fn e2e_backup_mirrors_live_server_state_to_disk() {
         1,
         "expected exactly the one uploaded content blob to be backed up"
     );
-    let backed_up_bytes =
-        std::fs::read(content_dir.join(&backed_up_hashes[0])).unwrap();
+    let backed_up_bytes = std::fs::read(content_dir.join(&backed_up_hashes[0])).unwrap();
     assert_eq!(backed_up_bytes, b"backed up bytes");
 
     std::fs::remove_dir_all(&data_dir).ok();
@@ -375,20 +374,37 @@ async fn e2e_official_mission_lifecycle() {
 
     // A file in Enterprise Sync.
     let upload = lead
-        .post(format!("{base}/Marti/sync/upload?name=map.png&creatorUid=ANDROID-LEAD"))
+        .post(format!(
+            "{base}/Marti/sync/upload?name=map.png&creatorUid=ANDROID-LEAD"
+        ))
         .header(CONTENT_TYPE, "image/png")
         .body(b"\x89PNG map".to_vec())
         .send()
         .await
         .unwrap();
-    let hash = serde_json::from_str::<serde_json::Value>(&upload.text().await.unwrap()).unwrap()["Hash"].as_str().unwrap().to_string();
+    let hash =
+        serde_json::from_str::<serde_json::Value>(&upload.text().await.unwrap()).unwrap()["Hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
     // A marker relayed by a device.
     let (dev_cert, dev_key) = enroll(&enrollment, "device").await;
-    let mut device = connect_mtls(mtls_addr, &ca_cert_pem, &dev_cert, dev_key).await.unwrap();
-    device.write_all(marker_xml("marker-e2e", "ANDROID-DEV").as_bytes()).await.unwrap();
+    let mut device = connect_mtls(mtls_addr, &ca_cert_pem, &dev_cert, dev_key)
+        .await
+        .unwrap();
+    device
+        .write_all(marker_xml("marker-e2e", "ANDROID-DEV").as_bytes())
+        .await
+        .unwrap();
 
-    let created = lead.put(format!("{base}/Marti/api/missions/Recon%20Alpha?creatorUid=ANDROID-LEAD&description=first")).send().await.unwrap();
+    let created = lead
+        .put(format!(
+            "{base}/Marti/api/missions/Recon%20Alpha?creatorUid=ANDROID-LEAD&description=first"
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(created.status(), 201);
     let created: serde_json::Value = created.json().await.unwrap();
     assert_envelope(&created, "Mission");
@@ -396,7 +412,9 @@ async fn e2e_official_mission_lifecycle() {
     let auth = format!("Bearer {token}");
 
     let added = lead
-        .put(format!("{base}/Marti/api/missions/Recon%20Alpha/contents?creatorUid=ANDROID-LEAD"))
+        .put(format!(
+            "{base}/Marti/api/missions/Recon%20Alpha/contents?creatorUid=ANDROID-LEAD"
+        ))
         .header("MissionAuthorization", &auth)
         .json(&serde_json::json!({ "hashes": [hash], "uids": ["marker-e2e"] }))
         .send()
@@ -407,17 +425,36 @@ async fn e2e_official_mission_lifecycle() {
     // The relayed marker reaches the latest-CoT store asynchronously.
     let mut cot = String::new();
     for _ in 0..50 {
-        cot = lead.get(format!("{base}/Marti/api/missions/Recon%20Alpha/cot")).send().await.unwrap().text().await.unwrap();
+        cot = lead
+            .get(format!("{base}/Marti/api/missions/Recon%20Alpha/cot"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
         if cot.contains("marker-e2e") {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(cot.starts_with("<?xml version='1.0' encoding='UTF-8' standalone='yes'?><events><event "), "{cot}");
-    assert!(cot.contains(r#"uid="marker-e2e""#) && cot.ends_with("</events>"), "{cot}");
+    assert!(
+        cot.starts_with("<?xml version='1.0' encoding='UTF-8' standalone='yes'?><events><event "),
+        "{cot}"
+    );
+    assert!(
+        cot.contains(r#"uid="marker-e2e""#) && cot.ends_with("</events>"),
+        "{cot}"
+    );
 
-    let mission: serde_json::Value =
-        lead.get(format!("{base}/Marti/api/missions/Recon%20Alpha")).send().await.unwrap().json().await.unwrap();
+    let mission: serde_json::Value = lead
+        .get(format!("{base}/Marti/api/missions/Recon%20Alpha"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let m = &mission["data"][0];
     assert_eq!(m["contents"][0]["data"]["hash"], hash.as_str());
     assert_eq!(m["contents"][0]["data"]["name"], "map.png");
@@ -429,31 +466,60 @@ async fn e2e_official_mission_lifecycle() {
     let (cert, key) = enroll(&enrollment, "member").await;
     let member = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
     let sub = member
-        .put(format!("{base}/Marti/api/missions/Recon%20Alpha/subscription?uid=ANDROID-MEMBER"))
+        .put(format!(
+            "{base}/Marti/api/missions/Recon%20Alpha/subscription?uid=ANDROID-MEMBER"
+        ))
         .send()
         .await
         .unwrap();
     assert_eq!(sub.status(), 201);
     let sub: serde_json::Value = sub.json().await.unwrap();
     assert_eq!(sub["data"]["role"]["type"], "MISSION_SUBSCRIBER");
-    let subscribers: serde_json::Value =
-        member.get(format!("{base}/Marti/api/missions/Recon%20Alpha/subscriptions")).send().await.unwrap().json().await.unwrap();
-    assert_eq!(subscribers["data"], serde_json::json!(["ANDROID-LEAD", "ANDROID-MEMBER"]));
+    let subscribers: serde_json::Value = member
+        .get(format!(
+            "{base}/Marti/api/missions/Recon%20Alpha/subscriptions"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        subscribers["data"],
+        serde_json::json!(["ANDROID-LEAD", "ANDROID-MEMBER"])
+    );
 
-    let changes: serde_json::Value =
-        member.get(format!("{base}/Marti/api/missions/Recon%20Alpha/changes")).send().await.unwrap().json().await.unwrap();
+    let changes: serde_json::Value = member
+        .get(format!("{base}/Marti/api/missions/Recon%20Alpha/changes"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_envelope(&changes, "MissionChange");
-    assert_eq!(changes["data"].as_array().unwrap().len(), 3, "create + two adds");
+    assert_eq!(
+        changes["data"].as_array().unwrap().len(),
+        3,
+        "create + two adds"
+    );
     assert_eq!(changes["data"][2]["type"], "CREATE_MISSION");
 
     let deleted = lead
-        .delete(format!("{base}/Marti/api/missions/Recon%20Alpha?creatorUid=ANDROID-LEAD"))
+        .delete(format!(
+            "{base}/Marti/api/missions/Recon%20Alpha?creatorUid=ANDROID-LEAD"
+        ))
         .header("MissionAuthorization", &auth)
         .send()
         .await
         .unwrap();
     assert_eq!(deleted.status(), 200);
-    let gone = member.get(format!("{base}/Marti/api/missions/Recon%20Alpha")).send().await.unwrap();
+    let gone = member
+        .get(format!("{base}/Marti/api/missions/Recon%20Alpha"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(gone.status(), 410);
 }
 
@@ -467,23 +533,62 @@ async fn e2e_file_manager_delete_and_count() {
         let client = client.clone();
         let base = base.clone();
         async move {
-            let r = client.post(format!("{base}/Marti/sync/upload?name={name}{query}")).body(name.as_bytes().to_vec()).send().await.unwrap();
-            serde_json::from_str::<serde_json::Value>(&r.text().await.unwrap()).unwrap()["Hash"].as_str().unwrap().to_string()
+            let r = client
+                .post(format!("{base}/Marti/sync/upload?name={name}{query}"))
+                .body(name.as_bytes().to_vec())
+                .send()
+                .await
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&r.text().await.unwrap()).unwrap()["Hash"]
+                .as_str()
+                .unwrap()
+                .to_string()
         }
     };
     let plain = upload("plain.txt", "").await;
     upload("pkg.zip", "&keywords=missionpackage").await;
-    let count: serde_json::Value = client.get(format!("{base}/Marti/api/files/metadata/count")).send().await.unwrap().json().await.unwrap();
+    let count: serde_json::Value = client
+        .get(format!("{base}/Marti/api/files/metadata/count"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_envelope(&count, "Count");
     assert_eq!(count["data"], 2);
-    let packages: serde_json::Value =
-        client.get(format!("{base}/Marti/api/files/metadata/count?missionPackage=true")).send().await.unwrap().json().await.unwrap();
+    let packages: serde_json::Value = client
+        .get(format!(
+            "{base}/Marti/api/files/metadata/count?missionPackage=true"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(packages["data"], 1);
 
-    let deleted = client.delete(format!("{base}/Marti/api/files/{plain}")).send().await.unwrap();
+    let deleted = client
+        .delete(format!("{base}/Marti/api/files/{plain}"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(deleted.status(), 200);
-    assert_eq!(client.get(format!("{base}/Marti/sync/content?hash={plain}")).send().await.unwrap().status(), 404);
-    let again = client.delete(format!("{base}/Marti/api/files/{plain}")).send().await.unwrap();
+    assert_eq!(
+        client
+            .get(format!("{base}/Marti/sync/content?hash={plain}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let again = client
+        .delete(format!("{base}/Marti/api/files/{plain}"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(again.status(), 200, "nothing there: still 200");
 }
 
@@ -499,24 +604,48 @@ async fn e2e_file_manager_metadata_like_the_official_server() {
         let client = client.clone();
         let base = base.clone();
         async move {
-            let r = client.post(format!("{base}/Marti/sync/upload?name={name}{query}")).body(body).send().await.unwrap();
-            serde_json::from_str::<serde_json::Value>(&r.text().await.unwrap()).unwrap()["Hash"].as_str().unwrap().to_string()
+            let r = client
+                .post(format!("{base}/Marti/sync/upload?name={name}{query}"))
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&r.text().await.unwrap()).unwrap()["Hash"]
+                .as_str()
+                .unwrap()
+                .to_string()
         }
     };
-    let plain = upload("b-plain.txt", b"plain text".to_vec(), "&mimetype=text/plain").await;
+    let plain = upload(
+        "b-plain.txt",
+        b"plain text".to_vec(),
+        "&mimetype=text/plain",
+    )
+    .await;
     let package = upload("a-pkg.zip", vec![7u8; 2048], "&keywords=missionpackage").await;
     let list = |query: &'static str| {
         let client = client.clone();
         let base = base.clone();
         async move {
-            let body: serde_json::Value = client.get(format!("{base}/Marti/api/files/metadata{query}")).send().await.unwrap().json().await.unwrap();
+            let body: serde_json::Value = client
+                .get(format!("{base}/Marti/api/files/metadata{query}"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
             assert_envelope(&body, "Files");
             body["data"].as_array().unwrap().clone()
         }
     };
     let all = list("").await;
     let hashes: Vec<&str> = all.iter().map(|e| e["Hash"].as_str().unwrap()).collect();
-    assert_eq!(hashes, [plain.as_str(), package.as_str()], "no sort: in the order stored");
+    assert_eq!(
+        hashes,
+        [plain.as_str(), package.as_str()],
+        "no sort: in the order stored"
+    );
     let entry = &all[0];
     assert_eq!(entry["Name"], "b-plain.txt");
     assert_eq!(entry["User"], "files-meta");
@@ -527,7 +656,10 @@ async fn e2e_file_manager_metadata_like_the_official_server() {
     assert_eq!(entry["Expiration"], "none");
     assert_eq!(entry["Groups"], "__ANON__");
     let time = entry["Time"].as_str().unwrap();
-    assert!(time.len() >= 21 && &time[10..11] == " " && &time[19..20] == ".", "Timestamp.toString: {time}");
+    assert!(
+        time.len() >= 21 && &time[10..11] == " " && &time[19..20] == ".",
+        "Timestamp.toString: {time}"
+    );
     assert_eq!(all[1]["Size"], "2kB");
     assert_eq!(all[1]["Keywords"], "missionpackage");
 
@@ -543,7 +675,13 @@ async fn e2e_file_manager_metadata_like_the_official_server() {
     assert_eq!(page.len(), 1);
     assert_eq!(page[0]["Name"], "b-plain.txt");
 
-    let created = client.put(format!("{base}/Marti/api/missions/Files?creatorUid=ANDROID-F")).send().await.unwrap();
+    let created = client
+        .put(format!(
+            "{base}/Marti/api/missions/Files?creatorUid=ANDROID-F"
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(created.status(), 201);
     let added = client
         .put(format!("{base}/Marti/api/missions/Files/contents"))
@@ -558,23 +696,52 @@ async fn e2e_file_manager_metadata_like_the_official_server() {
     assert_eq!(in_mission[0]["Hash"], package.as_str());
 
     // getFile: the bytes, the stored type, an attachment named after it.
-    let file = client.get(format!("{base}/Marti/api/files/{plain}")).send().await.unwrap();
+    let file = client
+        .get(format!("{base}/Marti/api/files/{plain}"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(file.status(), 200);
     assert_eq!(file.headers()["content-type"], "text/plain");
-    assert_eq!(file.headers()["content-disposition"], "attachment; filename=\"b-plain.txt\"");
+    assert_eq!(
+        file.headers()["content-disposition"],
+        "attachment; filename=\"b-plain.txt\""
+    );
     assert_eq!(file.bytes().await.unwrap().as_ref(), b"plain text");
-    let missing = client.get(format!("{base}/Marti/api/files/{}", "0".repeat(64))).send().await.unwrap();
-    assert_eq!(missing.status(), 400, "ByteArrayResource(null): IllegalArgumentException");
-    let head = client.head(format!("{base}/Marti/api/files/{plain}")).send().await.unwrap();
+    let missing = client
+        .get(format!("{base}/Marti/api/files/{}", "0".repeat(64)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        missing.status(),
+        400,
+        "ByteArrayResource(null): IllegalArgumentException"
+    );
+    let head = client
+        .head(format!("{base}/Marti/api/files/{plain}"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(head.status(), 200);
 
     // putMetadata: keywords are always replaced (empty when not given).
-    let put = client.put(format!("{base}/Marti/api/files/{plain}/metadata?keywords=a&keywords=b&expiration=1800000000")).send().await.unwrap();
+    let put = client
+        .put(format!(
+            "{base}/Marti/api/files/{plain}/metadata?keywords=a&keywords=b&expiration=1800000000"
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(put.status(), 200);
     let after = list("?name=plain").await;
     assert_eq!(after[0]["Keywords"], "a,b");
     assert_eq!(after[0]["Expiration"], "2027-01-15T08:00:00");
-    client.put(format!("{base}/Marti/api/files/{plain}/metadata?user=bob")).send().await.unwrap();
+    client
+        .put(format!("{base}/Marti/api/files/{plain}/metadata?user=bob"))
+        .send()
+        .await
+        .unwrap();
     let after = list("?name=plain").await;
     assert_eq!(after[0]["User"], "bob");
     assert_eq!(after[0]["Keywords"], "none");
@@ -583,10 +750,19 @@ async fn e2e_file_manager_metadata_like_the_official_server() {
 
 /// One enrolled device used like ATAK uses it: the same certificate for
 /// its CoT stream (after a position report binds its uid) and the Marti API.
-async fn device(enrollment: &str, cn: &str, uid: &str, mtls_addr: SocketAddr, marti_api_addr: SocketAddr, ca_cert_pem: &str) -> (TlsStream<TcpStream>, reqwest::Client) {
+async fn device(
+    enrollment: &str,
+    cn: &str,
+    uid: &str,
+    mtls_addr: SocketAddr,
+    marti_api_addr: SocketAddr,
+    ca_cert_pem: &str,
+) -> (TlsStream<TcpStream>, reqwest::Client) {
     let (cert, key) = enroll(enrollment, cn).await;
     let key_again = rcgen::KeyPair::from_pem(&key.serialize_pem()).unwrap();
-    let mut stream = connect_mtls(mtls_addr, ca_cert_pem, &cert, key).await.unwrap();
+    let mut stream = connect_mtls(mtls_addr, ca_cert_pem, &cert, key)
+        .await
+        .unwrap();
     stream.write_all(event_xml(uid).as_bytes()).await.unwrap();
     let http = mtls_reqwest_client(ca_cert_pem, &cert, key_again, marti_api_addr);
     (stream, http)
@@ -607,44 +783,115 @@ async fn e2e_mission_notifications_and_streaming_content() {
     tokio::spawn(app.run());
     let base = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
 
-    let (mut lead, lead_http) = device(&enrollment, "lead", "ANDROID-LEAD", mtls_addr, marti_api_addr, &ca).await;
-    let (mut member, member_http) = device(&enrollment, "member", "ANDROID-MEMBER", mtls_addr, marti_api_addr, &ca).await;
-    let (mut outsider, _) = device(&enrollment, "outsider", "ANDROID-OUT", mtls_addr, marti_api_addr, &ca).await;
+    let (mut lead, lead_http) = device(
+        &enrollment,
+        "lead",
+        "ANDROID-LEAD",
+        mtls_addr,
+        marti_api_addr,
+        &ca,
+    )
+    .await;
+    let (mut member, member_http) = device(
+        &enrollment,
+        "member",
+        "ANDROID-MEMBER",
+        mtls_addr,
+        marti_api_addr,
+        &ca,
+    )
+    .await;
+    let (mut outsider, _) = device(
+        &enrollment,
+        "outsider",
+        "ANDROID-OUT",
+        mtls_addr,
+        marti_api_addr,
+        &ca,
+    )
+    .await;
     // Let the position reports bind the uids, then clear what was relayed.
     for stream in [&mut lead, &mut member, &mut outsider] {
         receives_within(stream, "never-there", Duration::from_millis(300)).await;
     }
 
-    let created = lead_http.put(format!("{base}/Marti/api/missions/Ops?creatorUid=ANDROID-LEAD")).send().await.unwrap();
+    let created = lead_http
+        .put(format!(
+            "{base}/Marti/api/missions/Ops?creatorUid=ANDROID-LEAD"
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(created.status(), 201);
     let announced = read_until_contains(&mut member, "t-x-m-n").await;
-    assert!(announced.contains(r#"<mission type="CREATE" tool="public" name="Ops""#), "{announced}");
-    assert!(!receives_within(&mut lead, "t-x-m-n", Duration::from_millis(300)).await, "not to the author");
+    assert!(
+        announced.contains(r#"<mission type="CREATE" tool="public" name="Ops""#),
+        "{announced}"
+    );
+    assert!(
+        !receives_within(&mut lead, "t-x-m-n", Duration::from_millis(300)).await,
+        "not to the author"
+    );
 
-    let sub = member_http.put(format!("{base}/Marti/api/missions/Ops/subscription?uid=ANDROID-MEMBER")).send().await.unwrap();
+    let sub = member_http
+        .put(format!(
+            "{base}/Marti/api/missions/Ops/subscription?uid=ANDROID-MEMBER"
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(sub.status(), 201);
 
     lead_http
-        .put(format!("{base}/Marti/api/missions/Ops/contents?creatorUid=ANDROID-LEAD"))
+        .put(format!(
+            "{base}/Marti/api/missions/Ops/contents?creatorUid=ANDROID-LEAD"
+        ))
         .json(&serde_json::json!({ "uids": ["pin-1"] }))
         .send()
         .await
         .unwrap();
     let change = read_until_contains(&mut member, "</event>").await;
-    assert!(change.contains(r#"type="t-x-m-c""#) && change.contains("<contentUid>pin-1</contentUid>"), "{change}");
-    assert!(!receives_within(&mut outsider, "t-x-m-c", Duration::from_millis(300)).await, "not a subscriber");
+    assert!(
+        change.contains(r#"type="t-x-m-c""#) && change.contains("<contentUid>pin-1</contentUid>"),
+        "{change}"
+    );
+    assert!(
+        !receives_within(&mut outsider, "t-x-m-c", Duration::from_millis(300)).await,
+        "not a subscriber"
+    );
 
     // Streaming content: the lead (owner) sends a marker into the mission.
-    let streamed = marker_xml("marker-stream", "ANDROID-LEAD").replace("</detail>", r#"<marti><dest mission="Ops"/></marti></detail>"#);
+    let streamed = marker_xml("marker-stream", "ANDROID-LEAD").replace(
+        "</detail>",
+        r#"<marti><dest mission="Ops"/></marti></detail>"#,
+    );
     lead.write_all(streamed.as_bytes()).await.unwrap();
     let got = read_until_contains(&mut member, r#"uid="marker-stream""#).await;
     let event_start = got.find(r#"uid="marker-stream""#).unwrap();
     let event = &got[event_start..got[event_start..].find("</event>").unwrap() + event_start];
-    assert!(!event.contains("<marti"), "forwarded without <marti>: {event}");
-    assert!(!receives_within(&mut outsider, "marker-stream", Duration::from_millis(300)).await, "only to the mission's subscribers");
+    assert!(
+        !event.contains("<marti"),
+        "forwarded without <marti>: {event}"
+    );
+    assert!(
+        !receives_within(&mut outsider, "marker-stream", Duration::from_millis(300)).await,
+        "only to the mission's subscribers"
+    );
 
-    let mission: serde_json::Value = lead_http.get(format!("{base}/Marti/api/missions/Ops")).send().await.unwrap().json().await.unwrap();
-    let uids: Vec<&str> = mission["data"][0]["uids"].as_array().unwrap().iter().map(|u| u["data"].as_str().unwrap()).collect();
+    let mission: serde_json::Value = lead_http
+        .get(format!("{base}/Marti/api/missions/Ops"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let uids: Vec<&str> = mission["data"][0]["uids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["data"].as_str().unwrap())
+        .collect();
     assert_eq!(uids, ["pin-1", "marker-stream"]);
 }
 
@@ -654,16 +901,37 @@ async fn e2e_mission_notifications_and_streaming_content() {
 #[tokio::test]
 async fn e2e_mission_tokens_decide_roles() {
     let (lead, base, enrollment_addr, ca_cert_pem) = sync_client("lead").await;
-    let created = lead.put(format!("{base}/Marti/api/missions/Secret?creatorUid=ANDROID-LEAD&password=s3cret")).send().await.unwrap();
+    let created = lead
+        .put(format!(
+            "{base}/Marti/api/missions/Secret?creatorUid=ANDROID-LEAD&password=s3cret"
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(created.status(), 201);
     let marti_port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
     let (cert, key) = enroll(&format!("https://{enrollment_addr}"), "visitor").await;
-    let visitor = mtls_reqwest_client(&ca_cert_pem, &cert, key, SocketAddr::from(([127, 0, 0, 1], marti_port)));
+    let visitor = mtls_reqwest_client(
+        &ca_cert_pem,
+        &cert,
+        key,
+        SocketAddr::from(([127, 0, 0, 1], marti_port)),
+    );
 
-    let denied = visitor.get(format!("{base}/Marti/api/missions/Secret/changes")).send().await.unwrap();
+    let denied = visitor
+        .get(format!("{base}/Marti/api/missions/Secret/changes"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(denied.status(), 403);
-    let opened: serde_json::Value =
-        visitor.get(format!("{base}/Marti/api/missions/Secret?password=s3cret")).send().await.unwrap().json().await.unwrap();
+    let opened: serde_json::Value = visitor
+        .get(format!("{base}/Marti/api/missions/Secret?password=s3cret"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let access = opened["data"][0]["token"].as_str().unwrap().to_string();
     let allowed = visitor
         .get(format!("{base}/Marti/api/missions/Secret/changes"))
@@ -697,7 +965,10 @@ async fn e2e_missionupload_and_content_like_the_official_server() {
     let package = b"PK\x03\x04 a data package".to_vec();
     let expected_hash = {
         use sha2::Digest;
-        sha2::Sha256::digest(&package).iter().map(|b| format!("{b:02x}")).collect::<String>()
+        sha2::Sha256::digest(&package)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     };
     let form = reqwest::multipart::Form::new().part(
         "assetfile",
@@ -710,40 +981,92 @@ async fn e2e_missionupload_and_content_like_the_official_server() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    assert!(response.headers()["content-type"].to_str().unwrap().starts_with("text/plain"));
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
     let url = response.text().await.unwrap();
     assert!(
-        url.starts_with("https://") && url.ends_with(&format!("/Marti/sync/content?hash={expected_hash}")),
+        url.starts_with("https://")
+            && url.ends_with(&format!("/Marti/sync/content?hash={expected_hash}")),
         "{url}"
     );
 
-    let download = client.get(format!("{base_url}/Marti/sync/content?hash={expected_hash}")).send().await.unwrap();
+    let download = client
+        .get(format!(
+            "{base_url}/Marti/sync/content?hash={expected_hash}"
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(download.status(), 200);
-    assert_eq!(download.headers()["content-type"], "application/x-zip-compressed");
-    assert_eq!(download.headers()["content-disposition"], "inline; filename=\"Recon.zip\"");
+    assert_eq!(
+        download.headers()["content-type"],
+        "application/x-zip-compressed"
+    );
+    assert_eq!(
+        download.headers()["content-disposition"],
+        "inline; filename=\"Recon.zip\""
+    );
     assert_eq!(download.headers()["api-version"], "3");
     assert_eq!(download.bytes().await.unwrap().to_vec(), package);
 
     // Raw body: the official servlet insists on multipart.
     let raw = client
-        .post(format!("{base_url}/Marti/sync/missionupload?filename=x.zip&creatorUid=A"))
+        .post(format!(
+            "{base_url}/Marti/sync/missionupload?filename=x.zip&creatorUid=A"
+        ))
         .body(b"raw".to_vec())
         .send()
         .await
         .unwrap();
     assert_eq!(raw.status(), 400);
     // filename is required.
-    let form = reqwest::multipart::Form::new().part("assetfile", reqwest::multipart::Part::bytes(b"x".to_vec()));
-    let missing = client.post(format!("{base_url}/Marti/sync/missionupload?creatorUid=A")).multipart(form).send().await.unwrap();
+    let form = reqwest::multipart::Form::new()
+        .part("assetfile", reqwest::multipart::Part::bytes(b"x".to_vec()));
+    let missing = client
+        .post(format!("{base_url}/Marti/sync/missionupload?creatorUid=A"))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(missing.status(), 400);
 
     // missionquery: the content URL if the hash is known, 404 if not.
-    let query = client.get(format!("{base_url}/Marti/sync/missionquery?hash={expected_hash}")).send().await.unwrap();
+    let query = client
+        .get(format!(
+            "{base_url}/Marti/sync/missionquery?hash={expected_hash}"
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(query.status(), 200);
-    assert!(query.text().await.unwrap().ends_with(&format!("hash={expected_hash}")));
-    let unknown = client.get(format!("{base_url}/Marti/sync/missionquery?hash={}", "f".repeat(64))).send().await.unwrap();
+    assert!(
+        query
+            .text()
+            .await
+            .unwrap()
+            .ends_with(&format!("hash={expected_hash}"))
+    );
+    let unknown = client
+        .get(format!(
+            "{base_url}/Marti/sync/missionquery?hash={}",
+            "f".repeat(64)
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(unknown.status(), 404);
-    let none = client.get(format!("{base_url}/Marti/sync/content?hash={}", "f".repeat(64))).send().await.unwrap();
+    let none = client
+        .get(format!(
+            "{base_url}/Marti/sync/content?hash={}",
+            "f".repeat(64)
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(none.status(), 404);
 }
 
@@ -763,7 +1086,8 @@ async fn e2e_sync_upload_stores_metadata_like_the_official_server() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    let metadata: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(&response.text().await.unwrap()).unwrap();
     assert_eq!(metadata["UID"], "MARKER-1");
     assert_eq!(metadata["Name"], "photo.jpg");
     assert_eq!(metadata["MIMEType"], "image/jpeg");
@@ -772,14 +1096,34 @@ async fn e2e_sync_upload_stores_metadata_like_the_official_server() {
     assert_eq!(metadata["SubmissionUser"], "sync-bob");
     assert_eq!(metadata["Latitude"], "53.25");
     assert_eq!(metadata["Size"], "8");
-    assert!(metadata["PrimaryKey"].as_str().unwrap().parse::<i64>().is_ok());
+    assert!(
+        metadata["PrimaryKey"]
+            .as_str()
+            .unwrap()
+            .parse::<i64>()
+            .is_ok()
+    );
 
-    let by_uid = client.get(format!("{base_url}/Marti/sync/content?uid=MARKER-1")).send().await.unwrap();
+    let by_uid = client
+        .get(format!("{base_url}/Marti/sync/content?uid=MARKER-1"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(by_uid.status(), 200);
 
-    let unknown = client.post(format!("{base_url}/Marti/sync/upload?name=a&bogus=1")).body(b"x".to_vec()).send().await.unwrap();
+    let unknown = client
+        .post(format!("{base_url}/Marti/sync/upload?name=a&bogus=1"))
+        .body(b"x".to_vec())
+        .send()
+        .await
+        .unwrap();
     assert_eq!(unknown.status(), 400);
-    let empty = client.post(format!("{base_url}/Marti/sync/upload?name=a")).body(Vec::<u8>::new()).send().await.unwrap();
+    let empty = client
+        .post(format!("{base_url}/Marti/sync/upload?name=a"))
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .unwrap();
     assert_eq!(empty.status(), 400);
 }
 
@@ -790,7 +1134,9 @@ async fn e2e_sync_search_both_flavours() {
     let (client, base_url, _, _) = sync_client("sync-carol").await;
     for (name, keywords) in [("a.zip", "missionpackage"), ("b.txt", "notes")] {
         let status = client
-            .post(format!("{base_url}/Marti/sync/upload?name={name}&keywords={keywords}"))
+            .post(format!(
+                "{base_url}/Marti/sync/upload?name={name}&keywords={keywords}"
+            ))
             .body(name.as_bytes().to_vec())
             .send()
             .await
@@ -798,13 +1144,22 @@ async fn e2e_sync_search_both_flavours() {
             .status();
         assert_eq!(status, 200);
     }
-    let servlet: serde_json::Value = client.get(format!("{base_url}/Marti/sync/search")).send().await.unwrap().json().await.unwrap();
+    let servlet: serde_json::Value = client
+        .get(format!("{base_url}/Marti/sync/search"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(servlet["resultCount"], 2, "{servlet}");
     assert_eq!(servlet["results"].as_array().unwrap().len(), 2);
     assert!(servlet["results"][0]["Hash"].is_string());
 
     let filtered: serde_json::Value = client
-        .get(format!("{base_url}/Marti/sync/search?keywords=missionpackage"))
+        .get(format!(
+            "{base_url}/Marti/sync/search?keywords=missionpackage"
+        ))
         .send()
         .await
         .unwrap()
@@ -846,8 +1201,20 @@ async fn e2e_sync_visibility_and_delete() {
     tokio::spawn(app.run());
     groups.create("Red", None, 0).unwrap();
     groups.create("Blue", None, 0).unwrap();
-    groups.set_member("Red", "red-user", Some(microtak_server::groups::Membership::Both)).unwrap();
-    groups.set_member("Blue", "blue-user", Some(microtak_server::groups::Membership::Both)).unwrap();
+    groups
+        .set_member(
+            "Red",
+            "red-user",
+            Some(microtak_server::groups::Membership::Both),
+        )
+        .unwrap();
+    groups
+        .set_member(
+            "Blue",
+            "blue-user",
+            Some(microtak_server::groups::Membership::Both),
+        )
+        .unwrap();
     let url = format!("https://{enrollment_addr}");
     let (red_cert, red_key) = enroll(&url, "red-user").await;
     let (blue_cert, blue_key) = enroll(&url, "blue-user").await;
@@ -856,24 +1223,70 @@ async fn e2e_sync_visibility_and_delete() {
     let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
 
     let body: serde_json::Value = serde_json::from_str(
-        &red.post(format!("{base_url}/Marti/sync/upload?name=red.txt")).body(b"red secret".to_vec()).send().await.unwrap().text().await.unwrap(),
+        &red.post(format!("{base_url}/Marti/sync/upload?name=red.txt"))
+            .body(b"red secret".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
     )
     .unwrap();
     let hash = body["Hash"].as_str().unwrap().to_string();
 
-    let blue_view = blue.get(format!("{base_url}/Marti/sync/content?hash={hash}")).send().await.unwrap();
+    let blue_view = blue
+        .get(format!("{base_url}/Marti/sync/content?hash={hash}"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(blue_view.status(), 404, "Blue can't see Red's file");
-    let blue_search: serde_json::Value = blue.get(format!("{base_url}/Marti/sync/search")).send().await.unwrap().json().await.unwrap();
+    let blue_search: serde_json::Value = blue
+        .get(format!("{base_url}/Marti/sync/search"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(blue_search["resultCount"], 0);
-    assert_eq!(red.get(format!("{base_url}/Marti/sync/content?hash={hash}")).send().await.unwrap().status(), 200);
+    assert_eq!(
+        red.get(format!("{base_url}/Marti/sync/content?hash={hash}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
 
     // The official URL table refuses DELETE here; the servlet deletes on POST.
-    let refused = red.delete(format!("{base_url}/Marti/sync/delete?Hash={hash}")).send().await.unwrap();
+    let refused = red
+        .delete(format!("{base_url}/Marti/sync/delete?Hash={hash}"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(refused.status(), 403);
-    let delete = red.post(format!("{base_url}/Marti/sync/delete?Hash={hash}")).send().await.unwrap();
+    let delete = red
+        .post(format!("{base_url}/Marti/sync/delete?Hash={hash}"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(delete.status(), 200);
-    assert!(delete.text().await.unwrap().contains("Deleted 1 resource(s)."));
-    assert_eq!(red.get(format!("{base_url}/Marti/sync/content?hash={hash}")).send().await.unwrap().status(), 404);
+    assert!(
+        delete
+            .text()
+            .await
+            .unwrap()
+            .contains("Deleted 1 resource(s).")
+    );
+    assert_eq!(
+        red.get(format!("{base_url}/Marti/sync/content?hash={hash}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
 }
 
 /// Official MissionApi /resources/{hash} (admin only) and MetadataApi
@@ -883,27 +1296,39 @@ async fn e2e_resources_and_metadata_keywords() {
     let server = start_with_admin().await;
     let response = server
         .admin
-        .post(format!("{}/Marti/sync/upload?name=k.txt&keywords=old", server.api_url))
+        .post(format!(
+            "{}/Marti/sync/upload?name=k.txt&keywords=old",
+            server.api_url
+        ))
         .body(b"keyword file".to_vec())
         .send()
         .await
         .unwrap();
-    let metadata: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(&response.text().await.unwrap()).unwrap();
     let hash = metadata["Hash"].as_str().unwrap().to_string();
 
     let response = server
         .admin
-        .put(format!("{}/Marti/api/sync/metadata/{hash}/keywords", server.api_url))
+        .put(format!(
+            "{}/Marti/api/sync/metadata/{hash}/keywords",
+            server.api_url
+        ))
         .json(&serde_json::json!(["new", "two"]))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
 
-    let (status, resources) = server.admin_get(&format!("/Marti/api/resources/{hash}")).await;
+    let (status, resources) = server
+        .admin_get(&format!("/Marti/api/resources/{hash}"))
+        .await;
     assert_eq!(status, 200);
     assert_envelope(&resources, "Resource");
-    assert_eq!(resources["data"][0]["keywords"], serde_json::json!(["new", "two"]));
+    assert_eq!(
+        resources["data"][0]["keywords"],
+        serde_json::json!(["new", "two"])
+    );
     assert_eq!(resources["data"][0]["hash"], hash.as_str());
 }
 
@@ -913,7 +1338,13 @@ async fn e2e_resources_and_metadata_keywords() {
 #[tokio::test]
 async fn e2e_creator_uid_is_the_device_uid_not_the_certificate() {
     let (client, base, _, _) = sync_client("jz").await;
-    let created = client.put(format!("{base}/Marti/api/missions/Ops?creatorUid=ANDROID-0123456789abcdef")).send().await.unwrap();
+    let created = client
+        .put(format!(
+            "{base}/Marti/api/missions/Ops?creatorUid=ANDROID-0123456789abcdef"
+        ))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(created.status(), 201);
     let body: serde_json::Value = created.json().await.unwrap();
     assert_eq!(body["data"][0]["creatorUid"], "ANDROID-0123456789abcdef");
@@ -985,7 +1416,10 @@ async fn e2e_fanout_to_multiple_clients_across_mixed_transports() {
 
     let mut buf = vec![0u8; 4096];
     for (name, stream) in [
-        ("mTLS client B", &mut tls_b as &mut (dyn tokio::io::AsyncRead + Unpin + Send)),
+        (
+            "mTLS client B",
+            &mut tls_b as &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        ),
         ("mTLS client C", &mut tls_c),
         ("plain-TCP client D", &mut plain_d),
     ] {
@@ -1021,7 +1455,10 @@ async fn e2e_client_endpoints_reflects_real_connections() {
     let (viewer_cert, viewer_key) = enroll(&base_url, "endpoints-viewer").await;
 
     let client = mtls_reqwest_client(&ca_cert_pem, &viewer_cert, viewer_key, marti_api_addr);
-    let list_url = format!("https://{SERVER_NAME}:{}/Marti/api/clientEndPoints", marti_api_addr.port());
+    let list_url = format!(
+        "https://{SERVER_NAME}:{}/Marti/api/clientEndPoints",
+        marti_api_addr.port()
+    );
 
     let before: Vec<serde_json::Value> = client
         .get(&list_url)
@@ -1054,7 +1491,11 @@ async fn e2e_client_endpoints_reflects_real_connections() {
         .json()
         .await
         .unwrap();
-    assert_eq!(during.len(), 2, "expected both live connections: {during:?}");
+    assert_eq!(
+        during.len(),
+        2,
+        "expected both live connections: {during:?}"
+    );
     assert!(
         during
             .iter()
@@ -1272,7 +1713,9 @@ async fn e2e_auto_mode_is_locked_from_the_start_and_the_admin_bootstraps_with_a_
     let plain_client = enrollment_client();
     let post = |query: String, csr: String| {
         plain_client
-            .post(format!("{enrollment_base_url}/Marti/api/tls/signClient/v2{query}"))
+            .post(format!(
+                "{enrollment_base_url}/Marti/api/tls/signClient/v2{query}"
+            ))
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(csr)
             .send()
@@ -1287,14 +1730,22 @@ async fn e2e_auto_mode_is_locked_from_the_start_and_the_admin_bootstraps_with_a_
     assert_eq!(post(String::new(), csr).await.unwrap().status(), 403);
     // ...but can with it, exactly once.
     let (csr, admin_key) = pki::build_csr("admin").unwrap();
-    let response = post(format!("?token={bootstrap_token}"), csr).await.unwrap();
+    let response = post(format!("?token={bootstrap_token}"), csr)
+        .await
+        .unwrap();
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().await.unwrap();
     let admin_cert = wrap_pem(body["signedCert"].as_str().unwrap());
-    assert!(!bootstrap_path.exists(), "the used bootstrap token file is deleted");
+    assert!(
+        !bootstrap_path.exists(),
+        "the used bootstrap token file is deleted"
+    );
     let (csr, _key) = pki::build_csr("admin").unwrap();
     assert_eq!(
-        post(format!("?token={bootstrap_token}"), csr).await.unwrap().status(),
+        post(format!("?token={bootstrap_token}"), csr)
+            .await
+            .unwrap()
+            .status(),
         403
     );
 
@@ -1311,7 +1762,10 @@ async fn e2e_auto_mode_is_locked_from_the_start_and_the_admin_bootstraps_with_a_
 
     // An invite token can't take over the admin identity.
     let (csr, _key) = pki::build_csr("admin").unwrap();
-    assert_eq!(post(format!("?token={token}"), csr).await.unwrap().status(), 403);
+    assert_eq!(
+        post(format!("?token={token}"), csr).await.unwrap().status(),
+        403
+    );
 
     // A new device enrolling with it succeeds, and its cert works.
     let (csr, device_key) = pki::build_csr("device-with-token").unwrap();
@@ -1325,7 +1779,10 @@ async fn e2e_auto_mode_is_locked_from_the_start_and_the_admin_bootstraps_with_a_
 
     // The consumed token can't be reused by a second device.
     let (csr, _key) = pki::build_csr("device-second").unwrap();
-    assert_eq!(post(format!("?token={token}"), csr).await.unwrap().status(), 403);
+    assert_eq!(
+        post(format!("?token={token}"), csr).await.unwrap().status(),
+        403
+    );
 
     // A fresh token can't re-enroll the existing device either.
     let mint_body: serde_json::Value = admin_client
@@ -1339,7 +1796,10 @@ async fn e2e_auto_mode_is_locked_from_the_start_and_the_admin_bootstraps_with_a_
     let second_token = mint_body["token"].as_str().unwrap();
     let (csr, _key) = pki::build_csr("device-with-token").unwrap();
     assert_eq!(
-        post(format!("?token={second_token}"), csr).await.unwrap().status(),
+        post(format!("?token={second_token}"), csr)
+            .await
+            .unwrap()
+            .status(),
         409
     );
 }
@@ -1386,7 +1846,9 @@ async fn e2e_csr_requesting_ca_status_cannot_forge_the_admin_identity() {
         .pem()
         .unwrap();
     let response = enrollment_client()
-        .post(format!("https://{enrollment_addr}/Marti/api/tls/signClient/v2"))
+        .post(format!(
+            "https://{enrollment_addr}/Marti/api/tls/signClient/v2"
+        ))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(csr_pem)
         .send()
@@ -1453,7 +1915,10 @@ async fn e2e_enrollment_port_is_https_only_with_a_cert_from_the_servers_ca() {
         .get(format!("http://{enrollment_addr}/Marti/api/tls/config"))
         .send()
         .await;
-    assert!(plain.is_err(), "plain HTTP must not get an HTTP response: {plain:?}");
+    assert!(
+        plain.is_err(),
+        "plain HTTP must not get an HTTP response: {plain:?}"
+    );
 
     // HTTPS, strictly verified against the server's CA, under both the
     // common name and a configured extra name.
@@ -1466,7 +1931,10 @@ async fn e2e_enrollment_port_is_https_only_with_a_cert_from_the_servers_ca() {
             .build()
             .unwrap();
         let response = strict
-            .get(format!("https://{name}:{}/Marti/api/tls/config", enrollment_addr.port()))
+            .get(format!(
+                "https://{name}:{}/Marti/api/tls/config",
+                enrollment_addr.port()
+            ))
             .send()
             .await
             .unwrap_or_else(|error| panic!("strict HTTPS to {name} failed: {error}"));
@@ -1477,7 +1945,10 @@ async fn e2e_enrollment_port_is_https_only_with_a_cert_from_the_servers_ca() {
     let wrong_name = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_cert_pem.as_bytes()).unwrap())
         .tls_built_in_root_certs(false)
-        .resolve("not-this-server.example", SocketAddr::new(enrollment_addr.ip(), 0))
+        .resolve(
+            "not-this-server.example",
+            SocketAddr::new(enrollment_addr.ip(), 0),
+        )
         .no_proxy()
         .build()
         .unwrap()
@@ -1582,28 +2053,45 @@ async fn e2e_a_devices_chat_and_markers_are_relayed_intact() {
     let base_url = format!("https://{enrollment_addr}");
     let (cert_a, key_a) = enroll(&base_url, "chatty").await;
     let (cert_b, key_b) = enroll(&base_url, "listener").await;
-    let mut a = connect_mtls(mtls_addr, &ca_cert_pem, &cert_a, key_a).await.unwrap();
-    let mut b = connect_mtls(mtls_addr, &ca_cert_pem, &cert_b, key_b).await.unwrap();
+    let mut a = connect_mtls(mtls_addr, &ca_cert_pem, &cert_a, key_a)
+        .await
+        .unwrap();
+    let mut b = connect_mtls(mtls_addr, &ca_cert_pem, &cert_b, key_b)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let sa = event_xml("ANDROID-chatty");
     a.write_all(sa.as_bytes()).await.unwrap();
     let got = read_until_contains(&mut b, "ANDROID-chatty-CS").await;
-    assert!(got.contains(r#"<takv platform="ATAK-CIV""#), "SA detail relayed intact: {got}");
+    assert!(
+        got.contains(r#"<takv platform="ATAK-CIV""#),
+        "SA detail relayed intact: {got}"
+    );
 
     let chat = chat_xml("ANDROID-chatty", "m1");
     a.write_all(chat.as_bytes()).await.unwrap();
     let got = read_until_contains(&mut b, "hello from ANDROID-chatty").await;
-    assert!(got.contains(&chat), "the chat message arrives exactly as sent: {got}");
+    assert!(
+        got.contains(&chat),
+        "the chat message arrives exactly as sent: {got}"
+    );
 
     let marker = marker_xml("marker-1", "ANDROID-chatty");
     a.write_all(marker.as_bytes()).await.unwrap();
     let got = read_until_contains(&mut b, "marker-1").await;
-    assert!(got.contains(&marker), "the marker arrives exactly as sent: {got}");
+    assert!(
+        got.contains(&marker),
+        "the marker arrives exactly as sent: {got}"
+    );
 
     // Still connected: a later SA still flows.
     a.write_all(sa.as_bytes()).await.unwrap();
-    assert!(read_until_contains(&mut b, "ANDROID-chatty-CS").await.contains("ANDROID-chatty-CS"));
+    assert!(
+        read_until_contains(&mut b, "ANDROID-chatty-CS")
+            .await
+            .contains("ANDROID-chatty-CS")
+    );
 }
 
 /// Impersonation through authored content is dropped, not relayed: chat
@@ -1621,28 +2109,58 @@ async fn e2e_content_impersonating_another_device_is_dropped() {
     let (cert_v, key_v) = enroll(&base_url, "victim").await;
     let (cert_m, key_m) = enroll(&base_url, "mallory").await;
     let (cert_w, key_w) = enroll(&base_url, "watcher").await;
-    let mut victim = connect_mtls(mtls_addr, &ca_cert_pem, &cert_v, key_v).await.unwrap();
-    let mut mallory = connect_mtls(mtls_addr, &ca_cert_pem, &cert_m, key_m).await.unwrap();
-    let mut watcher = connect_mtls(mtls_addr, &ca_cert_pem, &cert_w, key_w).await.unwrap();
+    let mut victim = connect_mtls(mtls_addr, &ca_cert_pem, &cert_v, key_v)
+        .await
+        .unwrap();
+    let mut mallory = connect_mtls(mtls_addr, &ca_cert_pem, &cert_m, key_m)
+        .await
+        .unwrap();
+    let mut watcher = connect_mtls(mtls_addr, &ca_cert_pem, &cert_w, key_w)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    victim.write_all(event_xml("ANDROID-victim").as_bytes()).await.unwrap();
+    victim
+        .write_all(event_xml("ANDROID-victim").as_bytes())
+        .await
+        .unwrap();
     read_until_contains(&mut watcher, "ANDROID-victim-CS").await;
-    mallory.write_all(event_xml("ANDROID-mallory").as_bytes()).await.unwrap();
+    mallory
+        .write_all(event_xml("ANDROID-mallory").as_bytes())
+        .await
+        .unwrap();
     read_until_contains(&mut watcher, "ANDROID-mallory-CS").await;
 
-    mallory.write_all(chat_xml("ANDROID-victim", "forged").as_bytes()).await.unwrap();
-    mallory.write_all(marker_xml("forged-marker", "ANDROID-victim").as_bytes()).await.unwrap();
+    mallory
+        .write_all(chat_xml("ANDROID-victim", "forged").as_bytes())
+        .await
+        .unwrap();
+    mallory
+        .write_all(marker_xml("forged-marker", "ANDROID-victim").as_bytes())
+        .await
+        .unwrap();
     let fake_position = r#"<event version="2.0" uid="ANDROID-victim" type="a-f-G-U-C" how="m-g" time="2026-09-29T12:00:00Z" start="2026-09-29T12:00:00Z" stale="2026-09-29T12:05:00Z"><point lat="0.0" lon="0.0" hae="0.0" ce="1.0" le="1.0"/><detail><contact callsign="FAKE"/></detail></event>"#;
     mallory.write_all(fake_position.as_bytes()).await.unwrap();
     // Then something legitimate, as a marker for "everything before this
     // has been processed".
-    mallory.write_all(chat_xml("ANDROID-mallory", "legit").as_bytes()).await.unwrap();
+    mallory
+        .write_all(chat_xml("ANDROID-mallory", "legit").as_bytes())
+        .await
+        .unwrap();
 
     let got = read_until_contains(&mut watcher, "hello from ANDROID-mallory").await;
-    assert!(got.contains("hello from ANDROID-mallory"), "mallory's own chat still flows: {got}");
-    assert!(!got.contains("forged"), "forged chat/marker must not be relayed: {got}");
-    assert!(!got.contains("FAKE"), "a fake position for the victim must not be relayed: {got}");
+    assert!(
+        got.contains("hello from ANDROID-mallory"),
+        "mallory's own chat still flows: {got}"
+    );
+    assert!(
+        !got.contains("forged"),
+        "forged chat/marker must not be relayed: {got}"
+    );
+    assert!(
+        !got.contains("FAKE"),
+        "a fake position for the victim must not be relayed: {got}"
+    );
     assert!(
         !receives_within(&mut watcher, "forged", Duration::from_millis(300)).await,
         "nothing forged arrives late either"
@@ -1687,52 +2205,89 @@ async fn e2e_groups_decide_who_receives_what() {
         if device == "red-2" {
             red2_identity = Some((cert.clone(), key.serialize_pem()));
         }
-        streams.insert(device, connect_mtls(mtls_addr, &ca_cert_pem, &cert, key).await.unwrap());
+        streams.insert(
+            device,
+            connect_mtls(mtls_addr, &ca_cert_pem, &cert, key)
+                .await
+                .unwrap(),
+        );
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     async fn say(streams: &mut std::collections::HashMap<&str, TlsStream<TcpStream>>, from: &str) {
         let s = streams.get_mut(from).unwrap();
-        s.write_all(event_xml(&format!("UID-{from}")).as_bytes()).await.unwrap();
+        s.write_all(event_xml(&format!("UID-{from}")).as_bytes())
+            .await
+            .unwrap();
     }
     async fn heard(
         streams: &mut std::collections::HashMap<&str, TlsStream<TcpStream>>,
         who: &str,
         from: &str,
     ) -> bool {
-        receives_within(streams.get_mut(who).unwrap(), &format!("UID-{from}-CS"), Duration::from_millis(400)).await
+        receives_within(
+            streams.get_mut(who).unwrap(),
+            &format!("UID-{from}-CS"),
+            Duration::from_millis(400),
+        )
+        .await
     }
 
     say(&mut streams, "red-1").await;
     assert!(heard(&mut streams, "red-2", "red-1").await, "same group");
-    assert!(heard(&mut streams, "listener", "red-1").await, "OUT member receives");
+    assert!(
+        heard(&mut streams, "listener", "red-1").await,
+        "OUT member receives"
+    );
     assert!(!heard(&mut streams, "blue-1", "red-1").await, "other group");
-    assert!(!heard(&mut streams, "anon-1", "red-1").await, "anonymous device");
+    assert!(
+        !heard(&mut streams, "anon-1", "red-1").await,
+        "anonymous device"
+    );
 
     say(&mut streams, "listener").await;
-    assert!(!heard(&mut streams, "red-1", "listener").await, "no IN membership: can't send into Red");
+    assert!(
+        !heard(&mut streams, "red-1", "listener").await,
+        "no IN membership: can't send into Red"
+    );
 
     say(&mut streams, "anon-1").await;
-    assert!(!heard(&mut streams, "red-1", "anon-1").await, "anonymous traffic stays anonymous");
+    assert!(
+        !heard(&mut streams, "red-1", "anon-1").await,
+        "anonymous traffic stays anonymous"
+    );
 
     say(&mut streams, "blue-1").await;
-    assert!(heard(&mut streams, "red-2", "blue-1").await, "red-2 is in Blue too");
+    assert!(
+        heard(&mut streams, "red-2", "blue-1").await,
+        "red-2 is in Blue too"
+    );
 
     // red-2 switches Blue off through the client API (bitpos: Red=1, Blue=2).
     let (red2_cert, red2_key_pem) = red2_identity.unwrap();
     let red2_key = rcgen::KeyPair::from_pem(&red2_key_pem).unwrap();
     let api = mtls_reqwest_client(&ca_cert_pem, &red2_cert, red2_key, marti_api_addr);
     let listed: serde_json::Value = api
-        .get(format!("https://{SERVER_NAME}:{}/Marti/api/groups/all?useCache=true", marti_api_addr.port()))
+        .get(format!(
+            "https://{SERVER_NAME}:{}/Marti/api/groups/all?useCache=true",
+            marti_api_addr.port()
+        ))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(listed["data"].as_array().unwrap().len(), 4, "Red and Blue, IN and OUT: {listed}");
+    assert_eq!(
+        listed["data"].as_array().unwrap().len(),
+        4,
+        "Red and Blue, IN and OUT: {listed}"
+    );
     let status = api
-        .put(format!("https://{SERVER_NAME}:{}/Marti/api/groups/activebits", marti_api_addr.port()))
+        .put(format!(
+            "https://{SERVER_NAME}:{}/Marti/api/groups/activebits",
+            marti_api_addr.port()
+        ))
         .json(&[1])
         .send()
         .await
@@ -1741,7 +2296,10 @@ async fn e2e_groups_decide_who_receives_what() {
     assert_eq!(status, 200);
 
     say(&mut streams, "blue-1").await;
-    assert!(!heard(&mut streams, "red-2", "blue-1").await, "Blue switched off: nothing from it");
+    assert!(
+        !heard(&mut streams, "red-2", "blue-1").await,
+        "Blue switched off: nothing from it"
+    );
     say(&mut streams, "red-1").await;
     assert!(heard(&mut streams, "red-2", "red-1").await, "Red still on");
 }
@@ -1780,7 +2338,9 @@ async fn start_with_admin() -> Running {
     let enrollment_url = format!("https://{enrollment_addr}");
     let (csr, admin_key) = pki::build_csr("admin").unwrap();
     let response = enrollment_client()
-        .post(format!("{enrollment_url}/Marti/api/tls/signClient/v2?token={token}"))
+        .post(format!(
+            "{enrollment_url}/Marti/api/tls/signClient/v2?token={token}"
+        ))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(csr)
         .send()
@@ -1816,10 +2376,17 @@ impl Running {
 
     /// Enroll (or re-enroll) `cn` with its password account. Returns the
     /// status and, on success, the certificate + key.
-    async fn enroll_with_password(&self, cn: &str, password: &str) -> (u16, Option<(String, rcgen::KeyPair)>) {
+    async fn enroll_with_password(
+        &self,
+        cn: &str,
+        password: &str,
+    ) -> (u16, Option<(String, rcgen::KeyPair)>) {
         let (csr, key) = pki::build_csr(cn).unwrap();
         let response = enrollment_client()
-            .post(format!("{}/Marti/api/tls/signClient/v2", self.enrollment_url))
+            .post(format!(
+                "{}/Marti/api/tls/signClient/v2",
+                self.enrollment_url
+            ))
             .basic_auth(cn, Some(password))
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(csr)
@@ -1831,7 +2398,10 @@ impl Running {
             return (status, None);
         }
         let body: serde_json::Value = response.json().await.unwrap();
-        (status, Some((wrap_pem(body["signedCert"].as_str().unwrap()), key)))
+        (
+            status,
+            Some((wrap_pem(body["signedCert"].as_str().unwrap()), key)),
+        )
     }
 
     fn client(&self, cert: &str, key: &rcgen::KeyPair) -> reqwest::Client {
@@ -1854,7 +2424,9 @@ impl Running {
 
     async fn stream(&self, cert: &str, key: &rcgen::KeyPair) -> TlsStream<TcpStream> {
         let key = rcgen::KeyPair::from_pem(&key.serialize_pem()).unwrap();
-        connect_mtls(self.mtls_addr, &self.ca_cert_pem, cert, key).await.unwrap()
+        connect_mtls(self.mtls_addr, &self.ca_cert_pem, cert, key)
+            .await
+            .unwrap()
     }
 }
 
@@ -1884,13 +2456,18 @@ async fn e2e_revoking_a_certificate_cuts_the_device_off_and_it_re_enrolls() {
     let (old_cert, old_key) = enrolled.unwrap();
     assert!(server.api_works(&old_cert, &old_key).await);
     let mut live = server.stream(&old_cert, &old_key).await;
-    live.write_all(event_xml("ALICE-UID").as_bytes()).await.unwrap();
+    live.write_all(event_xml("ALICE-UID").as_bytes())
+        .await
+        .unwrap();
 
     // The official certificate admin API: revoke by hash.
     let hash = pki::fingerprint_sha256_colon_hex(&old_cert).unwrap();
     let response = server
         .admin
-        .delete(format!("{}/Marti/api/certadmin/cert/{hash}", server.api_url))
+        .delete(format!(
+            "{}/Marti/api/certadmin/cert/{hash}",
+            server.api_url
+        ))
         .send()
         .await
         .unwrap();
@@ -1899,16 +2476,31 @@ async fn e2e_revoking_a_certificate_cuts_the_device_off_and_it_re_enrolls() {
     assert_eq!(body["type"], "TakCert");
     assert_eq!(body["data"]["hash"], hash.as_str());
 
-    assert!(closed_within(&mut live, Duration::from_secs(2)).await, "the live CoT session is cut");
-    assert!(!server.api_works(&old_cert, &old_key).await, "the revoked cert can't use the API");
+    assert!(
+        closed_within(&mut live, Duration::from_secs(2)).await,
+        "the live CoT session is cut"
+    );
+    assert!(
+        !server.api_works(&old_cert, &old_key).await,
+        "the revoked cert can't use the API"
+    );
     let mut again = server.stream(&old_cert, &old_key).await;
-    assert!(closed_within(&mut again, Duration::from_secs(2)).await, "nor open a new CoT session");
+    assert!(
+        closed_within(&mut again, Duration::from_secs(2)).await,
+        "nor open a new CoT session"
+    );
 
     let (status, enrolled) = server.enroll_with_password("alice", &password).await;
     assert_eq!(status, 200, "the identity itself isn't blocked");
     let (new_cert, new_key) = enrolled.unwrap();
-    assert!(server.api_works(&new_cert, &new_key).await, "the new certificate works");
-    assert!(!server.api_works(&old_cert, &old_key).await, "the old one stays revoked");
+    assert!(
+        server.api_works(&new_cert, &new_key).await,
+        "the new certificate works"
+    );
+    assert!(
+        !server.api_works(&old_cert, &old_key).await,
+        "the old one stays revoked"
+    );
 }
 
 /// Blocking an identity locks it out entirely -- current certificate,
@@ -1917,12 +2509,19 @@ async fn e2e_revoking_a_certificate_cuts_the_device_off_and_it_re_enrolls() {
 async fn e2e_blocking_an_identity_locks_it_out_until_unblocked() {
     let server = start_with_admin().await;
     let password = server.mint_user("bob").await;
-    let (cert, key) = server.enroll_with_password("bob", &password).await.1.unwrap();
+    let (cert, key) = server
+        .enroll_with_password("bob", &password)
+        .await
+        .1
+        .unwrap();
     let mut live = server.stream(&cert, &key).await;
 
     let block = server
         .admin
-        .put(format!("{}/Marti/api/admin/devices/bob/block", server.api_url))
+        .put(format!(
+            "{}/Marti/api/admin/devices/bob/block",
+            server.api_url
+        ))
         .send()
         .await
         .unwrap();
@@ -1930,16 +2529,25 @@ async fn e2e_blocking_an_identity_locks_it_out_until_unblocked() {
     assert!(closed_within(&mut live, Duration::from_secs(2)).await);
     assert!(!server.api_works(&cert, &key).await);
     let (status, _) = server.enroll_with_password("bob", &password).await;
-    assert_eq!(status, 403, "a blocked identity can't get a new certificate");
+    assert_eq!(
+        status, 403,
+        "a blocked identity can't get a new certificate"
+    );
 
     let unblock = server
         .admin
-        .delete(format!("{}/Marti/api/admin/devices/bob/block", server.api_url))
+        .delete(format!(
+            "{}/Marti/api/admin/devices/bob/block",
+            server.api_url
+        ))
         .send()
         .await
         .unwrap();
     assert_eq!(unblock.status(), 204);
-    assert!(server.api_works(&cert, &key).await, "unblocked: the certificate works again");
+    assert!(
+        server.api_works(&cert, &key).await,
+        "unblocked: the certificate works again"
+    );
 }
 
 /// Revoking a password account also revokes the certificate issued to it --
@@ -1949,7 +2557,11 @@ async fn e2e_blocking_an_identity_locks_it_out_until_unblocked() {
 async fn e2e_revoking_a_user_account_revokes_its_certificate() {
     let server = start_with_admin().await;
     let password = server.mint_user("erin").await;
-    let (cert, key) = server.enroll_with_password("erin", &password).await.1.unwrap();
+    let (cert, key) = server
+        .enroll_with_password("erin", &password)
+        .await
+        .1
+        .unwrap();
 
     let response = server
         .admin
@@ -1971,7 +2583,13 @@ fn sample(exposition: &str, series: &str) -> Option<f64> {
     exposition
         .lines()
         .filter(|line| !line.starts_with('#'))
-        .find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.trim().parse().ok())
+        .find_map(|line| {
+            line.strip_prefix(series)?
+                .strip_prefix(' ')?
+                .trim()
+                .parse()
+                .ok()
+        })
 }
 
 /// `/metrics` reports what the server actually holds and does: devices,
@@ -1992,13 +2610,21 @@ async fn e2e_metrics_report_what_the_server_holds() {
 
     let (cert, key) = enroll(&format!("https://{enrollment_addr}"), "metrics-device").await;
     let api_key = rcgen::KeyPair::from_pem(&key.serialize_pem()).unwrap();
-    let mut stream = connect_mtls(mtls_addr, &ca_cert_pem, &cert, key).await.unwrap();
-    stream.write_all(event_xml("METRICS-UID").as_bytes()).await.unwrap();
+    let mut stream = connect_mtls(mtls_addr, &ca_cert_pem, &cert, key)
+        .await
+        .unwrap();
+    stream
+        .write_all(event_xml("METRICS-UID").as_bytes())
+        .await
+        .unwrap();
 
     let client = mtls_reqwest_client(&ca_cert_pem, &cert, api_key, marti_api_addr);
     let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
     let png = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0u8; 64]].concat();
-    for (name, body) in [("photo.png", png), ("notes.txt", b"plain text, not a picture".to_vec())] {
+    for (name, body) in [
+        ("photo.png", png),
+        ("notes.txt", b"plain text, not a picture".to_vec()),
+    ] {
         let status = client
             .post(format!("{base_url}/Marti/sync/upload?name={name}"))
             .body(body)
@@ -2027,21 +2653,47 @@ async fn e2e_metrics_report_what_the_server_holds() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    assert!(response.headers()["content-type"].to_str().unwrap().starts_with("text/plain"));
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
     let text = response.text().await.unwrap();
 
     assert_eq!(sample(&text, "microtak_devices"), Some(1.0), "{text}");
     assert_eq!(sample(&text, "microtak_devices_blocked"), Some(0.0));
-    assert_eq!(sample(&text, "microtak_connected_clients{transport=\"tls\"}"), Some(1.0));
-    assert!(sample(&text, "microtak_cot_events_received_total{transport=\"tls\"}").unwrap() >= 1.0);
+    assert_eq!(
+        sample(&text, "microtak_connected_clients{transport=\"tls\"}"),
+        Some(1.0)
+    );
+    assert!(
+        sample(
+            &text,
+            "microtak_cot_events_received_total{transport=\"tls\"}"
+        )
+        .unwrap()
+            >= 1.0
+    );
     assert_eq!(sample(&text, "microtak_missions"), Some(1.0));
-    assert_eq!(sample(&text, "microtak_content_files{kind=\"image\"}"), Some(1.0));
-    assert_eq!(sample(&text, "microtak_content_files{kind=\"other\"}"), Some(1.0));
+    assert_eq!(
+        sample(&text, "microtak_content_files{kind=\"image\"}"),
+        Some(1.0)
+    );
+    assert_eq!(
+        sample(&text, "microtak_content_files{kind=\"other\"}"),
+        Some(1.0)
+    );
     assert!(sample(&text, "microtak_content_bytes").unwrap() > 64.0);
     assert!(sample(&text, "microtak_enrollments_total").unwrap() >= 1.0);
     assert!(sample(&text, "microtak_data_dir_bytes").unwrap() > 0.0);
     assert!(text.contains("microtak_build_info{version=\""));
-    for gauge in ["microtak_password_accounts", "microtak_groups", "microtak_enrollment_tokens_active", "microtak_certificates_revoked"] {
+    for gauge in [
+        "microtak_password_accounts",
+        "microtak_groups",
+        "microtak_enrollment_tokens_active",
+        "microtak_certificates_revoked",
+    ] {
         assert!(sample(&text, gauge).is_some(), "{gauge} missing");
     }
 }
@@ -2052,10 +2704,18 @@ async fn e2e_metrics_report_what_the_server_holds() {
 
 impl Running {
     /// Enroll `cn` with its password account, passing `clientUid` like ATAK.
-    async fn enroll_with_client_uid(&self, cn: &str, password: &str, client_uid: &str) -> (String, rcgen::KeyPair) {
+    async fn enroll_with_client_uid(
+        &self,
+        cn: &str,
+        password: &str,
+        client_uid: &str,
+    ) -> (String, rcgen::KeyPair) {
         let (csr, key) = pki::build_csr(cn).unwrap();
         let response = enrollment_client()
-            .post(format!("{}/Marti/api/tls/signClient/v2?clientUid={client_uid}", self.enrollment_url))
+            .post(format!(
+                "{}/Marti/api/tls/signClient/v2?clientUid={client_uid}",
+                self.enrollment_url
+            ))
             .basic_auth(cn, Some(password))
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(csr)
@@ -2068,9 +2728,17 @@ impl Running {
     }
 
     async fn admin_get(&self, path: &str) -> (u16, serde_json::Value) {
-        let response = self.admin.get(format!("{}{path}", self.api_url)).send().await.unwrap();
+        let response = self
+            .admin
+            .get(format!("{}{path}", self.api_url))
+            .send()
+            .await
+            .unwrap();
         let status = response.status().as_u16();
-        (status, response.json().await.unwrap_or(serde_json::Value::Null))
+        (
+            status,
+            response.json().await.unwrap_or(serde_json::Value::Null),
+        )
     }
 }
 
@@ -2078,71 +2746,134 @@ impl Running {
 fn assert_envelope(body: &serde_json::Value, kind: &str) {
     assert_eq!(body["version"], "3", "{body}");
     assert_eq!(body["type"], kind, "{body}");
-    assert!(body["nodeId"].as_str().is_some_and(|id| !id.is_empty()), "{body}");
+    assert!(
+        body["nodeId"].as_str().is_some_and(|id| !id.is_empty()),
+        "{body}"
+    );
 }
 
 /// Official COT date format `yyyy-MM-dd'T'HH:mm:ss.S'Z'` (milliseconds
 /// unpadded, as Java's SimpleDateFormat writes them).
 fn is_cot_date(value: &serde_json::Value) -> bool {
-    let Some(s) = value.as_str() else { return false };
-    let Some((secs, millis)) = s.strip_suffix('Z').and_then(|v| v.split_once('.')) else { return false };
-    secs.len() == 19 && !millis.is_empty() && millis.len() <= 3 && millis.chars().all(|c| c.is_ascii_digit())
+    let Some(s) = value.as_str() else {
+        return false;
+    };
+    let Some((secs, millis)) = s.strip_suffix('Z').and_then(|v| v.split_once('.')) else {
+        return false;
+    };
+    secs.len() == 19
+        && !millis.is_empty()
+        && millis.len() <= 3
+        && millis.chars().all(|c| c.is_ascii_digit())
 }
 
 #[tokio::test]
 async fn e2e_certadmin_lists_certificates_in_the_official_shape() {
     let server = start_with_admin().await;
     let password = server.mint_user("alice").await;
-    let (first, _) = server.enroll_with_client_uid("alice", &password, "ANDROID-A").await;
-    let (second, _) = server.enroll_with_client_uid("alice", &password, "ANDROID-A").await;
+    let (first, _) = server
+        .enroll_with_client_uid("alice", &password, "ANDROID-A")
+        .await;
+    let (second, _) = server
+        .enroll_with_client_uid("alice", &password, "ANDROID-A")
+        .await;
 
     let (status, all) = server.admin_get("/Marti/api/certadmin/cert").await;
     assert_eq!(status, 200);
     assert_envelope(&all, "TakCert");
-    let alice: Vec<&serde_json::Value> =
-        all["data"].as_array().unwrap().iter().filter(|c| c["userDn"] == "alice").collect();
+    let alice: Vec<&serde_json::Value> = all["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["userDn"] == "alice")
+        .collect();
     assert_eq!(alice.len(), 2, "both issued certificates are listed: {all}");
     let cert = alice[0];
     assert!(cert["id"].is_i64());
-    assert_eq!(cert["hash"], pki::fingerprint_sha256_colon_hex(&first).unwrap().as_str());
+    assert_eq!(
+        cert["hash"],
+        pki::fingerprint_sha256_colon_hex(&first).unwrap().as_str()
+    );
     assert_eq!(cert["clientUid"], "ANDROID-A");
     assert_eq!(cert["subjectDn"], "CN=alice");
-    assert!(cert["certificate"].as_str().unwrap().contains("BEGIN CERTIFICATE"));
-    assert!(cert["serialNumber"].as_str().unwrap().chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(
+        cert["certificate"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN CERTIFICATE")
+    );
+    assert!(
+        cert["serialNumber"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    );
     for field in ["issuanceDate", "expirationDate", "effectiveDate"] {
         assert!(is_cot_date(&cert[field]), "{field}: {}", cert[field]);
     }
-    assert!(cert.get("revocationDate").is_none(), "null fields are omitted (NON_NULL)");
+    assert!(
+        cert.get("revocationDate").is_none(),
+        "null fields are omitted (NON_NULL)"
+    );
 
-    let (_, by_user) = server.admin_get("/Marti/api/certadmin/cert?username=alice").await;
+    let (_, by_user) = server
+        .admin_get("/Marti/api/certadmin/cert?username=alice")
+        .await;
     assert_eq!(by_user["data"].as_array().unwrap().len(), 2);
 
     // Active = newest per clientUid + user; replaced = the older ones.
     let (_, active) = server.admin_get("/Marti/api/certadmin/cert/active").await;
     let second_hash = pki::fingerprint_sha256_colon_hex(&second).unwrap();
-    let active_alice: Vec<_> = active["data"].as_array().unwrap().iter().filter(|c| c["userDn"] == "alice").collect();
+    let active_alice: Vec<_> = active["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["userDn"] == "alice")
+        .collect();
     assert_eq!(active_alice.len(), 1);
     assert_eq!(active_alice[0]["hash"], second_hash.as_str());
     let (_, replaced) = server.admin_get("/Marti/api/certadmin/cert/replaced").await;
-    assert!(replaced["data"].as_array().unwrap().iter().any(|c| c["hash"] == cert["hash"]));
+    assert!(
+        replaced["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["hash"] == cert["hash"])
+    );
 
-    let (status, one) = server.admin_get(&format!("/Marti/api/certadmin/cert/{second_hash}")).await;
+    let (status, one) = server
+        .admin_get(&format!("/Marti/api/certadmin/cert/{second_hash}"))
+        .await;
     assert_eq!(status, 200);
     assert_envelope(&one, "TakCert");
     assert_eq!(one["data"]["hash"], second_hash.as_str());
 
     // Unknown hash: the official server answers 500 (clients rely on it).
-    let (status, _) = server.admin_get(&format!("/Marti/api/certadmin/cert/{}", "AB:".repeat(31) + "AB")).await;
+    let (status, _) = server
+        .admin_get(&format!(
+            "/Marti/api/certadmin/cert/{}",
+            "AB:".repeat(31) + "AB"
+        ))
+        .await;
     assert_eq!(status, 500);
 
     let pem = server
         .admin
-        .get(format!("{}/Marti/api/certadmin/cert/{second_hash}/download", server.api_url))
+        .get(format!(
+            "{}/Marti/api/certadmin/cert/{second_hash}/download",
+            server.api_url
+        ))
         .send()
         .await
         .unwrap();
     assert_eq!(pem.status(), 200);
-    assert!(pem.headers()["content-disposition"].to_str().unwrap().contains("alice_ClientCert.pem"));
+    assert!(
+        pem.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains("alice_ClientCert.pem")
+    );
     assert!(pem.text().await.unwrap().contains("BEGIN CERTIFICATE"));
 }
 
@@ -2150,27 +2881,42 @@ async fn e2e_certadmin_lists_certificates_in_the_official_shape() {
 async fn e2e_certadmin_revokes_and_deletes_by_id() {
     let server = start_with_admin().await;
     let password = server.mint_user("bob").await;
-    let (cert, key) = server.enroll_with_client_uid("bob", &password, "IOS-B").await;
+    let (cert, key) = server
+        .enroll_with_client_uid("bob", &password, "IOS-B")
+        .await;
     let hash = pki::fingerprint_sha256_colon_hex(&cert).unwrap();
-    let (_, all) = server.admin_get("/Marti/api/certadmin/cert?username=bob").await;
+    let (_, all) = server
+        .admin_get("/Marti/api/certadmin/cert?username=bob")
+        .await;
     let id = all["data"][0]["id"].as_i64().unwrap();
     assert!(server.api_works(&cert, &key).await);
 
     let response = server
         .admin
-        .delete(format!("{}/Marti/api/certadmin/cert/revoke/{id}", server.api_url))
+        .delete(format!(
+            "{}/Marti/api/certadmin/cert/revoke/{id}",
+            server.api_url
+        ))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
     assert!(!server.api_works(&cert, &key).await, "revoked by id");
     let (_, revoked) = server.admin_get("/Marti/api/certadmin/cert/revoked").await;
-    let entry = revoked["data"].as_array().unwrap().iter().find(|c| c["hash"] == hash.as_str()).unwrap();
+    let entry = revoked["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["hash"] == hash.as_str())
+        .unwrap();
     assert!(is_cot_date(&entry["revocationDate"]), "{entry}");
 
     let zip = server
         .admin
-        .get(format!("{}/Marti/api/certadmin/cert/download/{id}", server.api_url))
+        .get(format!(
+            "{}/Marti/api/certadmin/cert/download/{id}",
+            server.api_url
+        ))
         .send()
         .await
         .unwrap();
@@ -2179,12 +2925,17 @@ async fn e2e_certadmin_revokes_and_deletes_by_id() {
 
     let response = server
         .admin
-        .delete(format!("{}/Marti/api/certadmin/cert/delete/{id}", server.api_url))
+        .delete(format!(
+            "{}/Marti/api/certadmin/cert/delete/{id}",
+            server.api_url
+        ))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    let (_, after) = server.admin_get("/Marti/api/certadmin/cert?username=bob").await;
+    let (_, after) = server
+        .admin_get("/Marti/api/certadmin/cert?username=bob")
+        .await;
     assert!(after["data"].as_array().unwrap().is_empty(), "{after}");
 }
 
@@ -2192,10 +2943,23 @@ async fn e2e_certadmin_revokes_and_deletes_by_id() {
 async fn e2e_certadmin_is_admin_only() {
     let server = start_with_admin().await;
     let password = server.mint_user("carol").await;
-    let (cert, key) = server.enroll_with_password("carol", &password).await.1.unwrap();
+    let (cert, key) = server
+        .enroll_with_password("carol", &password)
+        .await
+        .1
+        .unwrap();
     let carol = server.client(&cert, &key);
-    for path in ["/Marti/api/certadmin/cert", "/Marti/api/certadmin/cert/active", "/Marti/api/certadmin/cert/revoked"] {
-        let status = carol.get(format!("{}{path}", server.api_url)).send().await.unwrap().status();
+    for path in [
+        "/Marti/api/certadmin/cert",
+        "/Marti/api/certadmin/cert/active",
+        "/Marti/api/certadmin/cert/revoked",
+    ] {
+        let status = carol
+            .get(format!("{}{path}", server.api_url))
+            .send()
+            .await
+            .unwrap()
+            .status();
         assert_eq!(status, 403, "{path}");
     }
 }

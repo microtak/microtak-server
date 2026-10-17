@@ -109,7 +109,9 @@ impl ContentStore {
         use tokio::io::AsyncWriteExt;
 
         let nonce = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp_path = self.dir.join(format!(".tmp-{}-{nonce}", std::process::id()));
+        let tmp_path = self
+            .dir
+            .join(format!(".tmp-{}-{nonce}", std::process::id()));
         let result: Result<String, ContentStoreError> = async {
             let mut file = tokio::fs::File::create(&tmp_path).await?;
             let mut hasher = Sha256::new();
@@ -128,7 +130,10 @@ impl ContentStore {
             if let Some(claimed) = claimed_hash {
                 let claimed_lower = claimed.to_lowercase();
                 if claimed_lower != actual {
-                    return Err(ContentStoreError::HashMismatch { claimed: claimed_lower, actual });
+                    return Err(ContentStoreError::HashMismatch {
+                        claimed: claimed_lower,
+                        actual,
+                    });
                 }
             }
             Ok(actual)
@@ -155,7 +160,10 @@ impl ContentStore {
 
     /// Open stored content for streaming: the file and its length, `None`
     /// if nothing is stored under `hash`.
-    pub async fn open_file(&self, hash: &str) -> Result<Option<(tokio::fs::File, u64)>, ContentStoreError> {
+    pub async fn open_file(
+        &self,
+        hash: &str,
+    ) -> Result<Option<(tokio::fs::File, u64)>, ContentStoreError> {
         let normalized = validate_hash(hash)?;
         match tokio::fs::File::open(self.path_for(&normalized)).await {
             Ok(file) => {
@@ -201,7 +209,9 @@ impl ContentStore {
             if name.to_string_lossy().starts_with(".tmp-") {
                 continue;
             }
-            let Ok(metadata) = entry.metadata() else { continue };
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
             if !metadata.is_file() {
                 continue;
             }
@@ -238,7 +248,10 @@ fn is_image(head: &[u8]) -> bool {
         || head.starts_with(b"GIF8")
         || (head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP"))
         || (head.get(4..8) == Some(b"ftyp")
-            && matches!(head.get(8..12), Some(b"heic" | b"heix" | b"mif1" | b"msf1" | b"avif")))
+            && matches!(
+                head.get(8..12),
+                Some(b"heic" | b"heix" | b"mif1" | b"msf1" | b"avif")
+            ))
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -286,14 +299,27 @@ mod tests {
         ))
     }
 
-    fn chunks(parts: &[&'static [u8]]) -> impl futures_util::Stream<Item = std::io::Result<bytes::Bytes>> {
-        futures_util::stream::iter(parts.iter().map(|p| Ok(bytes::Bytes::from_static(p))).collect::<Vec<_>>())
+    fn chunks(
+        parts: &[&'static [u8]],
+    ) -> impl futures_util::Stream<Item = std::io::Result<bytes::Bytes>> {
+        futures_util::stream::iter(
+            parts
+                .iter()
+                .map(|p| Ok(bytes::Bytes::from_static(p)))
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn leftover_temp_files(dir: &std::path::Path) -> usize {
         std::fs::read_dir(dir)
             .unwrap()
-            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with(".tmp-"))
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".tmp-")
+            })
             .count()
     }
 
@@ -308,7 +334,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hash, hex_sha256(b"hello world"));
-        assert_eq!(store.get(&hash).unwrap().as_deref(), Some(&b"hello world"[..]));
+        assert_eq!(
+            store.get(&hash).unwrap().as_deref(),
+            Some(&b"hello world"[..])
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -316,8 +345,13 @@ mod tests {
     async fn put_stream_over_the_limit_is_rejected_and_leaves_nothing() {
         let dir = temp_dir("stream-limit");
         let store = ContentStore::open(dir.clone()).unwrap();
-        let result = store.put_stream(chunks(&[b"0123456789", b"0123456789"]), None, 15).await;
-        assert!(matches!(result, Err(ContentStoreError::TooLarge { limit: 15 })), "{result:?}");
+        let result = store
+            .put_stream(chunks(&[b"0123456789", b"0123456789"]), None, 15)
+            .await;
+        assert!(
+            matches!(result, Err(ContentStoreError::TooLarge { limit: 15 })),
+            "{result:?}"
+        );
         assert_eq!(leftover_temp_files(&dir), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -327,8 +361,13 @@ mod tests {
         let dir = temp_dir("stream-mismatch");
         let store = ContentStore::open(dir.clone()).unwrap();
         let wrong = "0".repeat(64);
-        let result = store.put_stream(chunks(&[b"real"]), Some(&wrong), 1024).await;
-        assert!(matches!(result, Err(ContentStoreError::HashMismatch { .. })));
+        let result = store
+            .put_stream(chunks(&[b"real"]), Some(&wrong), 1024)
+            .await;
+        assert!(matches!(
+            result,
+            Err(ContentStoreError::HashMismatch { .. })
+        ));
         assert_eq!(leftover_temp_files(&dir), 0);
         assert!(store.get(&hex_sha256(b"real")).unwrap().is_none());
         std::fs::remove_dir_all(&dir).ok();
@@ -436,7 +475,10 @@ mod tests {
         let hash_a = store.put(b"duplicate me", None).unwrap();
         let hash_b = store.put(b"duplicate me", None).unwrap();
         assert_eq!(hash_a, hash_b);
-        assert_eq!(store.get(&hash_a).unwrap().as_deref(), Some(&b"duplicate me"[..]));
+        assert_eq!(
+            store.get(&hash_a).unwrap().as_deref(),
+            Some(&b"duplicate me"[..])
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

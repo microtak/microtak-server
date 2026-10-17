@@ -63,19 +63,29 @@ pub fn router(state: SyncState) -> Router {
             "/Marti/sync/delete",
             // `DeleteServlet`: doGet and doPost delete too; DELETE is refused by
             // the official URL table (`/Marti/** DELETE`), see `super::access`.
-            get(delete_servlet).post(delete_servlet).delete(delete_servlet),
+            get(delete_servlet)
+                .post(delete_servlet)
+                .delete(delete_servlet),
         )
         .route("/Marti/api/sync/search", get(search_api))
         .route("/Marti/api/resources/:hash", get(get_resource))
         .route(
             "/Marti/api/files/:hash",
-            get(super::file_manager::get_file).head(super::file_manager::head_file).delete(file_manager_delete),
+            get(super::file_manager::get_file)
+                .head(super::file_manager::head_file)
+                .delete(file_manager_delete),
         )
-        .route("/Marti/api/files/:hash/metadata", put(super::file_manager::put_metadata))
+        .route(
+            "/Marti/api/files/:hash/metadata",
+            put(super::file_manager::put_metadata),
+        )
         .route("/Marti/api/files/metadata", get(super::file_manager::list))
         .route("/Marti/api/files/metadata/count", get(file_manager_count))
         .route("/Marti/api/sync/metadata/:hash/keywords", put(set_keywords))
-        .route("/Marti/api/sync/metadata/:hash/expiration", put(set_expiration))
+        .route(
+            "/Marti/api/sync/metadata/:hash/expiration",
+            put(set_expiration),
+        )
         // Bodies are streamed to disk; the configured upload limit applies.
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state)
@@ -97,7 +107,11 @@ fn viewer_groups(state: &SyncState, identity: &PeerIdentity) -> Option<BTreeSet<
 /// The groups a new file is visible in: the requested `Groups` (only those
 /// the uploader is in -- the official `validateAccess`), else all of the
 /// uploader's.
-fn upload_groups(state: &SyncState, identity: &PeerIdentity, requested: &[String]) -> Result<Vec<String>, Box<Response>> {
+fn upload_groups(
+    state: &SyncState,
+    identity: &PeerIdentity,
+    requested: &[String],
+) -> Result<Vec<String>, Box<Response>> {
     let mine = state.groups.all_group_names(&identity.0);
     if requested.is_empty() {
         return Ok(mine.into_iter().collect());
@@ -112,7 +126,10 @@ fn upload_groups(state: &SyncState, identity: &PeerIdentity, requested: &[String
 /// `<scheme>://<host>:<port>` of the request, as the official
 /// `getBaseUrl` builds it (the Marti API is always HTTPS here).
 fn base_url(headers: &HeaderMap) -> String {
-    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost");
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("localhost");
     format!("https://{host}")
 }
 
@@ -140,7 +157,11 @@ fn query_pairs(raw: Option<&str>) -> Vec<(String, String)> {
 }
 
 fn values<'a>(pairs: &'a [(String, String)], name: &str) -> Vec<&'a str> {
-    pairs.iter().filter(|(k, _)| k == name).map(|(_, v)| v.as_str()).collect()
+    pairs
+        .iter()
+        .filter(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+        .collect()
 }
 
 // ---------------------------------------------------------------------
@@ -156,7 +177,11 @@ async fn store_multipart(
 ) -> Result<(String, u64, Option<String>, Option<String>), Box<Response>> {
     let mut multipart = axum::extract::Multipart::from_request(request, &())
         .await
-        .map_err(|_| Box::new(bad_request("Upload request was not formatted in a way Marti can understand.")))?;
+        .map_err(|_| {
+            Box::new(bad_request(
+                "Upload request was not formatted in a way Marti can understand.",
+            ))
+        })?;
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or_default().to_string();
         if name != "assetfile" && name != "resource" {
@@ -170,7 +195,14 @@ async fn store_multipart(
             .put_stream(stream, None, state.max_upload_bytes)
             .await
             .map_err(|e| Box::new(store_error(e)))?;
-        let size = state.content.open_file(&hash).await.ok().flatten().map(|(_, len)| len).unwrap_or(0);
+        let size = state
+            .content
+            .open_file(&hash)
+            .await
+            .ok()
+            .flatten()
+            .map(|(_, len)| len)
+            .unwrap_or(0);
         return Ok((hash, size, filename, content_type));
     }
     Err(Box::new(bad_request(
@@ -200,7 +232,10 @@ async fn mission_upload(
     };
     // `Groups` (capital G, as the official servlet reads it) sets who sees
     // the file; lowercase `groups` is only a metadata field.
-    let requested: Vec<String> = values(&pairs, "Groups").iter().map(|s| s.to_string()).collect();
+    let requested: Vec<String> = values(&pairs, "Groups")
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let visible_in = match upload_groups(&state, &identity, &requested) {
         Ok(groups) => groups,
         Err(response) => return *response,
@@ -215,7 +250,10 @@ async fn mission_upload(
         k => k.iter().map(|s| s.to_string()).collect(),
     };
     let first = |name: &str, default: &str| {
-        values(&pairs, name).first().map(|s| s.to_string()).unwrap_or_else(|| default.to_string())
+        values(&pairs, name)
+            .first()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| default.to_string())
     };
     let new = NewResource {
         // The hash is the uid (the official servlet lets the database
@@ -228,13 +266,19 @@ async fn mission_upload(
         creator_uid: Some(first("creatorUid", "")),
         tool: Some(first("tool", "public")),
         visible_in,
-        groups_field: values(&pairs, "groups").iter().map(|s| s.to_string()).collect(),
+        groups_field: values(&pairs, "groups")
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         ..Default::default()
     };
     if let Err(error) = state.resources.insert(new, &hash, size, now_millis()) {
         return text(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
     }
-    text(StatusCode::OK, format!("{base}/Marti/sync/content?hash={hash}"))
+    text(
+        StatusCode::OK,
+        format!("{base}/Marti/sync/content?hash={hash}"),
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -272,7 +316,10 @@ fn metadata_field(name: &str) -> Option<(&'static str, bool)> {
     if name.eq_ignore_ascii_case("MIME") {
         return Some(("MIMEType", false));
     }
-    METADATA_FIELDS.iter().copied().find(|(field, _)| field.eq_ignore_ascii_case(name))
+    METADATA_FIELDS
+        .iter()
+        .copied()
+        .find(|(field, _)| field.eq_ignore_ascii_case(name))
 }
 
 async fn upload(
@@ -281,46 +328,76 @@ async fn upload(
     RawQuery(raw): RawQuery,
     request: Request,
 ) -> Response {
-    let mut fields: std::collections::HashMap<&'static str, Vec<String>> = std::collections::HashMap::new();
+    let mut fields: std::collections::HashMap<&'static str, Vec<String>> =
+        std::collections::HashMap::new();
     for (key, value) in query_pairs(raw.as_deref()) {
         let Some((field, is_array)) = metadata_field(&key) else {
             return bad_request(&format!("Unrecognized parameter {key}"));
         };
         let entry = fields.entry(field).or_default();
         if is_array {
-            entry.extend(value.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()));
+            entry.extend(
+                value
+                    .split(',')
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
+            );
         } else {
             entry.push(value);
         }
     }
     let first = |name: &str| fields.get(name).and_then(|v| v.first().cloned());
     let parse = |name: &str| first(name).and_then(|v| v.parse::<f64>().ok());
-    let visible_in = match upload_groups(&state, &identity, fields.get("Groups").map(Vec::as_slice).unwrap_or(&[])) {
+    let visible_in = match upload_groups(
+        &state,
+        &identity,
+        fields.get("Groups").map(Vec::as_slice).unwrap_or(&[]),
+    ) {
         Ok(groups) => groups,
         Err(response) => return *response,
     };
 
-    let content_type = request.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let declared_length = request
         .headers()
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if declared_length.is_some_and(|len| len > state.max_upload_bytes) {
-        return store_error(ContentStoreError::TooLarge { limit: state.max_upload_bytes });
+        return store_error(ContentStoreError::TooLarge {
+            limit: state.max_upload_bytes,
+        });
     }
-    let (hash, size, part_name, mime_type) = if content_type.as_deref().is_some_and(|t| t.contains("multipart/form-data")) {
+    let (hash, size, part_name, mime_type) = if content_type
+        .as_deref()
+        .is_some_and(|t| t.contains("multipart/form-data"))
+    {
         match store_multipart(&state, request).await {
             Ok(stored) => stored,
             Err(response) => return *response,
         }
     } else {
         let stream = request.into_body().into_data_stream();
-        let hash = match state.content.put_stream(stream, None, state.max_upload_bytes).await {
+        let hash = match state
+            .content
+            .put_stream(stream, None, state.max_upload_bytes)
+            .await
+        {
             Ok(hash) => hash,
             Err(error) => return store_error(error),
         };
-        let size = state.content.open_file(&hash).await.ok().flatten().map(|(_, len)| len).unwrap_or(0);
+        let size = state
+            .content
+            .open_file(&hash)
+            .await
+            .ok()
+            .flatten()
+            .map(|(_, len)| len)
+            .unwrap_or(0);
         (hash, size, None, content_type)
     };
     if size == 0 {
@@ -339,7 +416,10 @@ async fn upload(
         latitude: parse("Latitude"),
         longitude: parse("Longitude"),
         altitude: parse("Altitude"),
-        expiration: first("EXPIRATION").and_then(|v| v.parse::<f64>().ok()).map(|v| v as i64).filter(|v| *v >= 0),
+        expiration: first("EXPIRATION")
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v as i64)
+            .filter(|v| *v >= 0),
         visible_in,
         groups_field: fields.get("Groups").cloned().unwrap_or_default(),
         mission_name: first("MissionName"),
@@ -364,7 +444,14 @@ fn uuid_v4() -> String {
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -395,11 +482,17 @@ async fn content(
         (None, None) => return bad_request("hash or uid required"),
     };
     // Newest first; the official servlet takes the first.
-    let Some(record) = matches.into_iter().next() else { return not_found() };
+    let Some(record) = matches.into_iter().next() else {
+        return not_found();
+    };
     let Ok(Some((file, total))) = state.content.open_file(&record.hash).await else {
         return text(StatusCode::INTERNAL_SERVER_ERROR, String::new());
     };
-    let filename = record.download_path.clone().or(record.name.clone()).unwrap_or_else(|| "file".to_string());
+    let filename = record
+        .download_path
+        .clone()
+        .or(record.name.clone())
+        .unwrap_or_else(|| "file".to_string());
     let mut headers = vec![
         ("api-version".to_string(), envelope::API_VERSION.to_string()),
         (
@@ -419,7 +512,9 @@ async fn content(
     }
     let remaining = total - offset;
     let (status, len) = match query.length {
-        Some(length) if length > 0 && offset + length < total => (StatusCode::PARTIAL_CONTENT, length),
+        Some(length) if length > 0 && offset + length < total => {
+            (StatusCode::PARTIAL_CONTENT, length)
+        }
         _ => (StatusCode::OK, remaining),
     };
     headers.push((header::CONTENT_LENGTH.to_string(), len.to_string()));
@@ -442,7 +537,9 @@ pub(crate) fn urlencode_filename(name: &str) -> String {
     let mut out = String::new();
     for byte in name.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'*' | b'_' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'*' | b'_' => {
+                out.push(byte as char)
+            }
             b' ' => out.push('+'),
             _ => out.push_str(&format!("%{byte:02X}")),
         }
@@ -461,12 +558,26 @@ async fn mission_query(
     headers: HeaderMap,
     Query(query): Query<MissionQuery>,
 ) -> Response {
-    let Some(hash) = query.hash else { return bad_request("HTTP post missing required param hash.") };
+    let Some(hash) = query.hash else {
+        return bad_request("HTTP post missing required param hash.");
+    };
     let groups = viewer_groups(&state, &identity);
     // The servlet looks the hash up as a UID (mission packages use their
     // hash as uid).
-    match state.resources.by_uid(&hash, groups.as_ref()).into_iter().next() {
-        Some(record) => text(StatusCode::OK, format!("{}/Marti/sync/content?hash={}", base_url(&headers), record.uid)),
+    match state
+        .resources
+        .by_uid(&hash, groups.as_ref())
+        .into_iter()
+        .next()
+    {
+        Some(record) => text(
+            StatusCode::OK,
+            format!(
+                "{}/Marti/sync/content?hash={}",
+                base_url(&headers),
+                record.uid
+            ),
+        ),
         None => not_found(),
     }
 }
@@ -516,22 +627,47 @@ async fn search_api(
 ) -> Response {
     let pairs = query_pairs(raw.as_deref());
     let one = |name: &str| values(&pairs, name).first().map(|s| s.to_string());
-    let keywords: Vec<String> = values(&pairs, "keyword").iter().map(|s| s.to_string()).collect();
-    let (mimetype, name, filename, uid, hash, tool, mission) =
-        (one("mimetype"), one("name"), one("filename"), one("uid"), one("hash"), one("tool"), one("mission"));
+    let keywords: Vec<String> = values(&pairs, "keyword")
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let (mimetype, name, filename, uid, hash, tool, mission) = (
+        one("mimetype"),
+        one("name"),
+        one("filename"),
+        one("uid"),
+        one("hash"),
+        one("tool"),
+        one("mission"),
+    );
     let groups = viewer_groups(&state, &identity);
     let results: Vec<serde_json::Value> = state
         .resources
         .visible(groups.as_ref())
         .into_iter()
         .filter(|r| keywords.is_empty() || keywords.iter().all(|k| r.keywords.contains(k)))
-        .filter(|r| mimetype.as_ref().is_none_or(|m| r.mime_type.as_ref() == Some(m)))
+        .filter(|r| {
+            mimetype
+                .as_ref()
+                .is_none_or(|m| r.mime_type.as_ref() == Some(m))
+        })
         .filter(|r| name.as_ref().is_none_or(|n| r.name.as_ref() == Some(n)))
-        .filter(|r| filename.as_ref().is_none_or(|f| r.download_path.as_ref().or(r.name.as_ref()) == Some(f)))
+        .filter(|r| {
+            filename
+                .as_ref()
+                .is_none_or(|f| r.download_path.as_ref().or(r.name.as_ref()) == Some(f))
+        })
         .filter(|r| uid.as_ref().is_none_or(|u| r.uid == *u))
-        .filter(|r| hash.as_ref().is_none_or(|h| r.hash == h.to_ascii_lowercase()))
+        .filter(|r| {
+            hash.as_ref()
+                .is_none_or(|h| r.hash == h.to_ascii_lowercase())
+        })
         .filter(|r| tool.as_ref().is_none_or(|t| r.tool.as_ref() == Some(t)))
-        .filter(|r| mission.as_ref().is_none_or(|m| r.mission_name.as_ref() == Some(m)))
+        .filter(|r| {
+            mission
+                .as_ref()
+                .is_none_or(|m| r.mission_name.as_ref() == Some(m))
+        })
         .map(|r| r.resource_json())
         .collect();
     envelope::api_response("Resource", results).into_response()
@@ -575,7 +711,10 @@ async fn delete_servlet(
         None => state.resources.delete_keys(&keys, groups.as_ref()),
     };
     if let Err(error) = deleted {
-        return text(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to process delete request: {error}"));
+        return text(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to process delete request: {error}"),
+        );
     }
     // Remove the bytes once nothing references them any more.
     for h in hashes {
@@ -583,7 +722,11 @@ async fn delete_servlet(
             state.content.remove(&h);
         }
     }
-    let count = if hash.is_some() { "1".to_string() } else { keys.len().to_string() };
+    let count = if hash.is_some() {
+        "1".to_string()
+    } else {
+        keys.len().to_string()
+    };
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html")],
@@ -603,7 +746,10 @@ async fn file_manager_delete(
 ) -> Response {
     let groups = viewer_groups(&state, &identity);
     let hash = hash.to_ascii_lowercase();
-    if !hash.is_empty() && state.resources.delete_hash(&hash, groups.as_ref()).is_ok() && !state.resources.hash_in_use(&hash) {
+    if !hash.is_empty()
+        && state.resources.delete_hash(&hash, groups.as_ref()).is_ok()
+        && !state.resources.hash_in_use(&hash)
+    {
         state.content.remove(&hash);
     }
     StatusCode::OK.into_response()
@@ -613,14 +759,22 @@ async fn file_manager_delete(
 /// not group-filtered) unless a mission or packages are asked for.
 async fn file_manager_count(State(state): State<SyncState>, RawQuery(raw): RawQuery) -> Response {
     let pairs = query_pairs(raw.as_deref());
-    let get = |k: &str| pairs.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str()).unwrap_or("");
+    let get = |k: &str| {
+        pairs
+            .iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    };
     let all = state.resources.all();
     let mission = get("mission");
     let count = if mission.trim().is_empty() && get("missionPackage") != "true" {
         all.len()
     } else if mission.trim().is_empty() {
         // `getPackageResourceCount`: `'missionpackage' = ANY(keywords)`.
-        all.iter().filter(|r| r.keywords.iter().any(|k| k == "missionpackage")).count()
+        all.iter()
+            .filter(|r| r.keywords.iter().any(|k| k == "missionpackage"))
+            .count()
     } else {
         // `getResourceCountByMission`: resources joined to the contents of
         // every mission of that name.
@@ -629,7 +783,14 @@ async fn file_manager_count(State(state): State<SyncState>, RawQuery(raw): RawQu
             .list()
             .into_iter()
             .filter(|m| m.name == mission)
-            .flat_map(|m| m.hashes().filter_map(|c| match &c.content { crate::missions::Content::Hash(h) => Some(h.clone()), _ => None }).collect::<Vec<_>>())
+            .flat_map(|m| {
+                m.hashes()
+                    .filter_map(|c| match &c.content {
+                        crate::missions::Content::Hash(h) => Some(h.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
             .collect();
         all.iter().filter(|r| hashes.contains(&r.hash)).count()
     };
@@ -646,7 +807,9 @@ async fn get_resource(
         return StatusCode::FORBIDDEN.into_response();
     }
     match state.resources.by_hash(&hash, None).into_iter().next() {
-        Some(record) => envelope::api_response("Resource", vec![record.resource_json()]).into_response(),
+        Some(record) => {
+            envelope::api_response("Resource", vec![record.resource_json()]).into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -682,7 +845,10 @@ async fn set_expiration(
     if state.resources.by_hash(&hash, groups.as_ref()).is_empty() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match state.resources.set_expiration(&hash, query.expiration.filter(|e| *e >= 0)) {
+    match state
+        .resources
+        .set_expiration(&hash, query.expiration.filter(|e| *e >= 0))
+    {
         Ok(()) => StatusCode::OK.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }

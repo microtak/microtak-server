@@ -125,7 +125,10 @@ mod tests {
         assert!(trusted.contains(ip("10.0.0.5")));
         assert!(!trusted.contains(ip("10.0.0.6")));
         assert!(trusted.contains(ip("fd12::1")));
-        assert!(trusted.contains(ip("::ffff:172.18.0.9")), "IPv4-mapped peers match");
+        assert!(
+            trusted.contains(ip("::ffff:172.18.0.9")),
+            "IPv4-mapped peers match"
+        );
         assert!(proxies(&["0.0.0.0/0"]).contains(ip("8.8.8.8")));
     }
 
@@ -144,7 +147,10 @@ mod tests {
     #[test]
     fn ignores_forwarded_for_from_an_untrusted_peer() {
         let trusted = proxies(&["172.18.0.0/16"]);
-        assert_eq!(trusted.client_ip(ip("203.0.113.9"), &xff("1.2.3.4")), ip("203.0.113.9"));
+        assert_eq!(
+            trusted.client_ip(ip("203.0.113.9"), &xff("1.2.3.4")),
+            ip("203.0.113.9")
+        );
         assert_eq!(
             TrustedProxies::default().client_ip(ip("172.18.0.2"), &xff("1.2.3.4")),
             ip("172.18.0.2"),
@@ -158,13 +164,20 @@ mod tests {
     fn takes_the_rightmost_untrusted_forwarded_address_from_a_trusted_proxy() {
         let trusted = proxies(&["172.18.0.0/16", "10.9.9.9"]);
         let peer = ip("172.18.0.2");
-        assert_eq!(trusted.client_ip(peer, &xff("198.51.100.7")), ip("198.51.100.7"));
+        assert_eq!(
+            trusted.client_ip(peer, &xff("198.51.100.7")),
+            ip("198.51.100.7")
+        );
         assert_eq!(
             trusted.client_ip(peer, &xff("6.6.6.6, 198.51.100.7, 10.9.9.9")),
             ip("198.51.100.7"),
             "a spoofed left-most entry is skipped, a trusted hop is skipped"
         );
-        assert_eq!(trusted.client_ip(peer, &HeaderMap::new()), peer, "no header: the proxy itself");
+        assert_eq!(
+            trusted.client_ip(peer, &HeaderMap::new()),
+            peer,
+            "no header: the proxy itself"
+        );
         assert_eq!(trusted.client_ip(peer, &xff("garbage")), peer);
     }
 }

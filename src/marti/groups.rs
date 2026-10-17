@@ -143,7 +143,11 @@ async fn set_active_groups(
     Extension(identity): Extension<PeerIdentity>,
     Json(groups): Json<Vec<GroupJson>>,
 ) -> Response {
-    let active: BTreeSet<String> = groups.into_iter().filter(|g| g.active).map(|g| g.name).collect();
+    let active: BTreeSet<String> = groups
+        .into_iter()
+        .filter(|g| g.active)
+        .map(|g| g.name)
+        .collect();
     apply_active(&state, &identity.0, &active)
 }
 
@@ -159,7 +163,11 @@ async fn set_active_bits(
 fn apply_active(state: &GroupsState, identity: &str, active: &BTreeSet<String>) -> Response {
     match state.groups.set_active(identity, active) {
         Ok(()) => StatusCode::OK.into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error.to_string() }))).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": error.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -175,8 +183,12 @@ mod tests {
         let groups = Arc::new(GroupStore::in_memory());
         groups.create("Red", Some("red team".into()), 0).unwrap();
         groups.create("Blue", None, 0).unwrap();
-        groups.set_member("Red", "alpha", Some(Membership::Both)).unwrap();
-        groups.set_member("Blue", "alpha", Some(Membership::Out)).unwrap();
+        groups
+            .set_member("Red", "alpha", Some(Membership::Both))
+            .unwrap();
+        groups
+            .set_member("Blue", "alpha", Some(Membership::Out))
+            .unwrap();
         let state = GroupsState {
             groups: Arc::clone(&groups),
             admin_common_name: Some("admin".into()),
@@ -184,7 +196,13 @@ mod tests {
         (router(state), groups)
     }
 
-    async fn call(app: &Router, identity: &str, method: &str, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+    async fn call(
+        app: &Router,
+        identity: &str,
+        method: &str,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
         let response = app
             .clone()
             .oneshot(
@@ -199,8 +217,13 @@ mod tests {
             .await
             .unwrap();
         let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
     }
 
     fn names_dirs(body: &serde_json::Value) -> Vec<(String, String, bool)> {
@@ -223,14 +246,29 @@ mod tests {
     #[tokio::test]
     async fn lists_the_callers_groups_in_the_official_shape() {
         let (app, _) = app();
-        let (status, body) = call(&app, "alpha", "GET", "/Marti/api/groups/all?useCache=true", "").await;
+        let (status, body) = call(
+            &app,
+            "alpha",
+            "GET",
+            "/Marti/api/groups/all?useCache=true",
+            "",
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["type"], "com.bbn.marti.remote.groups.Group");
-        let red_in = body["data"].as_array().unwrap().iter().find(|g| g["name"] == "Red" && g["direction"] == "IN").unwrap();
+        let red_in = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["name"] == "Red" && g["direction"] == "IN")
+            .unwrap();
         assert_eq!(red_in["type"], "SYSTEM");
         assert_eq!(red_in["bitpos"], 1);
         assert_eq!(red_in["description"], "red team");
-        assert!(red_in["created"].as_str().unwrap().len() == 10, "yyyy-MM-dd");
+        assert!(
+            red_in["created"].as_str().unwrap().len() == 10,
+            "yyyy-MM-dd"
+        );
         assert_eq!(
             names_dirs(&body),
             vec![
@@ -241,14 +279,23 @@ mod tests {
         );
 
         let (_, body) = call(&app, "alpha", "GET", "/Marti/api/groups/all", "").await;
-        assert_eq!(names_dirs(&body), vec![("Blue".into(), "OUT".into(), true), ("Red".into(), "OUT".into(), true)]);
+        assert_eq!(
+            names_dirs(&body),
+            vec![
+                ("Blue".into(), "OUT".into(), true),
+                ("Red".into(), "OUT".into(), true)
+            ]
+        );
     }
 
     #[tokio::test]
     async fn an_identity_without_groups_sees_anon_and_the_admin_sees_all() {
         let (app, _) = app();
         let (_, body) = call(&app, "stranger", "GET", "/Marti/api/groups/all", "").await;
-        assert_eq!(names_dirs(&body), vec![("__ANON__".into(), "OUT".into(), true)]);
+        assert_eq!(
+            names_dirs(&body),
+            vec![("__ANON__".into(), "OUT".into(), true)]
+        );
         let (_, body) = call(&app, "admin", "GET", "/Marti/api/groups/all", "").await;
         assert_eq!(body["data"].as_array().unwrap().len(), 3);
     }
@@ -265,16 +312,25 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(groups.active_groups(Some("alpha"), Direction::Out), BTreeSet::from(["Red".to_string()]));
+        assert_eq!(
+            groups.active_groups(Some("alpha"), Direction::Out),
+            BTreeSet::from(["Red".to_string()])
+        );
 
         let (status, _) = call(&app, "alpha", "PUT", "/Marti/api/groups/activebits", "[2]").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(groups.active_groups(Some("alpha"), Direction::Out), BTreeSet::from(["Blue".to_string()]));
+        assert_eq!(
+            groups.active_groups(Some("alpha"), Direction::Out),
+            BTreeSet::from(["Blue".to_string()])
+        );
 
         // Switching everything off is refused.
         let (status, _) = call(&app, "alpha", "PUT", "/Marti/api/groups/activebits", "[]").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(groups.active_groups(Some("alpha"), Direction::Out), BTreeSet::from(["Blue".to_string()]));
+        assert_eq!(
+            groups.active_groups(Some("alpha"), Direction::Out),
+            BTreeSet::from(["Blue".to_string()])
+        );
     }
 
     /// A device can only switch its *own* groups -- naming groups it isn't
@@ -283,9 +339,19 @@ mod tests {
     async fn activating_a_foreign_group_does_not_join_it() {
         let (app, groups) = app();
         groups.create("Secret", None, 0).unwrap();
-        let (status, _) = call(&app, "alpha", "PUT", "/Marti/api/groups/activebits", "[1,3]").await;
+        let (status, _) = call(
+            &app,
+            "alpha",
+            "PUT",
+            "/Marti/api/groups/activebits",
+            "[1,3]",
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(groups.active_groups(Some("alpha"), Direction::Out), BTreeSet::from(["Red".to_string()]));
+        assert_eq!(
+            groups.active_groups(Some("alpha"), Direction::Out),
+            BTreeSet::from(["Red".to_string()])
+        );
         assert!(!groups.all_group_names("alpha").contains("Secret"));
     }
 }

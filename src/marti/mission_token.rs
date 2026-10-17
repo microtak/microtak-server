@@ -55,7 +55,9 @@ pub struct MissionTokenSigner {
 
 impl MissionTokenSigner {
     pub fn from_secret(secret: &[u8]) -> Self {
-        Self { key: hmac::Key::new(hmac::HMAC_SHA256, secret) }
+        Self {
+            key: hmac::Key::new(hmac::HMAC_SHA256, secret),
+        }
     }
 
     /// A random key (tests; servers use [`Self::load_or_create`]).
@@ -73,7 +75,8 @@ impl MissionTokenSigner {
             Ok(secret) if secret.len() >= 32 => Ok(Self::from_secret(&secret)),
             _ => {
                 let mut secret = [0u8; 32];
-                getrandom::getrandom(&mut secret).map_err(|e| std::io::Error::other(e.to_string()))?;
+                getrandom::getrandom(&mut secret)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 crate::bootstrap::write_private_file(&path, &secret)?;
                 Ok(Self::from_secret(&secret))
             }
@@ -81,7 +84,14 @@ impl MissionTokenSigner {
     }
 
     /// A token of `token_type` with id `id` for the mission.
-    pub fn create(&self, id: &str, token_type: TokenType, mission_name: &str, mission_guid: &str, now_unix: i64) -> String {
+    pub fn create(
+        &self,
+        id: &str,
+        token_type: TokenType,
+        mission_name: &str,
+        mission_guid: &str,
+        now_unix: i64,
+    ) -> String {
         let s = |v: &str| serde_json::Value::from(v).to_string();
         let claims = format!(
             r#"{{"jti":{id},"iat":{now_unix},"sub":"{ty}","iss":"","{ty}":{id},"MISSION_NAME":{name},"MISSION_GUID":{guid}}}"#,
@@ -91,7 +101,11 @@ impl MissionTokenSigner {
             guid = s(mission_guid),
         );
         let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-        let signing_input = format!("{}.{}", encode(br#"{"alg":"HS256"}"#), encode(claims.as_bytes()));
+        let signing_input = format!(
+            "{}.{}",
+            encode(br#"{"alg":"HS256"}"#),
+            encode(claims.as_bytes())
+        );
         let tag = hmac::sign(&self.key, signing_input.as_bytes());
         format!("{signing_input}.{}", encode(tag.as_ref()))
     }
@@ -106,7 +120,12 @@ impl MissionTokenSigner {
         }
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let signature = b64.decode(signature).ok()?;
-        hmac::verify(&self.key, format!("{header}.{claims}").as_bytes(), &signature).ok()?;
+        hmac::verify(
+            &self.key,
+            format!("{header}.{claims}").as_bytes(),
+            &signature,
+        )
+        .ok()?;
         let header: serde_json::Value = serde_json::from_slice(&b64.decode(header).ok()?).ok()?;
         if header["alg"] != "HS256" {
             return None;
@@ -127,7 +146,9 @@ mod tests {
     use super::*;
 
     fn segment(token: &str, n: usize) -> String {
-        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token.split('.').nth(n).unwrap()).unwrap();
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(n).unwrap())
+            .unwrap();
         String::from_utf8(raw).unwrap()
     }
 
@@ -136,7 +157,13 @@ mod tests {
     #[test]
     fn tokens_have_the_official_shape() {
         let signer = MissionTokenSigner::generate();
-        let token = signer.create("sub-1", TokenType::Subscription, "Ops", "6f1c-guid", 1_760_000_000);
+        let token = signer.create(
+            "sub-1",
+            TokenType::Subscription,
+            "Ops",
+            "6f1c-guid",
+            1_760_000_000,
+        );
         assert_eq!(segment(&token, 0), r#"{"alg":"HS256"}"#);
         assert_eq!(
             segment(&token, 1),
@@ -147,7 +174,11 @@ mod tests {
     #[test]
     fn a_token_decodes_to_its_claims() {
         let signer = MissionTokenSigner::generate();
-        for token_type in [TokenType::Subscription, TokenType::Invitation, TokenType::Access] {
+        for token_type in [
+            TokenType::Subscription,
+            TokenType::Invitation,
+            TokenType::Access,
+        ] {
             let token = signer.create("id-9", token_type, "Name \"quoted\"", "g-1", 0);
             assert_eq!(
                 signer.decode(&token),
@@ -172,7 +203,11 @@ mod tests {
         let mut parts: Vec<String> = mine.split('.').map(String::from).collect();
         parts[1] = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(r#"{"jti":"x","iat":0,"sub":"ACCESS","iss":"","ACCESS":"x","MISSION_NAME":"Other","MISSION_GUID":"g"}"#);
-        assert_eq!(signer.decode(&parts.join(".")), None, "claims changed after signing");
+        assert_eq!(
+            signer.decode(&parts.join(".")),
+            None,
+            "claims changed after signing"
+        );
         assert_eq!(signer.decode("not-a-token"), None);
     }
 
@@ -187,7 +222,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.join("mission-token-key")).unwrap().permissions().mode();
+            let mode = std::fs::metadata(dir.join("mission-token-key"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
         std::fs::remove_dir_all(&dir).ok();

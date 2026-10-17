@@ -21,9 +21,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
+use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
-use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -245,14 +245,18 @@ mod tests {
     #[test]
     fn a_minted_user_authenticates_with_the_right_password() {
         let store = UserStore::in_memory();
-        store.mint("jz", "correct horse battery staple", 1_000).unwrap();
+        store
+            .mint("jz", "correct horse battery staple", 1_000)
+            .unwrap();
         assert!(store.authenticate("jz", "correct horse battery staple"));
     }
 
     #[test]
     fn wrong_password_is_rejected() {
         let store = UserStore::in_memory();
-        store.mint("jz", "correct horse battery staple", 1_000).unwrap();
+        store
+            .mint("jz", "correct horse battery staple", 1_000)
+            .unwrap();
         assert!(!store.authenticate("jz", "wrong password"));
     }
 
@@ -266,7 +270,10 @@ mod tests {
     fn minting_a_duplicate_username_errors() {
         let store = UserStore::in_memory();
         store.mint("jz", "pw1", 1_000).unwrap();
-        assert!(matches!(store.mint("jz", "pw2", 1_100), Err(UserError::AlreadyExists)));
+        assert!(matches!(
+            store.mint("jz", "pw2", 1_100),
+            Err(UserError::AlreadyExists)
+        ));
     }
 
     /// The whole point of revocation: it must actually block login, not
@@ -274,7 +281,9 @@ mod tests {
     #[test]
     fn a_revoked_user_cannot_authenticate_even_with_the_right_password() {
         let store = UserStore::in_memory();
-        store.mint("jz", "correct horse battery staple", 1_000).unwrap();
+        store
+            .mint("jz", "correct horse battery staple", 1_000)
+            .unwrap();
         store.revoke("jz").unwrap();
         assert!(!store.authenticate("jz", "correct horse battery staple"));
     }
@@ -288,11 +297,16 @@ mod tests {
     #[test]
     fn passwords_are_never_stored_in_plaintext() {
         let store = UserStore::in_memory();
-        store.mint("jz", "correct horse battery staple", 1_000).unwrap();
+        store
+            .mint("jz", "correct horse battery staple", 1_000)
+            .unwrap();
         let record = store.users.read().unwrap();
         let hash = &record.get("jz").unwrap().password_hash;
         assert_ne!(hash, "correct horse battery staple");
-        assert!(hash.starts_with("$argon2"), "expected a real Argon2 PHC hash, got: {hash}");
+        assert!(
+            hash.starts_with("$argon2"),
+            "expected a real Argon2 PHC hash, got: {hash}"
+        );
     }
 
     #[test]
@@ -318,7 +332,9 @@ mod tests {
 
         {
             let store = UserStore::load_or_create(&path).unwrap();
-            store.mint("jz", "correct horse battery staple", 1_000).unwrap();
+            store
+                .mint("jz", "correct horse battery staple", 1_000)
+                .unwrap();
         }
 
         let reloaded = UserStore::load_or_create(&path).unwrap();

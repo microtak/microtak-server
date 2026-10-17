@@ -37,8 +37,10 @@ pub fn authorize(registry: &DeviceRegistry, common_name: &str, event: &Event) ->
     if event.is_situational_awareness() {
         return match registry.bind_uid(common_name, &event.uid) {
             Ok(()) => Verdict::Relay,
-            Err(error @ (RegistryError::UidOwnedByOtherDevice { .. }
-            | RegistryError::DeviceUidMismatch { .. })) => Verdict::Disconnect(error.to_string()),
+            Err(
+                error @ (RegistryError::UidOwnedByOtherDevice { .. }
+                | RegistryError::DeviceUidMismatch { .. }),
+            ) => Verdict::Disconnect(error.to_string()),
             Err(error) => Verdict::Disconnect(format!("identity check failed: {error}")),
         };
     }
@@ -46,10 +48,7 @@ pub fn authorize(registry: &DeviceRegistry, common_name: &str, event: &Event) ->
     if let Some(owner) = registry.owner_of_uid(&event.uid)
         && owner != common_name
     {
-        return Verdict::Drop(format!(
-            "uid '{}' belongs to device '{owner}'",
-            event.uid
-        ));
+        return Verdict::Drop(format!("uid '{}' belongs to device '{owner}'", event.uid));
     }
     for producer in event.producer_uids() {
         if let Some(owner) = registry.owner_of_uid(producer)
@@ -87,12 +86,24 @@ mod tests {
     #[test]
     fn a_devices_first_sa_binds_its_uid_and_later_ones_must_match() {
         let registry = registry_with(&["alpha"]);
-        assert_eq!(authorize(&registry, "alpha", &event(ATAK_SA)), Verdict::Relay);
-        assert_eq!(registry.find("alpha").unwrap().uid.as_deref(), Some("ANDROID-abc123"));
-        assert_eq!(authorize(&registry, "alpha", &event(ATAK_SA)), Verdict::Relay);
+        assert_eq!(
+            authorize(&registry, "alpha", &event(ATAK_SA)),
+            Verdict::Relay
+        );
+        assert_eq!(
+            registry.find("alpha").unwrap().uid.as_deref(),
+            Some("ANDROID-abc123")
+        );
+        assert_eq!(
+            authorize(&registry, "alpha", &event(ATAK_SA)),
+            Verdict::Relay
+        );
 
         let other = with_uid(ATAK_SA, "ANDROID-abc123", "ANDROID-zzz");
-        assert!(matches!(authorize(&registry, "alpha", &other), Verdict::Disconnect(_)));
+        assert!(matches!(
+            authorize(&registry, "alpha", &other),
+            Verdict::Disconnect(_)
+        ));
     }
 
     #[test]
@@ -112,9 +123,18 @@ mod tests {
     fn a_devices_own_chat_and_markers_are_relayed() {
         let registry = registry_with(&["alpha"]);
         authorize(&registry, "alpha", &event(ATAK_SA));
-        assert_eq!(authorize(&registry, "alpha", &event(ATAK_CHAT)), Verdict::Relay);
-        assert_eq!(authorize(&registry, "alpha", &event(ATAK_MARKER)), Verdict::Relay);
-        assert_eq!(registry.find("alpha").unwrap().uid.as_deref(), Some("ANDROID-abc123"));
+        assert_eq!(
+            authorize(&registry, "alpha", &event(ATAK_CHAT)),
+            Verdict::Relay
+        );
+        assert_eq!(
+            authorize(&registry, "alpha", &event(ATAK_MARKER)),
+            Verdict::Relay
+        );
+        assert_eq!(
+            registry.find("alpha").unwrap().uid.as_deref(),
+            Some("ANDROID-abc123")
+        );
     }
 
     /// Content sent before any SA doesn't bind the device to a chat or
@@ -122,10 +142,19 @@ mod tests {
     #[test]
     fn content_before_the_first_sa_binds_nothing() {
         let registry = registry_with(&["alpha"]);
-        assert_eq!(authorize(&registry, "alpha", &event(ATAK_CHAT)), Verdict::Relay);
+        assert_eq!(
+            authorize(&registry, "alpha", &event(ATAK_CHAT)),
+            Verdict::Relay
+        );
         assert_eq!(registry.find("alpha").unwrap().uid, None);
-        assert_eq!(authorize(&registry, "alpha", &event(ATAK_SA)), Verdict::Relay);
-        assert_eq!(registry.find("alpha").unwrap().uid.as_deref(), Some("ANDROID-abc123"));
+        assert_eq!(
+            authorize(&registry, "alpha", &event(ATAK_SA)),
+            Verdict::Relay
+        );
+        assert_eq!(
+            registry.find("alpha").unwrap().uid.as_deref(),
+            Some("ANDROID-abc123")
+        );
     }
 
     /// A non-SA event reusing another device's uid would overwrite that
@@ -134,8 +163,15 @@ mod tests {
     fn content_reusing_another_devices_uid_is_dropped() {
         let registry = registry_with(&["alpha", "mallory"]);
         authorize(&registry, "alpha", &event(ATAK_SA));
-        let fake_position = with_uid(crate::cot::tests::MINIMAL_EVENT_PUB, "TEST-UID-1", "ANDROID-abc123");
-        assert!(matches!(authorize(&registry, "mallory", &fake_position), Verdict::Drop(_)));
+        let fake_position = with_uid(
+            crate::cot::tests::MINIMAL_EVENT_PUB,
+            "TEST-UID-1",
+            "ANDROID-abc123",
+        );
+        assert!(matches!(
+            authorize(&registry, "mallory", &fake_position),
+            Verdict::Drop(_)
+        ));
     }
 
     /// Chat "from" another device, or a marker "created by" another device
@@ -144,9 +180,19 @@ mod tests {
     fn content_naming_another_device_as_producer_is_dropped() {
         let registry = registry_with(&["alpha", "mallory"]);
         authorize(&registry, "alpha", &event(ATAK_SA));
-        authorize(&registry, "mallory", &with_uid(ATAK_SA, "ANDROID-abc123", "ANDROID-mal"));
-        assert!(matches!(authorize(&registry, "mallory", &event(ATAK_CHAT)), Verdict::Drop(_)));
-        assert!(matches!(authorize(&registry, "mallory", &event(ATAK_MARKER)), Verdict::Drop(_)));
+        authorize(
+            &registry,
+            "mallory",
+            &with_uid(ATAK_SA, "ANDROID-abc123", "ANDROID-mal"),
+        );
+        assert!(matches!(
+            authorize(&registry, "mallory", &event(ATAK_CHAT)),
+            Verdict::Drop(_)
+        ));
+        assert!(matches!(
+            authorize(&registry, "mallory", &event(ATAK_MARKER)),
+            Verdict::Drop(_)
+        ));
         // Its own chat is fine.
         let own_chat = with_uid(ATAK_CHAT, "ANDROID-abc123", "ANDROID-mal");
         assert_eq!(authorize(&registry, "mallory", &own_chat), Verdict::Relay);
@@ -157,6 +203,9 @@ mod tests {
     #[test]
     fn links_to_unbound_uids_are_fine() {
         let registry = registry_with(&["alpha"]);
-        assert_eq!(authorize(&registry, "alpha", &event(ATAK_MARKER)), Verdict::Relay);
+        assert_eq!(
+            authorize(&registry, "alpha", &event(ATAK_MARKER)),
+            Verdict::Relay
+        );
     }
 }

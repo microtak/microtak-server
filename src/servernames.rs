@@ -70,7 +70,14 @@ pub fn issue_server_cert(
     common_name: &str,
     names: &[String],
     validity: time::Duration,
-) -> Result<(rustls::sign::CertifiedKey, rustls::pki_types::CertificateDer<'static>, PrivateKeyDer<'static>), ServerCertError> {
+) -> Result<
+    (
+        rustls::sign::CertifiedKey,
+        rustls::pki_types::CertificateDer<'static>,
+        PrivateKeyDer<'static>,
+    ),
+    ServerCertError,
+> {
     let (csr, key) = pki::build_csr(common_name)?;
     let signed = ca.sign_server_csr(&csr, names, validity)?;
     let cert_der = pki::cert_pem_to_der(&signed.cert_pem)?;
@@ -110,7 +117,9 @@ pub async fn watch_interfaces(
                 info!(names = ?names, "network addresses changed -- re-issued the server certificate");
                 current = names;
             }
-            Err(error) => warn!(%error, "failed to re-issue the server certificate for changed addresses"),
+            Err(error) => {
+                warn!(%error, "failed to re-issue the server certificate for changed addresses")
+            }
         }
     }
 }
@@ -121,11 +130,30 @@ mod tests {
 
     #[test]
     fn filters_addresses_no_client_can_reach_us_by() {
-        for unreachable in ["127.0.0.1", "::1", "0.0.0.0", "169.254.10.20", "fe80::1", "224.0.0.1"] {
-            assert!(!is_reachable_address(unreachable.parse().unwrap()), "{unreachable}");
+        for unreachable in [
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "169.254.10.20",
+            "fe80::1",
+            "224.0.0.1",
+        ] {
+            assert!(
+                !is_reachable_address(unreachable.parse().unwrap()),
+                "{unreachable}"
+            );
         }
-        for reachable in ["192.168.1.10", "10.5.0.2", "100.64.0.7", "2001:db8::5", "fd00::1"] {
-            assert!(is_reachable_address(reachable.parse().unwrap()), "{reachable}");
+        for reachable in [
+            "192.168.1.10",
+            "10.5.0.2",
+            "100.64.0.7",
+            "2001:db8::5",
+            "fd00::1",
+        ] {
+            assert!(
+                is_reachable_address(reachable.parse().unwrap()),
+                "{reachable}"
+            );
         }
     }
 
@@ -138,7 +166,12 @@ mod tests {
         );
         assert_eq!(
             names,
-            vec!["microtak-server", "tak.example.com", "192.168.1.10", "100.64.0.7"]
+            vec![
+                "microtak-server",
+                "tak.example.com",
+                "192.168.1.10",
+                "100.64.0.7"
+            ]
         );
     }
 

@@ -316,13 +316,16 @@ mod tests {
             Err(EnrollmentTokenError::WrongIdentity { .. })
         ));
         assert!(!store.list()[0].used);
-        store.validate_and_consume(&token, "device-a", 1_002).unwrap();
+        store
+            .validate_and_consume(&token, "device-a", 1_002)
+            .unwrap();
         assert_eq!(store.list()[0].common_name.as_deref(), Some("device-a"));
     }
 
     #[test]
     fn a_tokens_binding_survives_a_reload_and_old_logs_still_load() {
-        let dir = std::env::temp_dir().join(format!("microtak-tokens-bound-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("microtak-tokens-bound-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("enrollment_tokens.log");
         std::fs::remove_file(&path).ok();
@@ -333,14 +336,23 @@ mod tests {
         )
         .unwrap();
         let store = EnrollmentTokenStore::load_or_create(&path).unwrap();
-        let bound = store.mint_bound(None, None, Some("device-a".into()), 2).unwrap();
+        let bound = store
+            .mint_bound(None, None, Some("device-a".into()), 2)
+            .unwrap();
         drop(store);
 
         let reloaded = EnrollmentTokenStore::load_or_create(&path).unwrap();
         let all = reloaded.list();
-        assert_eq!(all.iter().find(|t| t.token == "old").unwrap().common_name, None);
         assert_eq!(
-            all.iter().find(|t| t.token == bound).unwrap().common_name.as_deref(),
+            all.iter().find(|t| t.token == "old").unwrap().common_name,
+            None
+        );
+        assert_eq!(
+            all.iter()
+                .find(|t| t.token == bound)
+                .unwrap()
+                .common_name
+                .as_deref(),
             Some("device-a")
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -351,7 +363,9 @@ mod tests {
         let store = EnrollmentTokenStore::in_memory();
         let token = store.mint(None, None, 1_000).unwrap();
         assert_eq!(token.len(), 64, "expected a 256-bit hex token");
-        store.validate_and_consume(&token, "device-a", 1_100).unwrap();
+        store
+            .validate_and_consume(&token, "device-a", 1_100)
+            .unwrap();
     }
 
     #[test]
@@ -366,7 +380,9 @@ mod tests {
     fn a_token_can_only_be_used_once() {
         let store = EnrollmentTokenStore::in_memory();
         let token = store.mint(None, None, 1_000).unwrap();
-        store.validate_and_consume(&token, "device-a", 1_100).unwrap();
+        store
+            .validate_and_consume(&token, "device-a", 1_100)
+            .unwrap();
 
         let result = store.validate_and_consume(&token, "device-b", 1_200);
         assert!(matches!(result, Err(EnrollmentTokenError::AlreadyUsed)));
@@ -401,14 +417,20 @@ mod tests {
     fn a_token_just_before_its_expiry_is_still_usable() {
         let store = EnrollmentTokenStore::in_memory();
         let token = store.mint(Some(60), None, 1_000).unwrap(); // expires at 1060
-        store.validate_and_consume(&token, "device-a", 1_059).unwrap();
+        store
+            .validate_and_consume(&token, "device-a", 1_059)
+            .unwrap();
     }
 
     #[test]
     fn list_reflects_mint_and_consumption_state() {
         let store = EnrollmentTokenStore::in_memory();
-        let token = store.mint(None, Some("for jz_pixel".to_string()), 1_000).unwrap();
-        store.validate_and_consume(&token, "jz_pixel", 1_100).unwrap();
+        let token = store
+            .mint(None, Some("for jz_pixel".to_string()), 1_000)
+            .unwrap();
+        store
+            .validate_and_consume(&token, "jz_pixel", 1_100)
+            .unwrap();
 
         let all = store.list();
         assert_eq!(all.len(), 1);
@@ -428,17 +450,16 @@ mod tests {
 
     #[test]
     fn persists_across_reload() {
-        let dir = std::env::temp_dir().join(format!(
-            "microtak-tokens-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("microtak-tokens-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tokens.log");
 
         let token = {
             let store = EnrollmentTokenStore::load_or_create(&path).unwrap();
             let token = store.mint(None, None, 1_000).unwrap();
-            store.validate_and_consume(&token, "device-a", 1_100).unwrap();
+            store
+                .validate_and_consume(&token, "device-a", 1_100)
+                .unwrap();
             token
         };
 
@@ -472,6 +493,9 @@ mod tests {
         }
         let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let successes = results.iter().filter(|r| r.is_ok()).count();
-        assert_eq!(successes, 1, "exactly one of 8 racing attempts should succeed");
+        assert_eq!(
+            successes, 1,
+            "exactly one of 8 racing attempts should succeed"
+        );
     }
 }

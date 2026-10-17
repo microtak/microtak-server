@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader;
+use quick_xml::events::Event as XmlEvent;
 use serde::{Deserialize, Serialize};
 
 /// Bound on remembered uids; the oldest are forgotten first.
@@ -39,7 +39,10 @@ pub struct LatestCot {
 
 impl LatestCot {
     pub fn in_memory() -> Self {
-        Self { state: RwLock::new(State::default()), path: None }
+        Self {
+            state: RwLock::new(State::default()),
+            path: None,
+        }
     }
 
     /// Loads `path` if it exists (a damaged file starts empty).
@@ -49,18 +52,36 @@ impl LatestCot {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        Self { state: RwLock::new(State { events, dirty: false }), path: Some(path) }
+        Self {
+            state: RwLock::new(State {
+                events,
+                dirty: false,
+            }),
+            path: Some(path),
+        }
     }
 
     /// Remembers `xml` as `uid`'s latest event.
     pub fn record(&self, uid: &str, xml: &str, server_time_ms: i64) {
         let xml = strip_declaration(xml).to_string();
         let mut state = self.state.write().unwrap();
-        if state.events.len() >= MAX_UIDS && !state.events.contains_key(uid)
-            && let Some(oldest) = state.events.iter().min_by_key(|(_, e)| e.server_time_ms).map(|(k, _)| k.clone()) {
-                state.events.remove(&oldest);
-            }
-        state.events.insert(uid.to_string(), LatestEvent { xml, server_time_ms });
+        if state.events.len() >= MAX_UIDS
+            && !state.events.contains_key(uid)
+            && let Some(oldest) = state
+                .events
+                .iter()
+                .min_by_key(|(_, e)| e.server_time_ms)
+                .map(|(k, _)| k.clone())
+        {
+            state.events.remove(&oldest);
+        }
+        state.events.insert(
+            uid.to_string(),
+            LatestEvent {
+                xml,
+                server_time_ms,
+            },
+        );
         state.dirty = true;
     }
 
@@ -70,7 +91,9 @@ impl LatestCot {
 
     /// Writes the file if anything changed since the last save.
     pub fn save_if_dirty(&self) -> std::io::Result<()> {
-        let Some(path) = &self.path else { return Ok(()) };
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
         let snapshot = {
             let mut state = self.state.write().unwrap();
             if !state.dirty {
@@ -95,7 +118,10 @@ impl LatestCot {
 impl LatestCot {
     /// Records every event relayed through the hub (control messages are
     /// never published there) and saves at most every five seconds.
-    pub fn spawn_feed(self: std::sync::Arc<Self>, mut rx: tokio::sync::broadcast::Receiver<crate::transport::hub::Outbound>) {
+    pub fn spawn_feed(
+        self: std::sync::Arc<Self>,
+        mut rx: tokio::sync::broadcast::Receiver<crate::transport::hub::Outbound>,
+    ) {
         tokio::spawn(async move {
             let mut save = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
@@ -124,9 +150,10 @@ impl LatestCot {
 fn strip_declaration(xml: &str) -> &str {
     let trimmed = xml.trim_start();
     if trimmed.starts_with("<?xml")
-        && let Some(end) = trimmed.find("?>") {
-            return trimmed[end + 2..].trim_start();
-        }
+        && let Some(end) = trimmed.find("?>")
+    {
+        return trimmed[end + 2..].trim_start();
+    }
     trimmed
 }
 
@@ -135,7 +162,10 @@ fn attributes(e: &quick_xml::events::BytesStart<'_>) -> HashMap<String, String> 
         .flatten()
         .filter_map(|a| {
             let key = String::from_utf8(a.key.as_ref().to_vec()).ok()?;
-            let value = a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok()?.into_owned();
+            let value = a
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .ok()?
+                .into_owned();
             Some((key, value))
         })
         .collect()
@@ -156,7 +186,8 @@ pub fn uid_details(xml: &str) -> serde_json::Value {
     let mut depth = 0usize;
     let mut in_detail_at: Option<usize> = None;
     let (mut cot_type, mut lat, mut lon) = (None::<String>, 0f64, 0f64);
-    let (mut color, mut attachments, mut title, mut medevac) = (None, None::<Vec<String>>, None, None::<String>);
+    let (mut color, mut attachments, mut title, mut medevac) =
+        (None, None::<Vec<String>>, None, None::<String>);
     let (mut name, mut category, mut callsign, mut iconset) = (None, None, None, None);
     loop {
         let (element, empty) = match reader.read_event() {
@@ -201,12 +232,16 @@ pub fn uid_details(xml: &str) -> serde_json::Value {
                     }
                     "bullseye" if ty == "u-r-b-bullseye" => {
                         if let Some(v) = attrs.get("edgeToCenter") {
-                            color = Some(if v == "true" { "-65536" } else { "-16711936" }.to_string());
+                            color =
+                                Some(if v == "true" { "-65536" } else { "-16711936" }.to_string());
                         }
                     }
                     "attachment_list" => {
                         if let Some(v) = attrs.get("hashes") {
-                            let inner = v.get(1..v.len().saturating_sub(1)).unwrap_or("").replace('"', "");
+                            let inner = v
+                                .get(1..v.len().saturating_sub(1))
+                                .unwrap_or("")
+                                .replace('"', "");
                             attachments = Some(inner.split(',').map(String::from).collect());
                         }
                     }
@@ -246,7 +281,10 @@ pub fn uid_details(xml: &str) -> serde_json::Value {
     put("name", name.map(Into::into));
     put("category", category.map(Into::into));
     if lat != 0.0 && lon != 0.0 {
-        put("location", Some(serde_json::json!({ "lat": lat, "lon": lon })));
+        put(
+            "location",
+            Some(serde_json::json!({ "lat": lat, "lon": lon })),
+        );
     }
     serde_json::Value::Object(details)
 }
@@ -286,15 +324,22 @@ mod tests {
 
     #[test]
     fn the_latest_event_is_kept_and_saved() {
-        let path = std::env::temp_dir().join(format!("microtak-latest-cot-{}.json", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("microtak-latest-cot-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = LatestCot::load(&path);
         store.record("m-1", MARKER, 1);
         store.record("m-1", &MARKER.replace("Rally", "Moved"), 2);
-        assert!(store.get("m-1").unwrap().xml.starts_with("<event "), "declaration stripped");
+        assert!(
+            store.get("m-1").unwrap().xml.starts_with("<event "),
+            "declaration stripped"
+        );
         store.save_if_dirty().unwrap();
         let reloaded = LatestCot::load(&path);
-        assert_eq!(reloaded.uid_details("m-1").unwrap()["callsign"], "Moved & point");
+        assert_eq!(
+            reloaded.uid_details("m-1").unwrap()["callsign"],
+            "Moved & point"
+        );
         assert_eq!(reloaded.get("m-1").unwrap().server_time_ms, 2);
         std::fs::remove_file(&path).ok();
     }

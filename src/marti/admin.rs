@@ -32,9 +32,9 @@ use time::OffsetDateTime;
 
 use super::{PeerIdentity, envelope};
 use crate::enrollment_tokens::{EnrollmentTokenError, EnrollmentTokenStore};
+use crate::groups::{GroupError, GroupGrant, GroupStore, Membership, grants_from};
 use crate::pki;
 use crate::registry::{CertRecord, DeviceRegistry, RegistryError};
-use crate::groups::{grants_from, GroupError, GroupGrant, GroupStore, Membership};
 use crate::users::UserStore;
 
 #[derive(Clone)]
@@ -62,8 +62,14 @@ pub fn router(state: AdminState) -> Router {
             "/Marti/api/admin/users/:username",
             axum::routing::delete(revoke_user),
         )
-        .route("/Marti/api/admin/groups", post(create_group).get(list_groups))
-        .route("/Marti/api/admin/groups/:name", axum::routing::delete(delete_group))
+        .route(
+            "/Marti/api/admin/groups",
+            post(create_group).get(list_groups),
+        )
+        .route(
+            "/Marti/api/admin/groups/:name",
+            axum::routing::delete(delete_group),
+        )
         .route(
             "/Marti/api/admin/groups/:name/members/:identity",
             axum::routing::put(set_group_member).delete(remove_group_member),
@@ -73,18 +79,42 @@ pub fn router(state: AdminState) -> Router {
             axum::routing::put(block_device).delete(unblock_device),
         )
         .route("/Marti/api/certadmin/cert", axum::routing::get(list_certs))
-        .route("/Marti/api/certadmin/cert/active", axum::routing::get(list_active_certs))
-        .route("/Marti/api/certadmin/cert/replaced", axum::routing::get(list_replaced_certs))
-        .route("/Marti/api/certadmin/cert/expired", axum::routing::get(list_expired_certs))
-        .route("/Marti/api/certadmin/cert/revoked", axum::routing::get(list_revoked_certs))
-        .route("/Marti/api/certadmin/cert/download/:ids", axum::routing::get(download_certs))
-        .route("/Marti/api/certadmin/cert/delete/:ids", axum::routing::delete(delete_certs))
-        .route("/Marti/api/certadmin/cert/revoke/:ids", axum::routing::delete(revoke_certs_by_id))
+        .route(
+            "/Marti/api/certadmin/cert/active",
+            axum::routing::get(list_active_certs),
+        )
+        .route(
+            "/Marti/api/certadmin/cert/replaced",
+            axum::routing::get(list_replaced_certs),
+        )
+        .route(
+            "/Marti/api/certadmin/cert/expired",
+            axum::routing::get(list_expired_certs),
+        )
+        .route(
+            "/Marti/api/certadmin/cert/revoked",
+            axum::routing::get(list_revoked_certs),
+        )
+        .route(
+            "/Marti/api/certadmin/cert/download/:ids",
+            axum::routing::get(download_certs),
+        )
+        .route(
+            "/Marti/api/certadmin/cert/delete/:ids",
+            axum::routing::delete(delete_certs),
+        )
+        .route(
+            "/Marti/api/certadmin/cert/revoke/:ids",
+            axum::routing::delete(revoke_certs_by_id),
+        )
         .route(
             "/Marti/api/certadmin/cert/:hash",
             axum::routing::get(get_cert_by_hash).delete(revoke_cert_by_hash),
         )
-        .route("/Marti/api/certadmin/cert/:hash/download", axum::routing::get(download_cert))
+        .route(
+            "/Marti/api/certadmin/cert/:hash/download",
+            axum::routing::get(download_cert),
+        )
         .with_state(state)
 }
 
@@ -98,9 +128,10 @@ fn error_response(status: StatusCode, message: String) -> Response {
 
 fn token_error_response(error: EnrollmentTokenError) -> Response {
     match error {
-        EnrollmentTokenError::NotFound => {
-            error_response(StatusCode::NOT_FOUND, "unknown enrollment token".to_string())
-        }
+        EnrollmentTokenError::NotFound => error_response(
+            StatusCode::NOT_FOUND,
+            "unknown enrollment token".to_string(),
+        ),
         other => error_response(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     }
 }
@@ -175,7 +206,10 @@ async fn mint_token(
         match serde_json::from_slice(&body) {
             Ok(request) => request,
             Err(error) => {
-                return error_response(StatusCode::BAD_REQUEST, format!("invalid request body: {error}"))
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid request body: {error}"),
+                );
             }
         }
     };
@@ -189,7 +223,10 @@ async fn mint_token(
     let grants = match request.groups.resolve(&state.groups) {
         Ok(grants) => grants,
         Err(missing) => {
-            return error_response(StatusCode::BAD_REQUEST, format!("unknown group '{missing}'"))
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("unknown group '{missing}'"),
+            );
         }
     };
     match state.tokens.mint_with(
@@ -199,7 +236,11 @@ async fn mint_token(
         grants,
         now_unix(),
     ) {
-        Ok(token) => (StatusCode::CREATED, Json(serde_json::json!({ "token": token }))).into_response(),
+        Ok(token) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "token": token })),
+        )
+            .into_response(),
         Err(error) => token_error_response(error),
     }
 }
@@ -262,7 +303,10 @@ async fn mint_user(
     let request: MintUserRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(error) => {
-            return error_response(StatusCode::BAD_REQUEST, format!("invalid request body: {error}"))
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid request body: {error}"),
+            );
         }
     };
     // The admin identity is reserved for the bootstrap token -- a password
@@ -277,11 +321,17 @@ async fn mint_user(
     let grants = match request.groups.resolve(&state.groups) {
         Ok(grants) => grants,
         Err(missing) => {
-            return error_response(StatusCode::BAD_REQUEST, format!("unknown group '{missing}'"))
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("unknown group '{missing}'"),
+            );
         }
     };
     let password = request.password.unwrap_or_else(random_password);
-    match state.users.mint_with_groups(&request.username, &password, grants, now_unix()) {
+    match state
+        .users
+        .mint_with_groups(&request.username, &password, grants, now_unix())
+    {
         Ok(()) => (
             StatusCode::CREATED,
             Json(serde_json::json!({ "username": request.username, "password": password })),
@@ -390,7 +440,11 @@ fn certs_response(registry: &DeviceRegistry, certs: &[CertRecord]) -> Response {
 fn sorted_certs(registry: &DeviceRegistry) -> Vec<CertRecord> {
     let mut certs = registry.certificates();
     certs.sort_by(|a, b| {
-        a.client_uid.clone().unwrap_or_default().cmp(&b.client_uid.clone().unwrap_or_default()).then(a.id.cmp(&b.id))
+        a.client_uid
+            .clone()
+            .unwrap_or_default()
+            .cmp(&b.client_uid.clone().unwrap_or_default())
+            .then(a.id.cmp(&b.id))
     });
     certs
 }
@@ -421,7 +475,10 @@ async fn list_certs(
 fn newest_per_client(certs: &[CertRecord]) -> std::collections::HashMap<(String, String), i64> {
     let mut newest = std::collections::HashMap::new();
     for cert in certs {
-        let key = (cert.client_uid.clone().unwrap_or_default(), cert.common_name.clone());
+        let key = (
+            cert.client_uid.clone().unwrap_or_default(),
+            cert.common_name.clone(),
+        );
         let entry = newest.entry(key).or_insert((cert.issued_at_unix, cert.id));
         if (cert.issued_at_unix, cert.id) > *entry {
             *entry = (cert.issued_at_unix, cert.id);
@@ -440,7 +497,10 @@ async fn list_active_certs(
     }
     let certs = sorted_certs(&state.registry);
     let newest = newest_per_client(&certs);
-    let active: Vec<_> = certs.into_iter().filter(|c| newest.values().any(|id| *id == c.id)).collect();
+    let active: Vec<_> = certs
+        .into_iter()
+        .filter(|c| newest.values().any(|id| *id == c.id))
+        .collect();
     certs_response(&state.registry, &active)
 }
 
@@ -454,7 +514,10 @@ async fn list_replaced_certs(
     }
     let certs = sorted_certs(&state.registry);
     let newest = newest_per_client(&certs);
-    let replaced: Vec<_> = certs.into_iter().filter(|c| !newest.values().any(|id| *id == c.id)).collect();
+    let replaced: Vec<_> = certs
+        .into_iter()
+        .filter(|c| !newest.values().any(|id| *id == c.id))
+        .collect();
     certs_response(&state.registry, &replaced)
 }
 
@@ -485,7 +548,8 @@ async fn list_revoked_certs(
     let revoked: Vec<_> = sorted_certs(&state.registry)
         .into_iter()
         .filter(|c| {
-            pki::fingerprint_sha256_colon_hex(&c.cert_pem).is_some_and(|fp| state.registry.is_cert_revoked(&fp))
+            pki::fingerprint_sha256_colon_hex(&c.cert_pem)
+                .is_some_and(|fp| state.registry.is_cert_revoked(&fp))
         })
         .collect();
     certs_response(&state.registry, &revoked)
@@ -497,10 +561,9 @@ fn parse_ids(ids: &str) -> Option<Vec<i64>> {
 
 fn find_by_hash(registry: &DeviceRegistry, hash: &str) -> Option<CertRecord> {
     let wanted = pki::normalize_fingerprint(hash)?;
-    registry
-        .certificates()
-        .into_iter()
-        .find(|c| pki::fingerprint_sha256_colon_hex(&c.cert_pem).as_deref() == Some(wanted.as_str()))
+    registry.certificates().into_iter().find(|c| {
+        pki::fingerprint_sha256_colon_hex(&c.cert_pem).as_deref() == Some(wanted.as_str())
+    })
 }
 
 /// `GET /Marti/api/certadmin/cert/download/:ids` -- a zip of PEMs named
@@ -513,12 +576,24 @@ async fn download_certs(
     if let Some(response) = require_admin(&state, &identity) {
         return response;
     }
-    let Some(ids) = parse_ids(&ids) else { return official_error() };
-    let certs: Vec<_> = state.registry.certificates().into_iter().filter(|c| ids.contains(&c.id)).collect();
+    let Some(ids) = parse_ids(&ids) else {
+        return official_error();
+    };
+    let certs: Vec<_> = state
+        .registry
+        .certificates()
+        .into_iter()
+        .filter(|c| ids.contains(&c.id))
+        .collect();
     let files: Vec<(String, Vec<u8>)> = certs
         .iter()
         .enumerate()
-        .map(|(n, c)| (format!("{}_{}_ClientCert.pem", n + 1, c.common_name), c.cert_pem.as_bytes().to_vec()))
+        .map(|(n, c)| {
+            (
+                format!("{}_{}_ClientCert.pem", n + 1, c.common_name),
+                c.cert_pem.as_bytes().to_vec(),
+            )
+        })
         .collect();
     let date = OffsetDateTime::now_utc();
     let filename = format!(
@@ -533,8 +608,14 @@ async fn download_certs(
     (
         StatusCode::OK,
         [
-            (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
-            (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename={filename}")),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/zip".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename={filename}"),
+            ),
         ],
         crate::zip::stored(&files),
     )
@@ -550,7 +631,9 @@ async fn delete_certs(
     if let Some(response) = require_admin(&state, &identity) {
         return response;
     }
-    let Some(ids) = parse_ids(&ids) else { return official_error() };
+    let Some(ids) = parse_ids(&ids) else {
+        return official_error();
+    };
     match state.registry.delete_certs(&ids) {
         Ok(_) => StatusCode::OK.into_response(),
         Err(_) => official_error(),
@@ -568,8 +651,15 @@ async fn revoke_certs_by_id(
     if let Some(response) = require_admin(&state, &identity) {
         return response;
     }
-    let Some(ids) = parse_ids(&ids) else { return official_error() };
-    for cert in state.registry.certificates().into_iter().filter(|c| ids.contains(&c.id)) {
+    let Some(ids) = parse_ids(&ids) else {
+        return official_error();
+    };
+    for cert in state
+        .registry
+        .certificates()
+        .into_iter()
+        .filter(|c| ids.contains(&c.id))
+    {
         if let Some(fp) = pki::fingerprint_sha256_colon_hex(&cert.cert_pem)
             && state.registry.revoke_cert(&fp).is_err()
         {
@@ -592,7 +682,9 @@ async fn get_cert_by_hash(
         return response;
     }
     match find_by_hash(&state.registry, &hash) {
-        Some(cert) => envelope::api_response("TakCert", tak_cert_json(&state.registry, &cert)).into_response(),
+        Some(cert) => {
+            envelope::api_response("TakCert", tak_cert_json(&state.registry, &cert)).into_response()
+        }
         None => official_error(),
     }
 }
@@ -634,7 +726,9 @@ async fn revoke_cert_by_hash(
     if let Some(response) = require_admin(&state, &identity) {
         return response;
     }
-    let Some(cert) = find_by_hash(&state.registry, &hash) else { return official_error() };
+    let Some(cert) = find_by_hash(&state.registry, &hash) else {
+        return official_error();
+    };
     let before = tak_cert_json(&state.registry, &cert);
     match state.registry.revoke_cert(&hash) {
         Ok(()) => envelope::api_response("TakCert", before).into_response(),
@@ -726,7 +820,10 @@ async fn create_group(
     if let Some(response) = require_admin(&state, &identity) {
         return response;
     }
-    match state.groups.create(&request.name, request.description, now_unix()) {
+    match state
+        .groups
+        .create(&request.name, request.description, now_unix())
+    {
         Ok(()) => StatusCode::CREATED.into_response(),
         Err(error) => group_error_response(error),
     }
@@ -755,7 +852,10 @@ async fn set_group_member(
     if let Some(response) = require_admin(&state, &identity) {
         return response;
     }
-    match state.groups.set_member(&name, &member, Some(request.direction)) {
+    match state
+        .groups
+        .set_member(&name, &member, Some(request.direction))
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => group_error_response(error),
     }
@@ -784,7 +884,12 @@ mod tests {
 
     fn app_with_admin(
         admin_cn: Option<&str>,
-    ) -> (Router, Arc<EnrollmentTokenStore>, Arc<UserStore>, Arc<DeviceRegistry>) {
+    ) -> (
+        Router,
+        Arc<EnrollmentTokenStore>,
+        Arc<UserStore>,
+        Arc<DeviceRegistry>,
+    ) {
         let tokens = Arc::new(EnrollmentTokenStore::in_memory());
         let users = Arc::new(UserStore::in_memory());
         let registry = Arc::new(DeviceRegistry::in_memory());
@@ -821,16 +926,34 @@ mod tests {
     async fn admin_can_mint_list_and_revoke_a_token() {
         let (mut app, _tokens, _users, _registry) = app_with_admin(Some("jz-admin"));
 
-        let mint_response = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/enrollmentTokens", "{}").await;
+        let mint_response = request_as(
+            &mut app,
+            "jz-admin",
+            "POST",
+            "/Marti/api/admin/enrollmentTokens",
+            "{}",
+        )
+        .await;
         assert_eq!(mint_response.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(mint_response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(mint_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let token = parsed["token"].as_str().unwrap().to_string();
         assert_eq!(token.len(), 64);
 
-        let list_response = request_as(&mut app, "jz-admin", "GET", "/Marti/api/admin/enrollmentTokens", "").await;
+        let list_response = request_as(
+            &mut app,
+            "jz-admin",
+            "GET",
+            "/Marti/api/admin/enrollmentTokens",
+            "",
+        )
+        .await;
         assert_eq!(list_response.status(), StatusCode::OK);
-        let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX).await.unwrap();
+        let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let list: Vec<serde_json::Value> = serde_json::from_slice(&list_body).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["token"], token);
@@ -851,9 +974,19 @@ mod tests {
     #[tokio::test]
     async fn non_admin_identity_is_rejected() {
         let (mut app, tokens, _users, _registry) = app_with_admin(Some("jz-admin"));
-        let response = request_as(&mut app, "some-other-device", "POST", "/Marti/api/admin/enrollmentTokens", "{}").await;
+        let response = request_as(
+            &mut app,
+            "some-other-device",
+            "POST",
+            "/Marti/api/admin/enrollmentTokens",
+            "{}",
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(tokens.list().is_empty(), "the rejected request must not have minted anything");
+        assert!(
+            tokens.list().is_empty(),
+            "the rejected request must not have minted anything"
+        );
     }
 
     /// No admin configured at all means the API is unreachable by anyone,
@@ -861,7 +994,14 @@ mod tests {
     #[tokio::test]
     async fn no_configured_admin_rejects_every_caller() {
         let (mut app, _tokens, _users, _registry) = app_with_admin(None);
-        let response = request_as(&mut app, "anyone", "GET", "/Marti/api/admin/enrollmentTokens", "").await;
+        let response = request_as(
+            &mut app,
+            "anyone",
+            "GET",
+            "/Marti/api/admin/enrollmentTokens",
+            "",
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
@@ -915,14 +1055,24 @@ mod tests {
         assert_eq!(mint_response.status(), StatusCode::CREATED);
         assert!(users.authenticate("alice", "correct horse battery staple"));
 
-        let list_response = request_as(&mut app, "jz-admin", "GET", "/Marti/api/admin/users", "").await;
+        let list_response =
+            request_as(&mut app, "jz-admin", "GET", "/Marti/api/admin/users", "").await;
         assert_eq!(list_response.status(), StatusCode::OK);
-        let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX).await.unwrap();
+        let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let list: Vec<serde_json::Value> = serde_json::from_slice(&list_body).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["username"], "alice");
 
-        let revoke_response = request_as(&mut app, "jz-admin", "DELETE", "/Marti/api/admin/users/alice", "").await;
+        let revoke_response = request_as(
+            &mut app,
+            "jz-admin",
+            "DELETE",
+            "/Marti/api/admin/users/alice",
+            "",
+        )
+        .await;
         assert_eq!(revoke_response.status(), StatusCode::NO_CONTENT);
         assert!(!users.authenticate("alice", "correct horse battery staple"));
     }
@@ -941,9 +1091,12 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::CREATED);
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let generated_password = body["password"].as_str().unwrap();
         assert!(!generated_password.is_empty());
         assert!(users.authenticate("bob", generated_password));
@@ -1000,7 +1153,12 @@ mod tests {
         assert!(tokens.list().is_empty());
     }
 
-    fn app_with_groups() -> (Router, Arc<GroupStore>, Arc<EnrollmentTokenStore>, Arc<UserStore>) {
+    fn app_with_groups() -> (
+        Router,
+        Arc<GroupStore>,
+        Arc<EnrollmentTokenStore>,
+        Arc<UserStore>,
+    ) {
         let tokens = Arc::new(EnrollmentTokenStore::in_memory());
         let users = Arc::new(UserStore::in_memory());
         let groups = Arc::new(GroupStore::in_memory());
@@ -1017,28 +1175,87 @@ mod tests {
     #[tokio::test]
     async fn admin_manages_groups_and_members() {
         let (mut app, groups, _, _) = app_with_groups();
-        let created = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/groups", r#"{"name":"Red","description":"red team"}"#).await;
+        let created = request_as(
+            &mut app,
+            "jz-admin",
+            "POST",
+            "/Marti/api/admin/groups",
+            r#"{"name":"Red","description":"red team"}"#,
+        )
+        .await;
         assert_eq!(created.status(), StatusCode::CREATED);
-        let dup = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/groups", r#"{"name":"Red"}"#).await;
+        let dup = request_as(
+            &mut app,
+            "jz-admin",
+            "POST",
+            "/Marti/api/admin/groups",
+            r#"{"name":"Red"}"#,
+        )
+        .await;
         assert_eq!(dup.status(), StatusCode::CONFLICT);
-        let bad = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/groups", r#"{"name":"__ANON__"}"#).await;
+        let bad = request_as(
+            &mut app,
+            "jz-admin",
+            "POST",
+            "/Marti/api/admin/groups",
+            r#"{"name":"__ANON__"}"#,
+        )
+        .await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 
-        let set = request_as(&mut app, "jz-admin", "PUT", "/Marti/api/admin/groups/Red/members/phone-1", r#"{"direction":"IN"}"#).await;
+        let set = request_as(
+            &mut app,
+            "jz-admin",
+            "PUT",
+            "/Marti/api/admin/groups/Red/members/phone-1",
+            r#"{"direction":"IN"}"#,
+        )
+        .await;
         assert_eq!(set.status(), StatusCode::NO_CONTENT);
-        let unknown = request_as(&mut app, "jz-admin", "PUT", "/Marti/api/admin/groups/Nope/members/phone-1", r#"{"direction":"BOTH"}"#).await;
+        let unknown = request_as(
+            &mut app,
+            "jz-admin",
+            "PUT",
+            "/Marti/api/admin/groups/Nope/members/phone-1",
+            r#"{"direction":"BOTH"}"#,
+        )
+        .await;
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 
         let listed = request_as(&mut app, "jz-admin", "GET", "/Marti/api/admin/groups", "").await;
-        let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(listed.into_body(), usize::MAX).await.unwrap()).unwrap();
-        let red = body.as_array().unwrap().iter().find(|g| g["name"] == "Red").unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let red = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["name"] == "Red")
+            .unwrap();
         assert_eq!(red["members"]["phone-1"], "IN");
         assert_eq!(red["description"], "red team");
 
-        let removed = request_as(&mut app, "jz-admin", "DELETE", "/Marti/api/admin/groups/Red/members/phone-1", "").await;
+        let removed = request_as(
+            &mut app,
+            "jz-admin",
+            "DELETE",
+            "/Marti/api/admin/groups/Red/members/phone-1",
+            "",
+        )
+        .await;
         assert_eq!(removed.status(), StatusCode::NO_CONTENT);
         assert!(!groups.all_group_names("phone-1").contains("Red"));
-        let deleted = request_as(&mut app, "jz-admin", "DELETE", "/Marti/api/admin/groups/Red", "").await;
+        let deleted = request_as(
+            &mut app,
+            "jz-admin",
+            "DELETE",
+            "/Marti/api/admin/groups/Red",
+            "",
+        )
+        .await;
         assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
         assert!(!groups.exists("Red"));
     }
@@ -1049,7 +1266,11 @@ mod tests {
         for (method, uri, body) in [
             ("GET", "/Marti/api/admin/groups", ""),
             ("POST", "/Marti/api/admin/groups", r#"{"name":"Red"}"#),
-            ("PUT", "/Marti/api/admin/groups/__ANON__/members/me", r#"{"direction":"BOTH"}"#),
+            (
+                "PUT",
+                "/Marti/api/admin/groups/__ANON__/members/me",
+                r#"{"direction":"BOTH"}"#,
+            ),
             ("DELETE", "/Marti/api/admin/groups/__ANON__", ""),
         ] {
             let response = request_as(&mut app, "phone-1", method, uri, body).await;
@@ -1065,24 +1286,63 @@ mod tests {
         let (mut app, groups, tokens, users) = app_with_groups();
         groups.create("Red", None, 0).unwrap();
         groups.create("Blue", None, 0).unwrap();
-        let minted = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/enrollmentTokens",
-            r#"{"commonName":"phone-1","groups":["Red"],"groupsOut":["Blue"]}"#).await;
+        let minted = request_as(
+            &mut app,
+            "jz-admin",
+            "POST",
+            "/Marti/api/admin/enrollmentTokens",
+            r#"{"commonName":"phone-1","groups":["Red"],"groupsOut":["Blue"]}"#,
+        )
+        .await;
         assert_eq!(minted.status(), StatusCode::CREATED);
         assert_eq!(
             tokens.list()[0].groups,
             vec![
-                GroupGrant { name: "Blue".into(), membership: Membership::Out },
-                GroupGrant { name: "Red".into(), membership: Membership::Both },
+                GroupGrant {
+                    name: "Blue".into(),
+                    membership: Membership::Out
+                },
+                GroupGrant {
+                    name: "Red".into(),
+                    membership: Membership::Both
+                },
             ]
         );
-        let bad = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/enrollmentTokens", r#"{"groups":["Nope"]}"#).await;
+        let bad = request_as(
+            &mut app,
+            "jz-admin",
+            "POST",
+            "/Marti/api/admin/enrollmentTokens",
+            r#"{"groups":["Nope"]}"#,
+        )
+        .await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
         assert_eq!(tokens.list().len(), 1);
 
-        let user = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/users", r#"{"username":"bob","password":"pw","groupsIn":["Red"]}"#).await;
+        let user = request_as(
+            &mut app,
+            "jz-admin",
+            "POST",
+            "/Marti/api/admin/users",
+            r#"{"username":"bob","password":"pw","groupsIn":["Red"]}"#,
+        )
+        .await;
         assert_eq!(user.status(), StatusCode::CREATED);
-        assert_eq!(users.groups_of("bob"), vec![GroupGrant { name: "Red".into(), membership: Membership::In }]);
-        let bad = request_as(&mut app, "jz-admin", "POST", "/Marti/api/admin/users", r#"{"username":"eve","groups":["Nope"]}"#).await;
+        assert_eq!(
+            users.groups_of("bob"),
+            vec![GroupGrant {
+                name: "Red".into(),
+                membership: Membership::In
+            }]
+        );
+        let bad = request_as(
+            &mut app,
+            "jz-admin",
+            "POST",
+            "/Marti/api/admin/users",
+            r#"{"username":"eve","groups":["Nope"]}"#,
+        )
+        .await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
         assert!(!users.exists("eve"));
     }
@@ -1099,7 +1359,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(users.list().is_empty(), "the rejected request must not have minted anything");
+        assert!(
+            users.list().is_empty(),
+            "the rejected request must not have minted anything"
+        );
     }
 
     #[tokio::test]
@@ -1108,7 +1371,9 @@ mod tests {
         let ca = crate::pki::CertificateAuthority::generate("Test CA").unwrap();
         let (csr_pem, _key) = crate::pki::build_csr("device-a").unwrap();
         let signed = ca.sign_csr(&csr_pem, time::Duration::days(365)).unwrap();
-        registry.enroll("device-a", &signed.cert_pem, 1_000).unwrap();
+        registry
+            .enroll("device-a", &signed.cert_pem, 1_000)
+            .unwrap();
         let hash = crate::pki::fingerprint_sha256_colon_hex(&signed.cert_pem).unwrap();
 
         let response = request_as(
@@ -1120,9 +1385,12 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(body["type"], "TakCert");
         assert_eq!(body["data"]["userDn"], "device-a");
         // No `clientUid` at enrollment: the official default is "".
@@ -1136,7 +1404,9 @@ mod tests {
         let ca = crate::pki::CertificateAuthority::generate("Test CA").unwrap();
         let (csr_pem, _key) = crate::pki::build_csr("device-revoked").unwrap();
         let signed = ca.sign_csr(&csr_pem, time::Duration::days(365)).unwrap();
-        registry.enroll("device-revoked", &signed.cert_pem, 1_000).unwrap();
+        registry
+            .enroll("device-revoked", &signed.cert_pem, 1_000)
+            .unwrap();
         let hash = crate::pki::fingerprint_sha256_colon_hex(&signed.cert_pem).unwrap();
         registry.revoke_cert(&hash).unwrap();
 
@@ -1149,10 +1419,17 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert!(body["data"]["revocationDate"].as_str().is_some_and(|d| d.ends_with('Z')));
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            body["data"]["revocationDate"]
+                .as_str()
+                .is_some_and(|d| d.ends_with('Z'))
+        );
     }
 
     /// The official server answers an unknown hash with sendError(500);

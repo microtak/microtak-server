@@ -78,12 +78,18 @@ impl Membership {
     pub fn includes(self, direction: Direction) -> bool {
         matches!(
             (self, direction),
-            (Membership::Both, _) | (Membership::In, Direction::In) | (Membership::Out, Direction::Out)
+            (Membership::Both, _)
+                | (Membership::In, Direction::In)
+                | (Membership::Out, Direction::Out)
         )
     }
 
     fn merge(self, other: Membership) -> Membership {
-        if self == other { self } else { Membership::Both }
+        if self == other {
+            self
+        } else {
+            Membership::Both
+        }
     }
 }
 
@@ -100,7 +106,11 @@ pub struct GroupGrant {
 /// `outs`; a group named in more than one list gets the union.
 pub fn grants_from(both: &[String], ins: &[String], outs: &[String]) -> Vec<GroupGrant> {
     let mut merged: BTreeMap<String, Membership> = BTreeMap::new();
-    let lists = [(both, Membership::Both), (ins, Membership::In), (outs, Membership::Out)];
+    let lists = [
+        (both, Membership::Both),
+        (ins, Membership::In),
+        (outs, Membership::Out),
+    ];
     for (names, membership) in lists {
         for name in names {
             merged
@@ -202,7 +212,11 @@ fn validate_name(name: &str) -> Result<(), GroupError> {
         && name.chars().count() <= 64
         && !name.chars().any(char::is_control)
         && name != ANON_GROUP;
-    if ok { Ok(()) } else { Err(GroupError::InvalidName(name.to_string())) }
+    if ok {
+        Ok(())
+    } else {
+        Err(GroupError::InvalidName(name.to_string()))
+    }
 }
 
 impl GroupStore {
@@ -230,7 +244,12 @@ impl GroupStore {
         Ok(())
     }
 
-    pub fn create(&self, name: &str, description: Option<String>, now_unix: i64) -> Result<(), GroupError> {
+    pub fn create(
+        &self,
+        name: &str,
+        description: Option<String>,
+        now_unix: i64,
+    ) -> Result<(), GroupError> {
         validate_name(name)?;
         let mut state = self.state.write().unwrap();
         if state.groups.contains_key(name) {
@@ -256,7 +275,12 @@ impl GroupStore {
         if !state.groups.contains_key(name) {
             return Err(GroupError::NotFound(name.to_string()));
         }
-        self.record(&mut state, GroupEvent::Deleted { name: name.to_string() })
+        self.record(
+            &mut state,
+            GroupEvent::Deleted {
+                name: name.to_string(),
+            },
+        )
     }
 
     pub fn exists(&self, name: &str) -> bool {
@@ -273,7 +297,12 @@ impl GroupStore {
     }
 
     /// Set (or, with `None`, remove) `identity`'s membership in `group`.
-    pub fn set_member(&self, group: &str, identity: &str, membership: Option<Membership>) -> Result<(), GroupError> {
+    pub fn set_member(
+        &self,
+        group: &str,
+        identity: &str,
+        membership: Option<Membership>,
+    ) -> Result<(), GroupError> {
         let mut state = self.state.write().unwrap();
         if !state.groups.contains_key(group) {
             return Err(GroupError::NotFound(group.to_string()));
@@ -296,7 +325,11 @@ impl GroupStore {
         if let Some(missing) = grants.iter().find(|g| !state.groups.contains_key(&g.name)) {
             return Err(GroupError::NotFound(missing.name.clone()));
         }
-        for GroupGrant { name: group, membership } in grants {
+        for GroupGrant {
+            name: group,
+            membership,
+        } in grants
+        {
             let merged = match state.members.get(identity).and_then(|m| m.get(group)) {
                 Some(existing) => existing.merge(*membership),
                 None => *membership,
@@ -326,7 +359,9 @@ impl GroupStore {
                 members: state
                     .members
                     .iter()
-                    .filter_map(|(identity, groups)| groups.get(name).map(|m| (identity.clone(), *m)))
+                    .filter_map(|(identity, groups)| {
+                        groups.get(name).map(|m| (identity.clone(), *m))
+                    })
                     .collect(),
             })
             .collect()
@@ -381,7 +416,10 @@ impl GroupStore {
     /// not -- what mission visibility is checked against.
     pub fn all_group_names(&self, identity: &str) -> BTreeSet<String> {
         let state = self.state.read().unwrap();
-        effective_memberships(&state, identity).into_iter().map(|(g, _)| g).collect()
+        effective_memberships(&state, identity)
+            .into_iter()
+            .map(|(g, _)| g)
+            .collect()
     }
 
     /// Switch `identity`'s groups on/off: `active` names the groups to keep
@@ -389,8 +427,10 @@ impl GroupStore {
     /// on (otherwise the device would silently go dark).
     pub fn set_active(&self, identity: &str, active: &BTreeSet<String>) -> Result<(), GroupError> {
         let mut state = self.state.write().unwrap();
-        let member_of: BTreeSet<String> =
-            effective_memberships(&state, identity).into_iter().map(|(g, _)| g).collect();
+        let member_of: BTreeSet<String> = effective_memberships(&state, identity)
+            .into_iter()
+            .map(|(g, _)| g)
+            .collect();
         if member_of.intersection(active).next().is_none() {
             return Err(GroupError::NoActiveGroup);
         }
@@ -487,9 +527,18 @@ mod tests {
     #[test]
     fn identities_without_memberships_are_anonymous_both_ways() {
         let store = GroupStore::in_memory();
-        assert_eq!(store.active_groups(Some("alpha"), Direction::In), set(&[ANON_GROUP]));
-        assert_eq!(store.active_groups(Some("alpha"), Direction::Out), set(&[ANON_GROUP]));
-        assert_eq!(store.active_groups(None, Direction::Out), set(&[ANON_GROUP]));
+        assert_eq!(
+            store.active_groups(Some("alpha"), Direction::In),
+            set(&[ANON_GROUP])
+        );
+        assert_eq!(
+            store.active_groups(Some("alpha"), Direction::Out),
+            set(&[ANON_GROUP])
+        );
+        assert_eq!(
+            store.active_groups(None, Direction::Out),
+            set(&[ANON_GROUP])
+        );
     }
 
     #[test]
@@ -497,10 +546,20 @@ mod tests {
         let store = GroupStore::in_memory();
         store.create("Red", None, 1).unwrap();
         store.create("Blue", None, 1).unwrap();
-        store.set_member("Red", "alpha", Some(Membership::Both)).unwrap();
-        store.set_member("Blue", "alpha", Some(Membership::Out)).unwrap();
-        assert_eq!(store.active_groups(Some("alpha"), Direction::In), set(&["Red"]));
-        assert_eq!(store.active_groups(Some("alpha"), Direction::Out), set(&["Blue", "Red"]));
+        store
+            .set_member("Red", "alpha", Some(Membership::Both))
+            .unwrap();
+        store
+            .set_member("Blue", "alpha", Some(Membership::Out))
+            .unwrap();
+        assert_eq!(
+            store.active_groups(Some("alpha"), Direction::In),
+            set(&["Red"])
+        );
+        assert_eq!(
+            store.active_groups(Some("alpha"), Direction::Out),
+            set(&["Blue", "Red"])
+        );
         assert_eq!(store.all_group_names("alpha"), set(&["Blue", "Red"]));
     }
 
@@ -509,20 +568,39 @@ mod tests {
         let store = GroupStore::in_memory();
         store.create("Red", None, 1).unwrap();
         store.create("Blue", None, 1).unwrap();
-        store.set_member("Red", "alpha", Some(Membership::Both)).unwrap();
-        store.set_member("Blue", "alpha", Some(Membership::Both)).unwrap();
+        store
+            .set_member("Red", "alpha", Some(Membership::Both))
+            .unwrap();
+        store
+            .set_member("Blue", "alpha", Some(Membership::Both))
+            .unwrap();
         store.set_active("alpha", &set(&["Red"])).unwrap();
-        assert_eq!(store.active_groups(Some("alpha"), Direction::In), set(&["Red"]));
-        assert_eq!(store.active_groups(Some("alpha"), Direction::Out), set(&["Red"]));
-        assert_eq!(store.set_active("alpha", &set(&[])), Err(GroupError::NoActiveGroup));
-        assert_eq!(store.set_active("alpha", &set(&["Green"])), Err(GroupError::NoActiveGroup));
+        assert_eq!(
+            store.active_groups(Some("alpha"), Direction::In),
+            set(&["Red"])
+        );
+        assert_eq!(
+            store.active_groups(Some("alpha"), Direction::Out),
+            set(&["Red"])
+        );
+        assert_eq!(
+            store.set_active("alpha", &set(&[])),
+            Err(GroupError::NoActiveGroup)
+        );
+        assert_eq!(
+            store.set_active("alpha", &set(&["Green"])),
+            Err(GroupError::NoActiveGroup)
+        );
         let flags: Vec<(String, bool)> = store
             .memberships("alpha")
             .into_iter()
             .filter(|m| m.direction == Direction::Out)
             .map(|m| (m.name, m.active))
             .collect();
-        assert_eq!(flags, vec![("Blue".to_string(), false), ("Red".to_string(), true)]);
+        assert_eq!(
+            flags,
+            vec![("Blue".to_string(), false), ("Red".to_string(), true)]
+        );
     }
 
     #[test]
@@ -532,7 +610,11 @@ mod tests {
         store.create("Blue", None, 1).unwrap();
         store.delete("Red").unwrap();
         store.create("Green", None, 1).unwrap();
-        let bits: BTreeMap<String, u32> = store.list().into_iter().map(|g| (g.name, g.bitpos)).collect();
+        let bits: BTreeMap<String, u32> = store
+            .list()
+            .into_iter()
+            .map(|g| (g.name, g.bitpos))
+            .collect();
         assert_eq!(bits[ANON_GROUP], 0);
         assert_eq!(bits["Blue"], 2);
         assert_eq!(bits["Green"], 3, "a deleted group's bitpos is never reused");
@@ -543,14 +625,33 @@ mod tests {
     fn grant_merges_directions_and_is_all_or_nothing() {
         let store = GroupStore::in_memory();
         store.create("Red", None, 1).unwrap();
-        store.grant("alpha", &grants_from(&[], &["Red".into()], &[])).unwrap();
-        store.grant("alpha", &grants_from(&[], &[], &["Red".into()])).unwrap();
-        assert_eq!(store.list().iter().find(|g| g.name == "Red").unwrap().members["alpha"], Membership::Both);
+        store
+            .grant("alpha", &grants_from(&[], &["Red".into()], &[]))
+            .unwrap();
+        store
+            .grant("alpha", &grants_from(&[], &[], &["Red".into()]))
+            .unwrap();
         assert_eq!(
-            store.grant("beta", &grants_from(&["Red".into(), "Nope".into()], &[], &[])),
+            store
+                .list()
+                .iter()
+                .find(|g| g.name == "Red")
+                .unwrap()
+                .members["alpha"],
+            Membership::Both
+        );
+        assert_eq!(
+            store.grant(
+                "beta",
+                &grants_from(&["Red".into(), "Nope".into()], &[], &[])
+            ),
             Err(GroupError::NotFound("Nope".into()))
         );
-        assert_eq!(store.all_group_names("beta"), set(&[ANON_GROUP]), "nothing applied");
+        assert_eq!(
+            store.all_group_names("beta"),
+            set(&[ANON_GROUP]),
+            "nothing applied"
+        );
     }
 
     #[test]
@@ -559,9 +660,18 @@ mod tests {
         assert_eq!(
             grants,
             vec![
-                GroupGrant { name: "A".into(), membership: Membership::Both },
-                GroupGrant { name: "B".into(), membership: Membership::In },
-                GroupGrant { name: "C".into(), membership: Membership::Both },
+                GroupGrant {
+                    name: "A".into(),
+                    membership: Membership::Both
+                },
+                GroupGrant {
+                    name: "B".into(),
+                    membership: Membership::In
+                },
+                GroupGrant {
+                    name: "C".into(),
+                    membership: Membership::Both
+                },
             ]
         );
     }
@@ -570,18 +680,26 @@ mod tests {
     fn names_are_validated_and_anon_is_protected() {
         let store = GroupStore::in_memory();
         for bad in ["", "  ", ANON_GROUP, "a\nb", &"x".repeat(65)] {
-            assert!(matches!(store.create(bad, None, 1), Err(GroupError::InvalidName(_))), "{bad:?}");
+            assert!(
+                matches!(store.create(bad, None, 1), Err(GroupError::InvalidName(_))),
+                "{bad:?}"
+            );
         }
         assert!(store.delete(ANON_GROUP).is_err());
         store.create("Red", None, 1).unwrap();
-        assert_eq!(store.create("Red", None, 1), Err(GroupError::AlreadyExists("Red".into())));
+        assert_eq!(
+            store.create("Red", None, 1),
+            Err(GroupError::AlreadyExists("Red".into()))
+        );
     }
 
     #[test]
     fn deleting_a_group_removes_its_memberships() {
         let store = GroupStore::in_memory();
         store.create("Red", None, 1).unwrap();
-        store.set_member("Red", "alpha", Some(Membership::Both)).unwrap();
+        store
+            .set_member("Red", "alpha", Some(Membership::Both))
+            .unwrap();
         store.delete("Red").unwrap();
         assert_eq!(store.all_group_names("alpha"), set(&[ANON_GROUP]));
     }
@@ -596,14 +714,24 @@ mod tests {
             let store = GroupStore::load_or_create(&path).unwrap();
             store.create("Red", Some("red team".into()), 5).unwrap();
             store.create("Blue", None, 6).unwrap();
-            store.set_member("Red", "alpha", Some(Membership::In)).unwrap();
-            store.set_member("Blue", "alpha", Some(Membership::Both)).unwrap();
+            store
+                .set_member("Red", "alpha", Some(Membership::In))
+                .unwrap();
+            store
+                .set_member("Blue", "alpha", Some(Membership::Both))
+                .unwrap();
             store.set_active("alpha", &set(&["Blue"])).unwrap();
         }
         let store = GroupStore::load_or_create(&path).unwrap();
-        assert_eq!(store.active_groups(Some("alpha"), Direction::In), set(&["Blue"]));
+        assert_eq!(
+            store.active_groups(Some("alpha"), Direction::In),
+            set(&["Blue"])
+        );
         let red = store.list().into_iter().find(|g| g.name == "Red").unwrap();
-        assert_eq!((red.bitpos, red.description.as_deref()), (1, Some("red team")));
+        assert_eq!(
+            (red.bitpos, red.description.as_deref()),
+            (1, Some("red team"))
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

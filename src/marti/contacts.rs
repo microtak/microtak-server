@@ -15,7 +15,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Extension, Json, Router};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::PeerIdentity;
 use crate::groups::{Direction, GroupStore};
@@ -31,14 +31,17 @@ pub struct ContactsState {
 }
 
 pub fn router(state: ContactsState) -> Router {
-    Router::new().route("/Marti/api/contacts/all", get(list_contacts)).with_state(state)
+    Router::new()
+        .route("/Marti/api/contacts/all", get(list_contacts))
+        .with_state(state)
 }
 
 /// team, role, takv from the latest report (`Subscription.setLatestSA`).
 fn sa_fields(xml: &str) -> (String, String, String, String) {
     use quick_xml::events::Event as X;
     let mut reader = quick_xml::Reader::from_str(xml);
-    let (mut team, mut role, mut platform, mut version, mut callsign) = (None, None, None, None, None);
+    let (mut team, mut role, mut platform, mut version, mut callsign) =
+        (None, None, None, None, None);
     let mut path: Vec<Vec<u8>> = Vec::new();
     loop {
         let (e, empty) = match reader.read_event() {
@@ -57,7 +60,11 @@ fn sa_fields(xml: &str) -> (String, String, String, String) {
                 e.attributes()
                     .flatten()
                     .find(|a| a.key.as_ref() == k.as_bytes())
-                    .and_then(|a| a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|v| v.into_owned()))
+                    .and_then(|a| {
+                        a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                            .ok()
+                            .map(|v| v.into_owned())
+                    })
             };
             match name.as_slice() {
                 b"__group" => {
@@ -79,7 +86,12 @@ fn sa_fields(xml: &str) -> (String, String, String, String) {
     let callsign = callsign.unwrap_or_default();
     match (team, role, platform, version) {
         (Some(t), Some(r), Some(p), Some(v)) => (callsign, t, r, format!("{p}:{v}")),
-        _ => (callsign, "unknown".into(), "unknown".into(), "unknown".into()),
+        _ => (
+            callsign,
+            "unknown".into(),
+            "unknown".into(),
+            "unknown".into(),
+        ),
     }
 }
 
@@ -91,7 +103,8 @@ pub fn callsign(xml: &str) -> String {
 /// `RemoteSubscription` / `RemoteSubscriptionLite` JSON for a connection.
 pub fn remote_subscription(endpoint: &ClientEndpoint, latest_cot: &LatestCot) -> Value {
     let uid = endpoint.uid.clone().unwrap_or_default();
-    let (callsign, team, role, takv) = match endpoint.uid.as_deref().and_then(|u| latest_cot.get(u)) {
+    let (callsign, team, role, takv) = match endpoint.uid.as_deref().and_then(|u| latest_cot.get(u))
+    {
         Some(event) => sa_fields(&event.xml),
         None => (String::new(), String::new(), String::new(), String::new()),
     };
@@ -107,23 +120,40 @@ pub fn remote_subscription(endpoint: &ClientEndpoint, latest_cot: &LatestCot) ->
 }
 
 /// The connections whose groups meet `groups` (all of them for the admin).
-pub fn reachable(state_clients: &ConnectedClients, groups_store: &GroupStore, groups: Option<&std::collections::BTreeSet<String>>) -> Vec<ClientEndpoint> {
+pub fn reachable(
+    state_clients: &ConnectedClients,
+    groups_store: &GroupStore,
+    groups: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<ClientEndpoint> {
     state_clients
         .list()
         .into_iter()
         .filter(|c| match (groups, &c.common_name) {
             (None, _) => true,
-            (Some(groups), Some(cn)) => groups_store.all_group_names(cn).iter().any(|g| groups.contains(g)),
+            (Some(groups), Some(cn)) => groups_store
+                .all_group_names(cn)
+                .iter()
+                .any(|g| groups.contains(g)),
             (Some(groups), None) => groups.contains(crate::groups::ANON_GROUP),
         })
         .collect()
 }
 
-async fn list_contacts(State(state): State<ContactsState>, Extension(identity): Extension<PeerIdentity>) -> Json<Vec<Value>> {
+async fn list_contacts(
+    State(state): State<ContactsState>,
+    Extension(identity): Extension<PeerIdentity>,
+) -> Json<Vec<Value>> {
     let admin = state.admin_common_name.as_deref() == Some(identity.0.as_str());
-    let out = state.groups.active_groups(Some(&identity.0), Direction::Out);
+    let out = state
+        .groups
+        .active_groups(Some(&identity.0), Direction::Out);
     let reachable = reachable(&state.clients, &state.groups, (!admin).then_some(&out));
-    Json(reachable.iter().map(|c| remote_subscription(c, &state.latest_cot)).collect())
+    Json(
+        reachable
+            .iter()
+            .map(|c| remote_subscription(c, &state.latest_cot))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -144,11 +174,19 @@ mod tests {
     }
 
     async fn contacts(state: &ContactsState, cn: &str) -> Vec<Value> {
-        let mut request = Request::builder().uri("/Marti/api/contacts/all").body(Body::empty()).unwrap();
+        let mut request = Request::builder()
+            .uri("/Marti/api/contacts/all")
+            .body(Body::empty())
+            .unwrap();
         request.extensions_mut().insert(PeerIdentity(cn.into()));
         let response = router(state.clone()).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
     }
 
     fn connect(state: &ContactsState, port: u16, cn: &str, uid: Option<&str>) {
@@ -178,21 +216,39 @@ mod tests {
             list[0],
             json!({ "filterGroups": null, "notes": "device-a", "callsign": "ALPHA", "team": "Cyan", "role": "Team Member", "takv": "ATAK-CIV:5.6.0", "uid": "UID-A" })
         );
-        assert_eq!((list[1]["team"].as_str(), list[1]["takv"].as_str()), (Some("unknown"), Some("unknown")));
-        assert_eq!(list[2]["uid"], "", "listed before its first report, without a uid");
+        assert_eq!(
+            (list[1]["team"].as_str(), list[1]["takv"].as_str()),
+            (Some("unknown"), Some("unknown"))
+        );
+        assert_eq!(
+            list[2]["uid"], "",
+            "listed before its first report, without a uid"
+        );
     }
 
     #[tokio::test]
     async fn contacts_are_limited_to_reachable_groups() {
         let s = state();
         s.groups.create("Red", None, 0).unwrap();
-        s.groups.set_member("Red", "red-1", Some(crate::groups::Membership::Both)).unwrap();
-        s.groups.set_member("Red", "red-2", Some(crate::groups::Membership::Both)).unwrap();
+        s.groups
+            .set_member("Red", "red-1", Some(crate::groups::Membership::Both))
+            .unwrap();
+        s.groups
+            .set_member("Red", "red-2", Some(crate::groups::Membership::Both))
+            .unwrap();
         connect(&s, 1, "red-1", Some("R1"));
         connect(&s, 2, "anon", Some("A1"));
-        let red: Vec<String> = contacts(&s, "red-2").await.iter().map(|c| c["uid"].as_str().unwrap().to_string()).collect();
+        let red: Vec<String> = contacts(&s, "red-2")
+            .await
+            .iter()
+            .map(|c| c["uid"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(red, ["R1"]);
-        let anon: Vec<String> = contacts(&s, "other").await.iter().map(|c| c["uid"].as_str().unwrap().to_string()).collect();
+        let anon: Vec<String> = contacts(&s, "other")
+            .await
+            .iter()
+            .map(|c| c["uid"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(anon, ["A1"]);
     }
 }

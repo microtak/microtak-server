@@ -29,7 +29,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::PeerIp;
-use crate::ratelimit::{user_key, AuthLimiter};
+use crate::ratelimit::{AuthLimiter, user_key};
 use crate::users::UserStore;
 use tracing::warn;
 
@@ -43,8 +43,14 @@ pub struct OAuthState {
 pub fn router(users: Arc<UserStore>, limiter: Arc<AuthLimiter>, signer: Arc<JwtSigner>) -> Router {
     Router::new()
         .route("/oauth/token", post(token))
-        .layer(DefaultBodyLimit::max(super::enrollment::MAX_REQUEST_BODY_BYTES))
-        .with_state(OAuthState { users, limiter, signer })
+        .layer(DefaultBodyLimit::max(
+            super::enrollment::MAX_REQUEST_BODY_BYTES,
+        ))
+        .with_state(OAuthState {
+            users,
+            limiter,
+            signer,
+        })
 }
 
 /// Access-token lifetime: the official default `httpSessionTimeoutMinutes`
@@ -82,7 +88,8 @@ impl JwtSigner {
     pub fn load_or_create(data_dir: &std::path::Path) -> Result<Self, JwtSignerError> {
         let path = data_dir.join("oauth-signing-key.pem");
         if let Ok(pem) = std::fs::read_to_string(&path) {
-            let key = rcgen::KeyPair::from_pem(&pem).map_err(|e| JwtSignerError::Key(e.to_string()))?;
+            let key =
+                rcgen::KeyPair::from_pem(&pem).map_err(|e| JwtSignerError::Key(e.to_string()))?;
             return Self::from_pkcs8(&key.serialize_der());
         }
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)?;
@@ -91,8 +98,12 @@ impl JwtSigner {
     }
 
     fn from_pkcs8(der: &[u8]) -> Result<Self, JwtSignerError> {
-        let key = ring::signature::RsaKeyPair::from_pkcs8(der).map_err(|e| JwtSignerError::Key(e.to_string()))?;
-        Ok(Self { key, kid: super::envelope::random_uuid() })
+        let key = ring::signature::RsaKeyPair::from_pkcs8(der)
+            .map_err(|e| JwtSignerError::Key(e.to_string()))?;
+        Ok(Self {
+            key,
+            kid: super::envelope::random_uuid(),
+        })
     }
 
     /// DER `RSAPublicKey` (PKCS#1), for verifying.
@@ -129,10 +140,12 @@ impl JwtSigner {
                 &mut signature,
             )
             .expect("RSA signing with a valid key");
-        format!("{signing_input}.{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature))
+        format!(
+            "{signing_input}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature)
+        )
     }
 }
-
 
 #[derive(Deserialize)]
 struct TokenRequest {
@@ -217,7 +230,8 @@ mod tests {
             .collect();
         let mut bytes = Vec::new();
         for chunk in sextets.chunks(4) {
-            let n = chunk.iter().fold(0u32, |acc, s| (acc << 6) | *s as u32) << (6 * (4 - chunk.len()));
+            let n =
+                chunk.iter().fold(0u32, |acc, s| (acc << 6) | *s as u32) << (6 * (4 - chunk.len()));
             let out = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
             bytes.extend_from_slice(&out[..chunk.len().saturating_sub(1)]);
         }
@@ -227,7 +241,12 @@ mod tests {
     }
 
     fn decode_segment(segment: &str) -> serde_json::Value {
-        serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(segment).unwrap()).unwrap()
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(segment)
+                .unwrap(),
+        )
+        .unwrap()
     }
 
     /// The official token (Spring Authorization Server JwtGenerator +
@@ -244,11 +263,23 @@ mod tests {
         let header = decode_segment(segments[0]);
         assert_eq!(header["alg"], "RS256");
         assert_eq!(header["kid"].as_str().unwrap().len(), 36);
-        assert_eq!(segments[0].len() % 4, 0, "header must decode on a 4-char boundary");
-        let raw_header = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(segments[0]).unwrap();
+        assert_eq!(
+            segments[0].len() % 4,
+            0,
+            "header must decode on a 4-char boundary"
+        );
+        let raw_header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(segments[0])
+            .unwrap();
         let raw_header = String::from_utf8(raw_header).unwrap();
-        assert!(raw_header.starts_with(r#"{"kid":""#), "Spring/Nimbus header order: {raw_header}");
-        assert!(raw_header.ends_with(r#"","alg":"RS256"}"#), "Spring/Nimbus header order: {raw_header}");
+        assert!(
+            raw_header.starts_with(r#"{"kid":""#),
+            "Spring/Nimbus header order: {raw_header}"
+        );
+        assert!(
+            raw_header.ends_with(r#"","alg":"RS256"}"#),
+            "Spring/Nimbus header order: {raw_header}"
+        );
 
         let claims = decode_segment(segments[1]);
         assert_eq!(claims["sub"], "jz");
@@ -264,10 +295,15 @@ mod tests {
         assert_eq!(parsed["exp"], 1_760_000_000 + 3600);
 
         let signing_input = format!("{}.{}", segments[0], segments[1]);
-        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(segments[2]).unwrap();
-        ring::signature::UnparsedPublicKey::new(&ring::signature::RSA_PKCS1_2048_8192_SHA256, signer.public_key_der())
-            .verify(signing_input.as_bytes(), &signature)
-            .expect("a valid RS256 signature");
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(segments[2])
+            .unwrap();
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+            signer.public_key_der(),
+        )
+        .verify(signing_input.as_bytes(), &signature)
+        .expect("a valid RS256 signature");
     }
 
     #[test]
@@ -280,7 +316,11 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.join("oauth-signing-key.pem")).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(dir.join("oauth-signing-key.pem"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600);
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -290,7 +330,11 @@ mod tests {
     use tower::ServiceExt;
 
     fn app_with(users: Arc<UserStore>) -> Router {
-        router(users, Arc::new(AuthLimiter::default()), Arc::new(JwtSigner::generate().unwrap()))
+        router(
+            users,
+            Arc::new(AuthLimiter::default()),
+            Arc::new(JwtSigner::generate().unwrap()),
+        )
     }
 
     async fn post_token(app: Router, username: &str, password: &str) -> Response {
@@ -330,11 +374,18 @@ mod tests {
 
         let response = post_token(app_with(users), "jz", "correct horse battery staple").await;
         assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let token = body["access_token"].as_str().unwrap();
-        assert_eq!(token.split('.').count(), 3, "expected header.payload.signature");
+        assert_eq!(
+            token.split('.').count(),
+            3,
+            "expected header.payload.signature"
+        );
 
         // The real client's own decode: base64-decode the whole thing and
         // pull the second `}`-delimited JSON chunk out (see this module's
@@ -355,11 +406,19 @@ mod tests {
 
         let response = post_token(app_with(users), "jz", "wrong").await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(body["error"], "invalid_grant");
-        assert!(body["error_description"].as_str().unwrap().contains("Bad credentials"));
+        assert!(
+            body["error_description"]
+                .as_str()
+                .unwrap()
+                .contains("Bad credentials")
+        );
     }
 
     #[tokio::test]
@@ -375,10 +434,17 @@ mod tests {
     #[tokio::test]
     async fn repeated_wrong_passwords_are_rate_limited() {
         let users = Arc::new(UserStore::in_memory());
-        users.mint("alice", "correct horse battery staple", 0).unwrap();
+        users
+            .mint("alice", "correct horse battery staple", 0)
+            .unwrap();
         let app = router(
             users,
-            Arc::new(AuthLimiter::new(3, std::time::Duration::from_secs(300), 100, 1)),
+            Arc::new(AuthLimiter::new(
+                3,
+                std::time::Duration::from_secs(300),
+                100,
+                1,
+            )),
             Arc::new(JwtSigner::generate().unwrap()),
         );
 

@@ -101,7 +101,9 @@ impl Admission {
         peer: SocketAddr,
     ) -> Option<(SocketAddr, Permit)> {
         let client = if self.inner.proxy_protocol_from.contains(peer.ip()) {
-            match crate::transport::proxy_protocol::read_header(stream, self.handshake_timeout()).await {
+            match crate::transport::proxy_protocol::read_header(stream, self.handshake_timeout())
+                .await
+            {
                 Ok(Some(client)) => client,
                 Ok(None) => peer,
                 Err(error) => {
@@ -193,7 +195,10 @@ mod tests {
         let admission = Admission::new(limits(10, 2));
         let _a1 = admission.admit(A).unwrap();
         let _a2 = admission.admit(A).unwrap();
-        assert!(admission.admit(A).is_none(), "third from A is over the per-IP limit");
+        assert!(
+            admission.admit(A).is_none(),
+            "third from A is over the per-IP limit"
+        );
         assert!(admission.admit(B).is_some(), "B has its own allowance");
     }
 

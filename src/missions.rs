@@ -183,11 +183,15 @@ impl MissionRecord {
     }
 
     pub fn uids(&self) -> impl Iterator<Item = &ContentAdd> {
-        self.contents.iter().filter(|c| matches!(c.content, Content::Uid(_)))
+        self.contents
+            .iter()
+            .filter(|c| matches!(c.content, Content::Uid(_)))
     }
 
     pub fn hashes(&self) -> impl Iterator<Item = &ContentAdd> {
-        self.contents.iter().filter(|c| matches!(c.content, Content::Hash(_)))
+        self.contents
+            .iter()
+            .filter(|c| matches!(c.content, Content::Hash(_)))
     }
 }
 
@@ -343,7 +347,10 @@ pub struct Window {
 }
 
 impl Window {
-    pub const ALL: Window = Window { start_ms: i64::MIN, end_ms: i64::MAX };
+    pub const ALL: Window = Window {
+        start_ms: i64::MIN,
+        end_ms: i64::MAX,
+    };
 
     fn contains(&self, t: i64) -> bool {
         self.start_ms <= t && t <= self.end_ms
@@ -352,28 +359,110 @@ impl Window {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Event {
-    Created { mission: Box<MissionRecord>, change_id: u64 },
-    FieldsSet { guid: String, fields: MissionFields, at_ms: i64 },
-    PasswordSet { guid: String, password_hash: Option<String>, at_ms: i64 },
-    DefaultRoleSet { guid: String, role: Option<Role>, at_ms: i64 },
-    GroupsSet { guid: String, groups: BTreeSet<String>, at_ms: i64 },
-    KeywordsSet { guid: String, keywords: BTreeSet<String>, at_ms: i64 },
-    ContentKeywordsSet { guid: String, content: Content, keywords: Vec<String> },
-    Deleted { guid: String, creator_uid: String, at_ms: i64, change_id: u64 },
-    ContentAdded { guid: String, content: Content, creator_uid: String, at_ms: i64, change_id: u64 },
-    ContentRemoved { guid: String, content: Content, creator_uid: String, at_ms: i64, change_id: u64 },
-    Subscribed { guid: String, subscription: SubscriptionRecord },
-    SubscriptionRoleSet { guid: String, id: String, role: Role },
-    Unsubscribed { guid: String, id: String },
-    Invited { invitation: InvitationRecord },
-    Uninvited { guid: String, invitee: String, invitation_type: InvitationType },
-    LogEntrySaved { entry: LogEntryRecord },
-    LogEntryDeleted { id: String },
-    LayerSaved { guid: String, layer: LayerRecord },
-    LayerNamed { guid: String, uid: String, name: String },
-    LayerParentSet { guid: String, uid: String, parent: Option<String> },
-    LayerAfterSet { guid: String, uid: String, after: Option<String> },
-    LayerDeleted { guid: String, uid: String },
+    Created {
+        mission: Box<MissionRecord>,
+        change_id: u64,
+    },
+    FieldsSet {
+        guid: String,
+        fields: MissionFields,
+        at_ms: i64,
+    },
+    PasswordSet {
+        guid: String,
+        password_hash: Option<String>,
+        at_ms: i64,
+    },
+    DefaultRoleSet {
+        guid: String,
+        role: Option<Role>,
+        at_ms: i64,
+    },
+    GroupsSet {
+        guid: String,
+        groups: BTreeSet<String>,
+        at_ms: i64,
+    },
+    KeywordsSet {
+        guid: String,
+        keywords: BTreeSet<String>,
+        at_ms: i64,
+    },
+    ContentKeywordsSet {
+        guid: String,
+        content: Content,
+        keywords: Vec<String>,
+    },
+    Deleted {
+        guid: String,
+        creator_uid: String,
+        at_ms: i64,
+        change_id: u64,
+    },
+    ContentAdded {
+        guid: String,
+        content: Content,
+        creator_uid: String,
+        at_ms: i64,
+        change_id: u64,
+    },
+    ContentRemoved {
+        guid: String,
+        content: Content,
+        creator_uid: String,
+        at_ms: i64,
+        change_id: u64,
+    },
+    Subscribed {
+        guid: String,
+        subscription: SubscriptionRecord,
+    },
+    SubscriptionRoleSet {
+        guid: String,
+        id: String,
+        role: Role,
+    },
+    Unsubscribed {
+        guid: String,
+        id: String,
+    },
+    Invited {
+        invitation: InvitationRecord,
+    },
+    Uninvited {
+        guid: String,
+        invitee: String,
+        invitation_type: InvitationType,
+    },
+    LogEntrySaved {
+        entry: LogEntryRecord,
+    },
+    LogEntryDeleted {
+        id: String,
+    },
+    LayerSaved {
+        guid: String,
+        layer: LayerRecord,
+    },
+    LayerNamed {
+        guid: String,
+        uid: String,
+        name: String,
+    },
+    LayerParentSet {
+        guid: String,
+        uid: String,
+        parent: Option<String>,
+    },
+    LayerAfterSet {
+        guid: String,
+        uid: String,
+        after: Option<String>,
+    },
+    LayerDeleted {
+        guid: String,
+        uid: String,
+    },
 }
 
 #[derive(Default)]
@@ -405,13 +494,21 @@ fn apply(state: &mut State, event: &Event) {
             state.next_change_id = state.next_change_id.max(change_id + 1);
             state.missions.insert(mission.guid.clone(), mission);
         }
-        Event::FieldsSet { guid, fields, at_ms } => {
+        Event::FieldsSet {
+            guid,
+            fields,
+            at_ms,
+        } => {
             if let Some(m) = state.missions.get_mut(&guid) {
                 m.fields = fields;
                 m.last_edited_ms = at_ms;
             }
         }
-        Event::PasswordSet { guid, password_hash, at_ms } => {
+        Event::PasswordSet {
+            guid,
+            password_hash,
+            at_ms,
+        } => {
             if let Some(m) = state.missions.get_mut(&guid) {
                 m.password_hash = password_hash;
                 m.last_edited_ms = at_ms;
@@ -423,19 +520,31 @@ fn apply(state: &mut State, event: &Event) {
                 m.last_edited_ms = at_ms;
             }
         }
-        Event::GroupsSet { guid, groups, at_ms } => {
+        Event::GroupsSet {
+            guid,
+            groups,
+            at_ms,
+        } => {
             if let Some(m) = state.missions.get_mut(&guid) {
                 m.groups = groups;
                 m.last_edited_ms = at_ms;
             }
         }
-        Event::KeywordsSet { guid, keywords, at_ms } => {
+        Event::KeywordsSet {
+            guid,
+            keywords,
+            at_ms,
+        } => {
             if let Some(m) = state.missions.get_mut(&guid) {
                 m.keywords = keywords;
                 m.last_edited_ms = at_ms;
             }
         }
-        Event::ContentKeywordsSet { guid, content, keywords } => {
+        Event::ContentKeywordsSet {
+            guid,
+            content,
+            keywords,
+        } => {
             if let Some(m) = state.missions.get_mut(&guid) {
                 if keywords.is_empty() {
                     m.content_keywords.remove(&content);
@@ -444,7 +553,12 @@ fn apply(state: &mut State, event: &Event) {
                 }
             }
         }
-        Event::Deleted { guid, creator_uid, at_ms, change_id } => {
+        Event::Deleted {
+            guid,
+            creator_uid,
+            at_ms,
+            change_id,
+        } => {
             if let Some(m) = state.missions.get_mut(&guid) {
                 m.deleted = true;
                 state.changes.push(ChangeRecord {
@@ -460,11 +574,21 @@ fn apply(state: &mut State, event: &Event) {
             }
             state.next_change_id = state.next_change_id.max(change_id + 1);
         }
-        Event::ContentAdded { guid, content, creator_uid, at_ms, change_id } => {
+        Event::ContentAdded {
+            guid,
+            content,
+            creator_uid,
+            at_ms,
+            change_id,
+        } => {
             if let Some(m) = state.missions.get_mut(&guid) {
                 // An item shows its latest ADD_CONTENT change, ordered by it.
                 m.contents.retain(|c| c.content != content);
-                m.contents.push(ContentAdd { content: content.clone(), timestamp_ms: at_ms, creator_uid: creator_uid.clone() });
+                m.contents.push(ContentAdd {
+                    content: content.clone(),
+                    timestamp_ms: at_ms,
+                    creator_uid: creator_uid.clone(),
+                });
                 state.changes.push(ChangeRecord {
                     id: change_id,
                     change_type: ChangeType::AddContent,
@@ -478,7 +602,13 @@ fn apply(state: &mut State, event: &Event) {
             }
             state.next_change_id = state.next_change_id.max(change_id + 1);
         }
-        Event::ContentRemoved { guid, content, creator_uid, at_ms, change_id } => {
+        Event::ContentRemoved {
+            guid,
+            content,
+            creator_uid,
+            at_ms,
+            change_id,
+        } => {
             if let Some(m) = state.missions.get_mut(&guid) {
                 m.contents.retain(|c| c.content != content);
                 state.changes.push(ChangeRecord {
@@ -495,10 +625,18 @@ fn apply(state: &mut State, event: &Event) {
             state.next_change_id = state.next_change_id.max(change_id + 1);
         }
         Event::Subscribed { guid, subscription } => {
-            state.subscriptions.entry(guid).or_default().push(subscription);
+            state
+                .subscriptions
+                .entry(guid)
+                .or_default()
+                .push(subscription);
         }
         Event::SubscriptionRoleSet { guid, id, role } => {
-            if let Some(sub) = state.subscriptions.get_mut(&guid).and_then(|subs| subs.iter_mut().find(|s| s.id == id)) {
+            if let Some(sub) = state
+                .subscriptions
+                .get_mut(&guid)
+                .and_then(|subs| subs.iter_mut().find(|s| s.id == id))
+            {
                 sub.role = role;
             }
         }
@@ -515,9 +653,15 @@ fn apply(state: &mut State, event: &Event) {
             });
             state.invitations.push(invitation);
         }
-        Event::Uninvited { guid, invitee, invitation_type } => {
+        Event::Uninvited {
+            guid,
+            invitee,
+            invitation_type,
+        } => {
             state.invitations.retain(|i| {
-                !(i.mission_guid == guid && i.invitation_type == invitation_type && i.invitee.eq_ignore_ascii_case(&invitee))
+                !(i.mission_guid == guid
+                    && i.invitation_type == invitation_type
+                    && i.invitee.eq_ignore_ascii_case(&invitee))
             });
         }
         Event::LogEntrySaved { entry } => {
@@ -555,7 +699,11 @@ fn apply(state: &mut State, event: &Event) {
 }
 
 fn layer_mut<'a>(state: &'a mut State, guid: &str, uid: &str) -> Option<&'a mut LayerRecord> {
-    state.layers.get_mut(guid)?.iter_mut().find(|l| l.uid == uid)
+    state
+        .layers
+        .get_mut(guid)?
+        .iter_mut()
+        .find(|l| l.uid == uid)
 }
 
 /// A layer with its children, as `MissionLayer` hydrates.
@@ -589,7 +737,9 @@ pub fn sort_layers(unsorted: Vec<LayerRecord>) -> Vec<LayerRecord> {
                 if inner == outer {
                     continue;
                 }
-                if sorted[inner].after.as_deref() == Some(sorted[outer].uid.as_str()) && inner != outer + 1 {
+                if sorted[inner].after.as_deref() == Some(sorted[outer].uid.as_str())
+                    && inner != outer + 1
+                {
                     if outer + 1 == sorted.len() {
                         let item = sorted.remove(inner);
                         sorted.push(item);
@@ -610,7 +760,11 @@ pub fn sort_layers(unsorted: Vec<LayerRecord>) -> Vec<LayerRecord> {
 fn has_cycle(check: &LayerRecord, layers: &[LayerRecord]) -> bool {
     let mut seen = BTreeSet::from([check.uid.clone()]);
     let mut current = check;
-    while let Some(prev) = current.after.as_ref().and_then(|a| layers.iter().find(|l| &l.uid == a)) {
+    while let Some(prev) = current
+        .after
+        .as_ref()
+        .and_then(|a| layers.iter().find(|l| &l.uid == a))
+    {
         if !seen.insert(prev.uid.clone()) {
             return true;
         }
@@ -640,13 +794,19 @@ pub struct MissionStore {
 
 impl MissionStore {
     pub fn in_memory() -> Self {
-        Self { state: RwLock::new(State::default()), log: None }
+        Self {
+            state: RwLock::new(State::default()),
+            log: None,
+        }
     }
 
     pub fn load_or_create(path: impl Into<PathBuf>) -> Result<Self, MissionError> {
         let mut state = State::default();
         let log = EventLog::open_and_replay(path, &mut state, apply)?;
-        Ok(Self { state: RwLock::new(state), log: Some(log) })
+        Ok(Self {
+            state: RwLock::new(state),
+            log: Some(log),
+        })
     }
 
     fn record(&self, state: &mut State, event: Event) -> Result<(), MissionError> {
@@ -658,7 +818,10 @@ impl MissionStore {
     }
 
     fn existing<'a>(state: &'a State, guid: &str) -> Result<&'a MissionRecord, MissionError> {
-        state.missions.get(guid).ok_or_else(|| MissionError::NotFound(guid.to_string()))
+        state
+            .missions
+            .get(guid)
+            .ok_or_else(|| MissionError::NotFound(guid.to_string()))
     }
 
     /// `MissionService.createMission`: stores the mission and its
@@ -683,7 +846,13 @@ impl MissionStore {
             deleted: false,
         };
         let change_id = state.next_change_id;
-        self.record(&mut state, Event::Created { mission: Box::new(mission.clone()), change_id })?;
+        self.record(
+            &mut state,
+            Event::Created {
+                mission: Box::new(mission.clone()),
+                change_id,
+            },
+        )?;
         Ok(mission)
     }
 
@@ -693,7 +862,11 @@ impl MissionStore {
 
     /// The newest undeleted mission called `name` (trimmed) among those
     /// `visible` accepts.
-    pub fn by_name(&self, name: &str, visible: impl Fn(&MissionRecord) -> bool) -> Option<MissionRecord> {
+    pub fn by_name(
+        &self,
+        name: &str,
+        visible: impl Fn(&MissionRecord) -> bool,
+    ) -> Option<MissionRecord> {
         let name = name.trim();
         let state = self.state.read().unwrap();
         state
@@ -709,51 +882,129 @@ impl MissionStore {
     pub fn is_deleted_name(&self, name: &str) -> bool {
         let name = name.trim();
         let state = self.state.read().unwrap();
-        let mut same = state.missions.values().filter(|m| m.name == name).peekable();
+        let mut same = state
+            .missions
+            .values()
+            .filter(|m| m.name == name)
+            .peekable();
         same.peek().is_some() && same.all(|m| m.deleted)
     }
 
     /// Every undeleted mission.
     pub fn list(&self) -> Vec<MissionRecord> {
         let state = self.state.read().unwrap();
-        let mut missions: Vec<_> = state.missions.values().filter(|m| !m.deleted).cloned().collect();
-        missions.sort_by(|a, b| a.name.cmp(&b.name).then(a.create_time_ms.cmp(&b.create_time_ms)));
+        let mut missions: Vec<_> = state
+            .missions
+            .values()
+            .filter(|m| !m.deleted)
+            .cloned()
+            .collect();
+        missions.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then(a.create_time_ms.cmp(&b.create_time_ms))
+        });
         missions
     }
 
-    pub fn set_fields(&self, guid: &str, fields: MissionFields, now_ms: i64) -> Result<(), MissionError> {
+    pub fn set_fields(
+        &self,
+        guid: &str,
+        fields: MissionFields,
+        now_ms: i64,
+    ) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, guid)?;
-        self.record(&mut state, Event::FieldsSet { guid: guid.into(), fields, at_ms: now_ms })
+        self.record(
+            &mut state,
+            Event::FieldsSet {
+                guid: guid.into(),
+                fields,
+                at_ms: now_ms,
+            },
+        )
     }
 
-    pub fn set_password(&self, guid: &str, password_hash: Option<String>, now_ms: i64) -> Result<(), MissionError> {
+    pub fn set_password(
+        &self,
+        guid: &str,
+        password_hash: Option<String>,
+        now_ms: i64,
+    ) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, guid)?;
-        self.record(&mut state, Event::PasswordSet { guid: guid.into(), password_hash, at_ms: now_ms })
+        self.record(
+            &mut state,
+            Event::PasswordSet {
+                guid: guid.into(),
+                password_hash,
+                at_ms: now_ms,
+            },
+        )
     }
 
-    pub fn set_default_role(&self, guid: &str, role: Option<Role>, now_ms: i64) -> Result<(), MissionError> {
+    pub fn set_default_role(
+        &self,
+        guid: &str,
+        role: Option<Role>,
+        now_ms: i64,
+    ) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, guid)?;
-        self.record(&mut state, Event::DefaultRoleSet { guid: guid.into(), role, at_ms: now_ms })
+        self.record(
+            &mut state,
+            Event::DefaultRoleSet {
+                guid: guid.into(),
+                role,
+                at_ms: now_ms,
+            },
+        )
     }
 
-    pub fn set_groups(&self, guid: &str, groups: BTreeSet<String>, now_ms: i64) -> Result<(), MissionError> {
+    pub fn set_groups(
+        &self,
+        guid: &str,
+        groups: BTreeSet<String>,
+        now_ms: i64,
+    ) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, guid)?;
-        self.record(&mut state, Event::GroupsSet { guid: guid.into(), groups, at_ms: now_ms })
+        self.record(
+            &mut state,
+            Event::GroupsSet {
+                guid: guid.into(),
+                groups,
+                at_ms: now_ms,
+            },
+        )
     }
 
-    pub fn set_keywords(&self, guid: &str, keywords: BTreeSet<String>, now_ms: i64) -> Result<(), MissionError> {
+    pub fn set_keywords(
+        &self,
+        guid: &str,
+        keywords: BTreeSet<String>,
+        now_ms: i64,
+    ) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, guid)?;
-        self.record(&mut state, Event::KeywordsSet { guid: guid.into(), keywords, at_ms: now_ms })
+        self.record(
+            &mut state,
+            Event::KeywordsSet {
+                guid: guid.into(),
+                keywords,
+                at_ms: now_ms,
+            },
+        )
     }
 
     /// Replaces the keywords of one uid or hash (duplicates dropped, as
     /// the official unique constraint does); empty clears them.
-    pub fn set_content_keywords(&self, guid: &str, content: Content, keywords: Vec<String>) -> Result<(), MissionError> {
+    pub fn set_content_keywords(
+        &self,
+        guid: &str,
+        content: Content,
+        keywords: Vec<String>,
+    ) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, guid)?;
         let mut unique = Vec::new();
@@ -762,40 +1013,81 @@ impl MissionStore {
                 unique.push(k);
             }
         }
-        self.record(&mut state, Event::ContentKeywordsSet { guid: guid.into(), content, keywords: unique })
+        self.record(
+            &mut state,
+            Event::ContentKeywordsSet {
+                guid: guid.into(),
+                content,
+                keywords: unique,
+            },
+        )
     }
 
     /// `MissionService.deleteMission`: flags it deleted, `DELETE_MISSION`.
-    pub fn delete(&self, guid: &str, creator_uid: &str, now_ms: i64) -> Result<MissionRecord, MissionError> {
+    pub fn delete(
+        &self,
+        guid: &str,
+        creator_uid: &str,
+        now_ms: i64,
+    ) -> Result<MissionRecord, MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, guid)?;
         let change_id = state.next_change_id;
         self.record(
             &mut state,
-            Event::Deleted { guid: guid.into(), creator_uid: creator_uid.into(), at_ms: now_ms, change_id },
+            Event::Deleted {
+                guid: guid.into(),
+                creator_uid: creator_uid.into(),
+                at_ms: now_ms,
+                change_id,
+            },
         )?;
         Ok(state.missions[guid].clone())
     }
 
     /// Adds content (an `ADD_CONTENT` change even if it was already there,
     /// as the official server records one per request).
-    pub fn add_content(&self, guid: &str, content: Content, creator_uid: &str, now_ms: i64) -> Result<(), MissionError> {
+    pub fn add_content(
+        &self,
+        guid: &str,
+        content: Content,
+        creator_uid: &str,
+        now_ms: i64,
+    ) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, guid)?;
         let change_id = state.next_change_id;
         self.record(
             &mut state,
-            Event::ContentAdded { guid: guid.into(), content, creator_uid: creator_uid.into(), at_ms: now_ms, change_id },
+            Event::ContentAdded {
+                guid: guid.into(),
+                content,
+                creator_uid: creator_uid.into(),
+                at_ms: now_ms,
+                change_id,
+            },
         )
     }
 
-    pub fn remove_content(&self, guid: &str, content: Content, creator_uid: &str, now_ms: i64) -> Result<(), MissionError> {
+    pub fn remove_content(
+        &self,
+        guid: &str,
+        content: Content,
+        creator_uid: &str,
+        now_ms: i64,
+    ) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, guid)?;
         let change_id = state.next_change_id;
         self.record(
             &mut state,
-            Event::ContentRemoved { guid: guid.into(), content, creator_uid: creator_uid.into(), at_ms: now_ms, change_id },
+            Event::ContentRemoved {
+                guid: guid.into(),
+                content,
+                creator_uid: creator_uid.into(),
+                at_ms: now_ms,
+                change_id,
+            },
         )
     }
 
@@ -805,10 +1097,18 @@ impl MissionStore {
     /// still in the mission, or the latest remove of content no longer in
     /// it -- rows are filtered by the window before squashing, as the SQL's
     /// `where` runs before its `group by`.
-    pub fn changes(&self, guid: &str, window: Window, squashed: bool) -> Result<Vec<ChangeRecord>, MissionError> {
+    pub fn changes(
+        &self,
+        guid: &str,
+        window: Window,
+        squashed: bool,
+    ) -> Result<Vec<ChangeRecord>, MissionError> {
         let state = self.state.read().unwrap();
         let mission = Self::existing(&state, guid)?;
-        let mine = state.changes.iter().filter(|c| c.mission_guid == guid && window.contains(c.server_time_ms));
+        let mine = state
+            .changes
+            .iter()
+            .filter(|c| c.mission_guid == guid && window.contains(c.server_time_ms));
         let mut result: Vec<ChangeRecord> = if !squashed {
             mine.cloned().collect()
         } else {
@@ -837,7 +1137,11 @@ impl MissionStore {
                         if is_add != present {
                             continue;
                         }
-                        let key = (u8::from(is_add), content.clone(), change.creator_uid.clone());
+                        let key = (
+                            u8::from(is_add),
+                            content.clone(),
+                            change.creator_uid.clone(),
+                        );
                         // max(id), max(ts), max(servertime) per group
                         let entry = squashed.entry(key).or_insert_with(|| change.clone());
                         entry.id = entry.id.max(change.id);
@@ -847,7 +1151,10 @@ impl MissionStore {
                     _ => {}
                 }
             }
-            lifecycle.into_iter().chain(squashed.into_values()).collect()
+            lifecycle
+                .into_iter()
+                .chain(squashed.into_values())
+                .collect()
         };
         result.sort_by_key(|c| std::cmp::Reverse(c.id));
         Ok(result)
@@ -873,11 +1180,21 @@ impl MissionStore {
         let existing = state
             .subscriptions
             .get(guid)
-            .and_then(|subs| subs.iter().find(|s| s.client_uid == client_uid && s.username == username))
+            .and_then(|subs| {
+                subs.iter()
+                    .find(|s| s.client_uid == client_uid && s.username == username)
+            })
             .cloned();
         if let Some(mut sub) = existing {
             if sub.role != role && role.has_all(sub.role) {
-                self.record(&mut state, Event::SubscriptionRoleSet { guid: guid.into(), id: sub.id.clone(), role })?;
+                self.record(
+                    &mut state,
+                    Event::SubscriptionRoleSet {
+                        guid: guid.into(),
+                        id: sub.id.clone(),
+                        role,
+                    },
+                )?;
                 sub.role = role;
             }
             return Ok(sub);
@@ -891,20 +1208,39 @@ impl MissionStore {
             create_time_ms: now_ms,
             role,
         };
-        self.record(&mut state, Event::Subscribed { guid: guid.into(), subscription: subscription.clone() })?;
+        self.record(
+            &mut state,
+            Event::Subscribed {
+                guid: guid.into(),
+                subscription: subscription.clone(),
+            },
+        )?;
         Ok(subscription)
     }
 
     pub fn subscriptions(&self, guid: &str) -> Vec<SubscriptionRecord> {
-        self.state.read().unwrap().subscriptions.get(guid).cloned().unwrap_or_default()
+        self.state
+            .read()
+            .unwrap()
+            .subscriptions
+            .get(guid)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn subscription_by_id(&self, guid: &str, id: &str) -> Option<SubscriptionRecord> {
         self.subscriptions(guid).into_iter().find(|s| s.id == id)
     }
 
-    pub fn find_subscription(&self, guid: &str, client_uid: &str, username: &str) -> Option<SubscriptionRecord> {
-        self.subscriptions(guid).into_iter().find(|s| s.client_uid == client_uid && s.username == username)
+    pub fn find_subscription(
+        &self,
+        guid: &str,
+        client_uid: &str,
+        username: &str,
+    ) -> Option<SubscriptionRecord> {
+        self.subscriptions(guid)
+            .into_iter()
+            .find(|s| s.client_uid == client_uid && s.username == username)
     }
 
     /// Every stored subscription: (mission guid, mission name, client uid).
@@ -914,15 +1250,26 @@ impl MissionStore {
             .subscriptions
             .iter()
             .flat_map(|(guid, subs)| {
-                let name = state.missions.get(guid).map(|m| m.name.clone()).unwrap_or_default();
-                subs.iter().map(move |s| (guid.clone(), name.clone(), s.client_uid.clone()))
+                let name = state
+                    .missions
+                    .get(guid)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_default();
+                subs.iter()
+                    .map(move |s| (guid.clone(), name.clone(), s.client_uid.clone()))
             })
             .collect()
     }
 
     /// `MissionService.setRoleByClientUidOrUsername`: by username if given,
     /// else by client uid. Returns how many subscriptions changed.
-    pub fn set_subscription_role(&self, guid: &str, client_uid: &str, username: &str, role: Role) -> Result<usize, MissionError> {
+    pub fn set_subscription_role(
+        &self,
+        guid: &str,
+        client_uid: &str,
+        username: &str,
+        role: Role,
+    ) -> Result<usize, MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, guid)?;
         let ids: Vec<String> = state
@@ -930,13 +1277,26 @@ impl MissionStore {
             .get(guid)
             .map(|subs| {
                 subs.iter()
-                    .filter(|s| if !username.is_empty() { s.username == username } else { s.client_uid == client_uid })
+                    .filter(|s| {
+                        if !username.is_empty() {
+                            s.username == username
+                        } else {
+                            s.client_uid == client_uid
+                        }
+                    })
                     .map(|s| s.id.clone())
                     .collect()
             })
             .unwrap_or_default();
         for id in &ids {
-            self.record(&mut state, Event::SubscriptionRoleSet { guid: guid.into(), id: id.clone(), role })?;
+            self.record(
+                &mut state,
+                Event::SubscriptionRoleSet {
+                    guid: guid.into(),
+                    id: id.clone(),
+                    role,
+                },
+            )?;
         }
         Ok(ids.len())
     }
@@ -944,20 +1304,34 @@ impl MissionStore {
     /// Deletes stored subscriptions (`deleteByMissionGuidAndClientUid…`):
     /// by client uid and username if a username is given, else by client
     /// uid alone.
-    pub fn unsubscribe(&self, guid: &str, client_uid: &str, username: Option<&str>) -> Result<usize, MissionError> {
+    pub fn unsubscribe(
+        &self,
+        guid: &str,
+        client_uid: &str,
+        username: Option<&str>,
+    ) -> Result<usize, MissionError> {
         let mut state = self.state.write().unwrap();
         let ids: Vec<String> = state
             .subscriptions
             .get(guid)
             .map(|subs| {
                 subs.iter()
-                    .filter(|s| s.client_uid == client_uid && username.is_none_or(|u| u.is_empty() || s.username == u))
+                    .filter(|s| {
+                        s.client_uid == client_uid
+                            && username.is_none_or(|u| u.is_empty() || s.username == u)
+                    })
                     .map(|s| s.id.clone())
                     .collect()
             })
             .unwrap_or_default();
         for id in &ids {
-            self.record(&mut state, Event::Unsubscribed { guid: guid.into(), id: id.clone() })?;
+            self.record(
+                &mut state,
+                Event::Unsubscribed {
+                    guid: guid.into(),
+                    id: id.clone(),
+                },
+            )?;
         }
         Ok(ids.len())
     }
@@ -971,7 +1345,9 @@ impl MissionStore {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, &invitation.mission_guid)?;
         let duplicate = state.invitations.iter().any(|i| {
-            i.mission_guid == invitation.mission_guid && i.invitation_type == invitation.invitation_type && i.invitee == invitation.invitee
+            i.mission_guid == invitation.mission_guid
+                && i.invitation_type == invitation.invitation_type
+                && i.invitee == invitation.invitee
         });
         if duplicate {
             return Ok(false);
@@ -980,20 +1356,41 @@ impl MissionStore {
         Ok(true)
     }
 
-    pub fn uninvite(&self, guid: &str, invitee: &str, invitation_type: InvitationType) -> Result<(), MissionError> {
+    pub fn uninvite(
+        &self,
+        guid: &str,
+        invitee: &str,
+        invitation_type: InvitationType,
+    ) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
-        self.record(&mut state, Event::Uninvited { guid: guid.into(), invitee: invitee.into(), invitation_type })
+        self.record(
+            &mut state,
+            Event::Uninvited {
+                guid: guid.into(),
+                invitee: invitee.into(),
+                invitation_type,
+            },
+        )
     }
 
     pub fn invitations(&self, guid: &str) -> Vec<InvitationRecord> {
         let state = self.state.read().unwrap();
-        state.invitations.iter().filter(|i| i.mission_guid == guid).cloned().collect()
+        state
+            .invitations
+            .iter()
+            .filter(|i| i.mission_guid == guid)
+            .cloned()
+            .collect()
     }
 
     /// Invitations of `invitation_type` for `invitee` (case-insensitive,
     /// `findAllMissionInvitationsByInviteeIgnoreCaseAndType`) on missions
     /// that still exist.
-    pub fn invitations_for(&self, invitee: &str, invitation_type: InvitationType) -> Vec<InvitationRecord> {
+    pub fn invitations_for(
+        &self,
+        invitee: &str,
+        invitation_type: InvitationType,
+    ) -> Vec<InvitationRecord> {
         let state = self.state.read().unwrap();
         state
             .invitations
@@ -1001,7 +1398,10 @@ impl MissionStore {
             .filter(|i| {
                 i.invitation_type == invitation_type
                     && i.invitee.eq_ignore_ascii_case(invitee)
-                    && state.missions.get(&i.mission_guid).is_some_and(|m| !m.deleted)
+                    && state
+                        .missions
+                        .get(&i.mission_guid)
+                        .is_some_and(|m| !m.deleted)
             })
             .cloned()
             .collect()
@@ -1016,7 +1416,12 @@ impl MissionStore {
 
     pub fn layer(&self, guid: &str, uid: &str) -> Option<LayerRecord> {
         let state = self.state.read().unwrap();
-        state.layers.get(guid)?.iter().find(|l| l.uid == uid).cloned()
+        state
+            .layers
+            .get(guid)?
+            .iter()
+            .find(|l| l.uid == uid)
+            .cloned()
     }
 
     /// `findMissionLayers` + `sortMissionLayers`: the top-level layers with
@@ -1025,7 +1430,11 @@ impl MissionStore {
         let state = self.state.read().unwrap();
         let all = state.layers.get(guid).cloned().unwrap_or_default();
         fn build(all: &[LayerRecord], parent: Option<&str>) -> Vec<LayerTree> {
-            let level: Vec<LayerRecord> = all.iter().filter(|l| l.parent.as_deref() == parent).cloned().collect();
+            let level: Vec<LayerRecord> = all
+                .iter()
+                .filter(|l| l.parent.as_deref() == parent)
+                .cloned()
+                .collect();
             sort_layers(level)
                 .into_iter()
                 .map(|layer| {
@@ -1043,28 +1452,59 @@ impl MissionStore {
         let state = self.state.read().unwrap();
         let all = state.layers.get(guid).cloned().unwrap_or_default();
         fn children(all: &[LayerRecord], parent: &str) -> Vec<LayerTree> {
-            let level: Vec<LayerRecord> = all.iter().filter(|l| l.parent.as_deref() == Some(parent)).cloned().collect();
-            sort_layers(level).into_iter().map(|layer| LayerTree { children: children(all, &layer.uid), layer }).collect()
+            let level: Vec<LayerRecord> = all
+                .iter()
+                .filter(|l| l.parent.as_deref() == Some(parent))
+                .cloned()
+                .collect();
+            sort_layers(level)
+                .into_iter()
+                .map(|layer| LayerTree {
+                    children: children(all, &layer.uid),
+                    layer,
+                })
+                .collect()
         }
-        Some(LayerTree { children: children(&all, uid), layer })
+        Some(LayerTree {
+            children: children(&all, uid),
+            layer,
+        })
     }
 
     /// `MissionLayerRepository.fixupAfter(uid, parent, after)`: the sibling
     /// (under `parent`) whose `after` is `after` now comes after `uid`.
-    fn fixup_after(&self, state: &mut State, guid: &str, uid: Option<&str>, parent: Option<&str>, after: Option<&str>) -> Result<(), MissionError> {
+    fn fixup_after(
+        &self,
+        state: &mut State,
+        guid: &str,
+        uid: Option<&str>,
+        parent: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<(), MissionError> {
         let targets: Vec<String> = state
             .layers
             .get(guid)
             .map(|layers| {
                 layers
                     .iter()
-                    .filter(|l| uid.is_none_or(|u| u != l.uid) && l.parent.as_deref() == parent && l.after.as_deref() == after)
+                    .filter(|l| {
+                        uid.is_none_or(|u| u != l.uid)
+                            && l.parent.as_deref() == parent
+                            && l.after.as_deref() == after
+                    })
                     .map(|l| l.uid.clone())
                     .collect()
             })
             .unwrap_or_default();
         for target in targets {
-            self.record(state, Event::LayerAfterSet { guid: guid.into(), uid: target, after: uid.map(String::from) })?;
+            self.record(
+                state,
+                Event::LayerAfterSet {
+                    guid: guid.into(),
+                    uid: target,
+                    after: uid.map(String::from),
+                },
+            )?;
         }
         Ok(())
     }
@@ -1074,31 +1514,85 @@ impl MissionStore {
     pub fn add_layer(&self, guid: &str, layer: LayerRecord) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, guid)?;
-        self.fixup_after(&mut state, guid, Some(&layer.uid), layer.parent.as_deref(), layer.after.as_deref())?;
-        self.record(&mut state, Event::LayerSaved { guid: guid.into(), layer })
+        self.fixup_after(
+            &mut state,
+            guid,
+            Some(&layer.uid),
+            layer.parent.as_deref(),
+            layer.after.as_deref(),
+        )?;
+        self.record(
+            &mut state,
+            Event::LayerSaved {
+                guid: guid.into(),
+                layer,
+            },
+        )
     }
 
     pub fn rename_layer(&self, guid: &str, uid: &str, name: &str) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
-        self.record(&mut state, Event::LayerNamed { guid: guid.into(), uid: uid.into(), name: name.into() })
+        self.record(
+            &mut state,
+            Event::LayerNamed {
+                guid: guid.into(),
+                uid: uid.into(),
+                name: name.into(),
+            },
+        )
     }
 
     /// `setLayerParent`: take the layer out of its place, insert it after
     /// `after` under `parent`.
-    pub fn move_layer(&self, guid: &str, uid: &str, parent: Option<&str>, after: Option<&str>) -> Result<(), MissionError> {
+    pub fn move_layer(
+        &self,
+        guid: &str,
+        uid: &str,
+        parent: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
-        let Some(layer) = state.layers.get(guid).and_then(|ls| ls.iter().find(|l| l.uid == uid)).cloned() else {
+        let Some(layer) = state
+            .layers
+            .get(guid)
+            .and_then(|ls| ls.iter().find(|l| l.uid == uid))
+            .cloned()
+        else {
             return Err(MissionError::NotFound(uid.into()));
         };
-        self.fixup_after(&mut state, guid, layer.after.as_deref(), layer.parent.as_deref(), Some(uid))?;
+        self.fixup_after(
+            &mut state,
+            guid,
+            layer.after.as_deref(),
+            layer.parent.as_deref(),
+            Some(uid),
+        )?;
         self.fixup_after(&mut state, guid, Some(uid), parent, after)?;
         if layer.parent.as_deref() != parent || layer.parent.is_none() {
-            self.record(&mut state, Event::LayerParentSet { guid: guid.into(), uid: uid.into(), parent: parent.map(String::from) })?;
+            self.record(
+                &mut state,
+                Event::LayerParentSet {
+                    guid: guid.into(),
+                    uid: uid.into(),
+                    parent: parent.map(String::from),
+                },
+            )?;
         }
         // `setAfter` only matches when the stored parent equals `parent`.
-        let current_parent = state.layers.get(guid).and_then(|ls| ls.iter().find(|l| l.uid == uid)).and_then(|l| l.parent.clone());
+        let current_parent = state
+            .layers
+            .get(guid)
+            .and_then(|ls| ls.iter().find(|l| l.uid == uid))
+            .and_then(|l| l.parent.clone());
         if current_parent.as_deref() == parent {
-            self.record(&mut state, Event::LayerAfterSet { guid: guid.into(), uid: uid.into(), after: after.map(String::from) })?;
+            self.record(
+                &mut state,
+                Event::LayerAfterSet {
+                    guid: guid.into(),
+                    uid: uid.into(),
+                    after: after.map(String::from),
+                },
+            )?;
         }
         Ok(())
     }
@@ -1107,18 +1601,40 @@ impl MissionStore {
     /// and delete it.
     pub fn delete_layer(&self, guid: &str, uid: &str) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
-        let Some(layer) = state.layers.get(guid).and_then(|ls| ls.iter().find(|l| l.uid == uid)).cloned() else {
+        let Some(layer) = state
+            .layers
+            .get(guid)
+            .and_then(|ls| ls.iter().find(|l| l.uid == uid))
+            .cloned()
+        else {
             return Ok(());
         };
-        self.fixup_after(&mut state, guid, layer.after.as_deref(), layer.parent.as_deref(), Some(uid))?;
-        self.record(&mut state, Event::LayerDeleted { guid: guid.into(), uid: uid.into() })
+        self.fixup_after(
+            &mut state,
+            guid,
+            layer.after.as_deref(),
+            layer.parent.as_deref(),
+            Some(uid),
+        )?;
+        self.record(
+            &mut state,
+            Event::LayerDeleted {
+                guid: guid.into(),
+                uid: uid.into(),
+            },
+        )
     }
 
     // --- log entries ----------------------------------------------------------
 
     pub fn save_log_entry(&self, entry: LogEntryRecord) -> Result<LogEntryRecord, MissionError> {
         let mut state = self.state.write().unwrap();
-        self.record(&mut state, Event::LogEntrySaved { entry: entry.clone() })?;
+        self.record(
+            &mut state,
+            Event::LogEntrySaved {
+                entry: entry.clone(),
+            },
+        )?;
         Ok(entry)
     }
 
@@ -1142,7 +1658,10 @@ impl MissionStore {
         let mut entries: Vec<_> = state
             .logs
             .values()
-            .filter(|e| e.mission_names.iter().any(|n| n == mission_name) && window.contains(e.server_time_ms))
+            .filter(|e| {
+                e.mission_names.iter().any(|n| n == mission_name)
+                    && window.contains(e.server_time_ms)
+            })
             .cloned()
             .collect();
         entries.sort_by_key(|e| e.server_time_ms);
@@ -1160,7 +1679,10 @@ mod tests {
                 NewMission {
                     guid: crate::marti::envelope::random_uuid(),
                     name: name.into(),
-                    fields: MissionFields { expiration: -1, ..Default::default() },
+                    fields: MissionFields {
+                        expiration: -1,
+                        ..Default::default()
+                    },
                     tool: "public".into(),
                     creator_uid: "ANDROID-1".into(),
                     groups: BTreeSet::from(["__ANON__".to_string()]),
@@ -1176,8 +1698,14 @@ mod tests {
     #[test]
     fn the_official_roles_have_the_official_permissions() {
         assert_eq!(Role::Owner.permissions().len(), 8);
-        assert_eq!(Role::Subscriber.permissions(), &[Permission::MissionRead, Permission::MissionWrite]);
-        assert_eq!(Role::ReadOnlySubscriber.permissions(), &[Permission::MissionRead]);
+        assert_eq!(
+            Role::Subscriber.permissions(),
+            &[Permission::MissionRead, Permission::MissionWrite]
+        );
+        assert_eq!(
+            Role::ReadOnlySubscriber.permissions(),
+            &[Permission::MissionRead]
+        );
         assert!(Role::Owner.has_all(Role::Subscriber));
         assert!(!Role::Subscriber.has_all(Role::Owner));
         assert!(Role::Subscriber.has_all(Role::ReadOnlySubscriber));
@@ -1191,7 +1719,10 @@ mod tests {
         assert_eq!(first.name, "Ops");
         let second = new_mission(&store, "Ops", 2_000);
         assert_eq!(store.by_name(" Ops", |_| true).unwrap().guid, second.guid);
-        assert_eq!(store.by_name("Ops", |m| m.guid == first.guid).unwrap().guid, first.guid);
+        assert_eq!(
+            store.by_name("Ops", |m| m.guid == first.guid).unwrap().guid,
+            first.guid
+        );
         assert!(store.by_name("Ops", |_| false).is_none());
     }
 
@@ -1209,7 +1740,10 @@ mod tests {
     }
 
     fn summary(changes: &[ChangeRecord]) -> Vec<(ChangeType, Option<Content>, String)> {
-        changes.iter().map(|c| (c.change_type, c.content.clone(), c.creator_uid.clone())).collect()
+        changes
+            .iter()
+            .map(|c| (c.change_type, c.content.clone(), c.creator_uid.clone()))
+            .collect()
     }
 
     /// The official squashed view (`MISSION_CHANGES`): per content and
@@ -1221,10 +1755,16 @@ mod tests {
         let m = new_mission(&store, "Ops", 1_000);
         let hash = Content::Hash("a".repeat(64));
         let uid = Content::Uid("marker-1".into());
-        store.add_content(&m.guid, hash.clone(), "A", 2_000).unwrap();
-        store.add_content(&m.guid, hash.clone(), "A", 3_000).unwrap();
+        store
+            .add_content(&m.guid, hash.clone(), "A", 2_000)
+            .unwrap();
+        store
+            .add_content(&m.guid, hash.clone(), "A", 3_000)
+            .unwrap();
         store.add_content(&m.guid, uid.clone(), "A", 4_000).unwrap();
-        store.remove_content(&m.guid, uid.clone(), "B", 5_000).unwrap();
+        store
+            .remove_content(&m.guid, uid.clone(), "B", 5_000)
+            .unwrap();
 
         let squashed = store.changes(&m.guid, Window::ALL, true).unwrap();
         assert_eq!(
@@ -1242,7 +1782,10 @@ mod tests {
         assert_eq!(full.len(), 5);
         assert!(full.windows(2).all(|w| w[0].id > w[1].id), "newest first");
 
-        let window = Window { start_ms: 4_500, end_ms: i64::MAX };
+        let window = Window {
+            start_ms: 4_500,
+            end_ms: i64::MAX,
+        };
         assert_eq!(
             summary(&store.changes(&m.guid, window, true).unwrap()),
             vec![(ChangeType::RemoveContent, Some(uid), "B".into())],
@@ -1256,17 +1799,59 @@ mod tests {
     fn subscribing_again_reuses_and_only_upgrades() {
         let store = MissionStore::in_memory();
         let m = new_mission(&store, "Ops", 1_000);
-        let first = store.subscribe(&m.guid, "ANDROID-1", "jz", Role::ReadOnlySubscriber, 2_000, |id| format!("t-{id}")).unwrap();
+        let first = store
+            .subscribe(
+                &m.guid,
+                "ANDROID-1",
+                "jz",
+                Role::ReadOnlySubscriber,
+                2_000,
+                |id| format!("t-{id}"),
+            )
+            .unwrap();
         assert_eq!(first.token, format!("t-{}", first.id));
-        let again = store.subscribe(&m.guid, "ANDROID-1", "jz", Role::Subscriber, 3_000, |_| unreachable!()).unwrap();
-        assert_eq!((again.id.clone(), again.role), (first.id.clone(), Role::Subscriber));
-        let lower = store.subscribe(&m.guid, "ANDROID-1", "jz", Role::ReadOnlySubscriber, 4_000, |_| unreachable!()).unwrap();
+        let again = store
+            .subscribe(
+                &m.guid,
+                "ANDROID-1",
+                "jz",
+                Role::Subscriber,
+                3_000,
+                |_| unreachable!(),
+            )
+            .unwrap();
+        assert_eq!(
+            (again.id.clone(), again.role),
+            (first.id.clone(), Role::Subscriber)
+        );
+        let lower = store
+            .subscribe(
+                &m.guid,
+                "ANDROID-1",
+                "jz",
+                Role::ReadOnlySubscriber,
+                4_000,
+                |_| unreachable!(),
+            )
+            .unwrap();
         assert_eq!(lower.role, Role::Subscriber);
-        let other_user = store.subscribe(&m.guid, "ANDROID-1", "other", Role::Subscriber, 5_000, |id| id.to_string()).unwrap();
+        let other_user = store
+            .subscribe(
+                &m.guid,
+                "ANDROID-1",
+                "other",
+                Role::Subscriber,
+                5_000,
+                |id| id.to_string(),
+            )
+            .unwrap();
         assert_ne!(other_user.id, first.id);
         assert_eq!(store.subscriptions(&m.guid).len(), 2);
 
-        assert_eq!(store.unsubscribe(&m.guid, "ANDROID-1", Some("jz")).unwrap(), 1);
+        assert_eq!(
+            store.unsubscribe(&m.guid, "ANDROID-1", Some("jz")).unwrap(),
+            1
+        );
         assert_eq!(store.subscriptions(&m.guid).len(), 1);
         assert_eq!(store.unsubscribe(&m.guid, "ANDROID-1", None).unwrap(), 1);
         assert!(store.subscriptions(&m.guid).is_empty());
@@ -1283,8 +1868,17 @@ mod tests {
         store.add_content(&m.guid, b.clone(), "X", 3_000).unwrap();
         store.add_content(&m.guid, a.clone(), "Y", 4_000).unwrap();
         let contents = store.by_guid(&m.guid).unwrap().contents;
-        assert_eq!(contents.iter().map(|c| c.content.clone()).collect::<Vec<_>>(), vec![b, a]);
-        assert_eq!((contents[1].timestamp_ms, contents[1].creator_uid.as_str()), (4_000, "Y"));
+        assert_eq!(
+            contents
+                .iter()
+                .map(|c| c.content.clone())
+                .collect::<Vec<_>>(),
+            vec![b, a]
+        );
+        assert_eq!(
+            (contents[1].timestamp_ms, contents[1].creator_uid.as_str()),
+            (4_000, "Y")
+        );
     }
 
     #[test]
@@ -1302,12 +1896,21 @@ mod tests {
             role,
         };
         assert!(store.invite(invite(Role::ReadOnlySubscriber)).unwrap());
-        assert!(!store.invite(invite(Role::Subscriber)).unwrap(), "a duplicate is refused");
+        assert!(
+            !store.invite(invite(Role::Subscriber)).unwrap(),
+            "a duplicate is refused"
+        );
         let found = store.invitations_for("ALPHA", InvitationType::Callsign);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].role, Role::ReadOnlySubscriber);
-        assert!(store.invitations_for("Alpha", InvitationType::UserName).is_empty());
-        store.uninvite(&m.guid, "alpha", InvitationType::Callsign).unwrap();
+        assert!(
+            store
+                .invitations_for("Alpha", InvitationType::UserName)
+                .is_empty()
+        );
+        store
+            .uninvite(&m.guid, "alpha", InvitationType::Callsign)
+            .unwrap();
         assert!(store.invitations(&m.guid).is_empty());
     }
 
@@ -1333,22 +1936,40 @@ mod tests {
         let store = MissionStore::in_memory();
         let m = new_mission(&store, "Ops", 1_000);
         store.add_layer(&m.guid, layer("a", None, None)).unwrap();
-        store.add_layer(&m.guid, layer("c", Some("a"), None)).unwrap();
-        store.add_layer(&m.guid, layer("b", Some("a"), None)).unwrap();
-        assert_eq!(order(&store.layer_trees(&m.guid)), ["a", "b", "c"], "b went between a and c");
-        store.add_layer(&m.guid, layer("first", None, None)).unwrap();
+        store
+            .add_layer(&m.guid, layer("c", Some("a"), None))
+            .unwrap();
+        store
+            .add_layer(&m.guid, layer("b", Some("a"), None))
+            .unwrap();
+        assert_eq!(
+            order(&store.layer_trees(&m.guid)),
+            ["a", "b", "c"],
+            "b went between a and c"
+        );
+        store
+            .add_layer(&m.guid, layer("first", None, None))
+            .unwrap();
         assert_eq!(order(&store.layer_trees(&m.guid)), ["first", "a", "b", "c"]);
 
-        store.add_layer(&m.guid, layer("child", None, Some("b"))).unwrap();
+        store
+            .add_layer(&m.guid, layer("child", None, Some("b")))
+            .unwrap();
         assert_eq!(order(&store.layer_trees(&m.guid)[2].children), ["child"]);
 
-        store.move_layer(&m.guid, "a", Some("b"), Some("child")).unwrap();
+        store
+            .move_layer(&m.guid, "a", Some("b"), Some("child"))
+            .unwrap();
         let trees = store.layer_trees(&m.guid);
         assert_eq!(order(&trees), ["first", "b", "c"]);
         assert_eq!(order(&trees[1].children), ["child", "a"]);
 
         store.delete_layer(&m.guid, "b").unwrap();
-        assert_eq!(order(&store.layer_trees(&m.guid)), ["first", "c"], "c now follows first");
+        assert_eq!(
+            order(&store.layer_trees(&m.guid)),
+            ["first", "c"],
+            "c now follows first"
+        );
     }
 
     #[test]
@@ -1361,31 +1982,62 @@ mod tests {
 
     #[test]
     fn everything_survives_a_restart() {
-        let path = std::env::temp_dir().join(format!("microtak-official-missions-{}.log", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "microtak-official-missions-{}.log",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let (guid, sub) = {
             let store = MissionStore::load_or_create(&path).unwrap();
             let m = new_mission(&store, "Ops", 1_000);
-            store.add_content(&m.guid, Content::Uid("u".into()), "A", 2_000).unwrap();
-            store.set_keywords(&m.guid, BTreeSet::from(["k".to_string()]), 3_000).unwrap();
-            store.set_content_keywords(&m.guid, Content::Uid("not-in-mission".into()), vec!["x".into(), "x".into()]).unwrap();
-            let sub = store.subscribe(&m.guid, "ANDROID-1", "jz", Role::Owner, 4_000, |id| id.into()).unwrap();
             store
-                .save_log_entry(LogEntryRecord { id: "log-1".into(), mission_names: vec!["Ops".into()], ..Default::default() })
+                .add_content(&m.guid, Content::Uid("u".into()), "A", 2_000)
+                .unwrap();
+            store
+                .set_keywords(&m.guid, BTreeSet::from(["k".to_string()]), 3_000)
+                .unwrap();
+            store
+                .set_content_keywords(
+                    &m.guid,
+                    Content::Uid("not-in-mission".into()),
+                    vec!["x".into(), "x".into()],
+                )
+                .unwrap();
+            let sub = store
+                .subscribe(&m.guid, "ANDROID-1", "jz", Role::Owner, 4_000, |id| {
+                    id.into()
+                })
+                .unwrap();
+            store
+                .save_log_entry(LogEntryRecord {
+                    id: "log-1".into(),
+                    mission_names: vec!["Ops".into()],
+                    ..Default::default()
+                })
                 .unwrap();
             (m.guid, sub)
         };
         let store = MissionStore::load_or_create(&path).unwrap();
         let m = store.by_guid(&guid).unwrap();
         assert_eq!(m.keywords, BTreeSet::from(["k".to_string()]));
-        assert_eq!(m.content_keywords[&Content::Uid("not-in-mission".into())], vec!["x".to_string()]);
+        assert_eq!(
+            m.content_keywords[&Content::Uid("not-in-mission".into())],
+            vec!["x".to_string()]
+        );
         assert!(m.has(&Content::Uid("u".into())));
         assert_eq!(store.subscription_by_id(&guid, &sub.id), Some(sub));
         assert_eq!(store.log_entries_for("Ops", Window::ALL).len(), 1);
         assert_eq!(store.changes(&guid, Window::ALL, false).unwrap().len(), 2);
         // new changes continue the id sequence
-        store.add_content(&guid, Content::Uid("v".into()), "A", 5_000).unwrap();
-        let ids: Vec<u64> = store.changes(&guid, Window::ALL, false).unwrap().iter().map(|c| c.id).collect();
+        store
+            .add_content(&guid, Content::Uid("v".into()), "A", 5_000)
+            .unwrap();
+        let ids: Vec<u64> = store
+            .changes(&guid, Window::ALL, false)
+            .unwrap()
+            .iter()
+            .map(|c| c.id)
+            .collect();
         assert_eq!(ids, vec![2, 1, 0]);
         std::fs::remove_file(&path).ok();
     }

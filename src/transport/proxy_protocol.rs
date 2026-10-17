@@ -36,7 +36,10 @@ pub enum ProxyHeaderError {
 /// return the client address it names (`None` for a `LOCAL`/`UNKNOWN`
 /// header, i.e. "use the connection's own address"). Without a header,
 /// nothing is consumed and `None` is returned.
-pub async fn read_header(stream: &mut TcpStream, wait: Duration) -> Result<Option<SocketAddr>, ProxyHeaderError> {
+pub async fn read_header(
+    stream: &mut TcpStream,
+    wait: Duration,
+) -> Result<Option<SocketAddr>, ProxyHeaderError> {
     tokio::time::timeout(wait, read_header_inner(stream))
         .await
         .map_err(|_| ProxyHeaderError::Timeout)?
@@ -89,8 +92,11 @@ async fn read_header_inner(stream: &mut TcpStream) -> Result<Option<SocketAddr>,
 }
 
 fn parse_v1(line: &[u8]) -> Result<Option<SocketAddr>, ProxyHeaderError> {
-    let text = std::str::from_utf8(line).map_err(|_| ProxyHeaderError::Malformed("v1 header not ASCII"))?;
-    let text = text.strip_suffix("\r\n").ok_or(ProxyHeaderError::Malformed("v1 header without CRLF"))?;
+    let text = std::str::from_utf8(line)
+        .map_err(|_| ProxyHeaderError::Malformed("v1 header not ASCII"))?;
+    let text = text
+        .strip_suffix("\r\n")
+        .ok_or(ProxyHeaderError::Malformed("v1 header without CRLF"))?;
     let mut parts = text.split(' ');
     if parts.next() != Some("PROXY") {
         return Err(ProxyHeaderError::Malformed("v1 header without PROXY"));
@@ -133,7 +139,10 @@ fn parse_v2(header: &[u8; 16], payload: &[u8]) -> Result<Option<SocketAddr>, Pro
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&payload[..16]);
             let port = u16::from_be_bytes([payload[32], payload[33]]);
-            Ok(Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port)))
+            Ok(Some(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::from(octets)),
+                port,
+            )))
         }
         0x0 => Ok(None), // AF_UNSPEC
         _ => Err(ProxyHeaderError::Malformed("v2 address family or length")),
@@ -232,12 +241,20 @@ mod tests {
         let mut local = V2_SIGNATURE.to_vec();
         local.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]);
         assert_eq!(roundtrip(local).await.0.unwrap(), None);
-        assert_eq!(roundtrip(b"PROXY UNKNOWN\r\n".to_vec()).await.0.unwrap(), None);
+        assert_eq!(
+            roundtrip(b"PROXY UNKNOWN\r\n".to_vec()).await.0.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
     async fn malformed_headers_are_errors() {
-        assert!(roundtrip(b"PROXY TCP4 not-an-ip 10.0.0.1 1 2\r\n".to_vec()).await.0.is_err());
+        assert!(
+            roundtrip(b"PROXY TCP4 not-an-ip 10.0.0.1 1 2\r\n".to_vec())
+                .await
+                .0
+                .is_err()
+        );
         let mut bad_version = V2_SIGNATURE.to_vec();
         bad_version.extend_from_slice(&[0x31, 0x11, 0x00, 0x00]);
         assert!(roundtrip(bad_version).await.0.is_err());

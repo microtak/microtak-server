@@ -28,7 +28,8 @@ struct Reply {
 
 impl Reply {
     fn json(&self) -> Value {
-        serde_json::from_slice(&self.body).unwrap_or_else(|_| panic!("not JSON: {}", String::from_utf8_lossy(&self.body)))
+        serde_json::from_slice(&self.body)
+            .unwrap_or_else(|_| panic!("not JSON: {}", String::from_utf8_lossy(&self.body)))
     }
     fn data(&self) -> Value {
         self.json()["data"].clone()
@@ -39,18 +40,37 @@ impl Reply {
 }
 
 impl Harness {
-    async fn call(&self, method: &str, uri: &str, cn: &str, headers: &[(&str, &str)], body: &str) -> Reply {
+    async fn call(
+        &self,
+        method: &str,
+        uri: &str,
+        cn: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Reply {
         let mut builder = Request::builder().method(method).uri(uri);
         for (k, v) in headers {
             builder = builder.header(*k, *v);
         }
         let mut request = builder.body(Body::from(body.to_string())).unwrap();
-        request.extensions_mut().insert(PeerIdentity(cn.to_string()));
+        request
+            .extensions_mut()
+            .insert(PeerIdentity(cn.to_string()));
         let response = self.app.clone().oneshot(request).await.unwrap();
         let status = response.status();
-        let content_type = response.headers().get("content-type").map(|v| v.to_str().unwrap().to_string());
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec();
-        Reply { status, body, content_type }
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        Reply {
+            status,
+            body,
+            content_type,
+        }
     }
 
     async fn get(&self, uri: &str, cn: &str) -> Reply {
@@ -59,7 +79,15 @@ impl Harness {
 
     /// Creates a mission and returns (its JSON, the owner token).
     async fn create(&self, name: &str, cn: &str, query: &str) -> (Value, String) {
-        let reply = self.call("PUT", &format!("/Marti/api/missions/{name}?creatorUid=ANDROID-{cn}{query}"), cn, &[], "").await;
+        let reply = self
+            .call(
+                "PUT",
+                &format!("/Marti/api/missions/{name}?creatorUid=ANDROID-{cn}{query}"),
+                cn,
+                &[],
+                "",
+            )
+            .await;
         assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.text());
         let mission = reply.data()[0].clone();
         let token = mission["token"].as_str().unwrap().to_string();
@@ -73,7 +101,10 @@ fn bearer(token: &str) -> String {
 
 fn is_pad_millis(s: &Value) -> bool {
     let s = s.as_str().unwrap_or("");
-    s.len() == 24 && s.ends_with('Z') && s.as_bytes()[19] == b'.' && s[20..23].chars().all(|c| c.is_ascii_digit())
+    s.len() == 24
+        && s.ends_with('Z')
+        && s.as_bytes()[19] == b'.'
+        && s[20..23].chars().all(|c| c.is_ascii_digit())
 }
 
 // --- create / get ------------------------------------------------------------------
@@ -84,7 +115,13 @@ fn is_pad_millis(s: &Value) -> bool {
 async fn create_returns_the_mission_with_an_owner_token() {
     let h = harness();
     let reply = h
-        .call("PUT", "/Marti/api/missions/Ops?creatorUid=ANDROID-1&description=Night%20op&chatRoom=ops-chat", "jz", &[], "")
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops?creatorUid=ANDROID-1&description=Night%20op&chatRoom=ops-chat",
+            "jz",
+            &[],
+            "",
+        )
         .await;
     assert_eq!(reply.status, StatusCode::CREATED);
     let envelope = reply.json();
@@ -102,7 +139,10 @@ async fn create_returns_the_mission_with_an_owner_token() {
     assert_eq!(m["keywords"], json!([]));
     assert_eq!(m["uids"], json!([]));
     assert_eq!(m["contents"], json!([]));
-    assert!(m.get("defaultRole").is_none(), "NON_NULL: no default role set");
+    assert!(
+        m.get("defaultRole").is_none(),
+        "NON_NULL: no default role set"
+    );
     assert_eq!(m["ownerRole"]["type"], "MISSION_OWNER");
     assert_eq!(m["ownerRole"]["permissions"].as_array().unwrap().len(), 8);
     assert!(is_pad_millis(&m["createTime"]), "{}", m["createTime"]);
@@ -110,8 +150,15 @@ async fn create_returns_the_mission_with_an_owner_token() {
 
     let claims = h.state.tokens.decode(m["token"].as_str().unwrap()).unwrap();
     assert_eq!(claims.token_type, TokenType::Subscription);
-    let sub = h.state.store.subscription_by_id(m["guid"].as_str().unwrap(), &claims.id).unwrap();
-    assert_eq!((sub.role, sub.client_uid.as_str(), sub.username.as_str()), (Role::Owner, "ANDROID-1", "jz"));
+    let sub = h
+        .state
+        .store
+        .subscription_by_id(m["guid"].as_str().unwrap(), &claims.id)
+        .unwrap();
+    assert_eq!(
+        (sub.role, sub.client_uid.as_str(), sub.username.as_str()),
+        (Role::Owner, "ANDROID-1", "jz")
+    );
 }
 
 /// A JSON `Mission` body wins over query parameters.
@@ -139,14 +186,32 @@ async fn a_json_body_overrides_the_query() {
 async fn put_on_an_existing_mission_updates_it() {
     let h = harness();
     let (_, token) = h.create("Ops", "jz", "").await;
-    let reply = h.call("PUT", "/Marti/api/missions/Ops?description=changed", "jz", &[("MissionAuthorization", &bearer(&token))], "").await;
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops?description=changed",
+            "jz",
+            &[("MissionAuthorization", &bearer(&token))],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.data()[0]["description"], "changed");
     assert_eq!(h.state.store.list().len(), 1);
 
     // A read-only default role can't write.
-    let (_, _) = h.create("Read", "jz", "&defaultRole=MISSION_READONLY_SUBSCRIBER").await;
-    let reply = h.call("PUT", "/Marti/api/missions/Read?description=x", "other", &[], "").await;
+    let (_, _) = h
+        .create("Read", "jz", "&defaultRole=MISSION_READONLY_SUBSCRIBER")
+        .await;
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Read?description=x",
+            "other",
+            &[],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     assert_eq!(reply.json()["code"], 10);
 }
@@ -156,7 +221,15 @@ async fn put_on_an_existing_mission_updates_it() {
 async fn post_with_allow_dupe_creates_a_duplicate() {
     let h = harness();
     h.create("Ops", "jz", "").await;
-    let reply = h.call("POST", "/Marti/api/missions/Ops?creatorUid=B&allowDupe=true", "jz", &[], "").await;
+    let reply = h
+        .call(
+            "POST",
+            "/Marti/api/missions/Ops?creatorUid=B&allowDupe=true",
+            "jz",
+            &[],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::CREATED);
     assert_eq!(h.state.store.list().len(), 2);
 }
@@ -170,13 +243,26 @@ async fn unknown_and_deleted_missions_are_bodyless_404_and_410() {
     assert!(reply.body.is_empty());
 
     let (_, token) = h.create("Ops", "jz", "").await;
-    let deleted = h.call("DELETE", "/Marti/api/missions/Ops?creatorUid=A", "jz", &[("Authorization", &bearer(&token))], "").await;
+    let deleted = h
+        .call(
+            "DELETE",
+            "/Marti/api/missions/Ops?creatorUid=A",
+            "jz",
+            &[("Authorization", &bearer(&token))],
+            "",
+        )
+        .await;
     assert_eq!(deleted.status, StatusCode::OK);
     assert_eq!(deleted.data()[0]["name"], "Ops");
     let reply = h.get("/Marti/api/missions/Ops", "jz").await;
     assert_eq!(reply.status, StatusCode::GONE);
     assert!(reply.body.is_empty());
-    assert_eq!(h.get("/Marti/api/missions/guid/not-a-uuid", "jz").await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        h.get("/Marti/api/missions/guid/not-a-uuid", "jz")
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
 }
 
 /// `getMission`: password-protected without a token → 403 at API version
@@ -186,34 +272,76 @@ async fn unknown_and_deleted_missions_are_bodyless_404_and_410() {
 async fn password_protected_missions_follow_the_api_version() {
     let h = harness();
     let (_, owner) = h.create("Secret", "jz", "&password=pw").await;
-    h.call("PUT", "/Marti/api/missions/Secret/contents?creatorUid=A", "jz", &[("MissionAuthorization", &bearer(&owner))], r#"{"uids":["u-1"]}"#)
-        .await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Secret/contents?creatorUid=A",
+        "jz",
+        &[("MissionAuthorization", &bearer(&owner))],
+        r#"{"uids":["u-1"]}"#,
+    )
+    .await;
 
     let reply = h.get("/Marti/api/missions/Secret", "other").await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
 
-    let reply = h.call("GET", "/Marti/api/missions/Secret", "other", &[("API_VERSION", "3")], "").await;
+    let reply = h
+        .call(
+            "GET",
+            "/Marti/api/missions/Secret",
+            "other",
+            &[("API_VERSION", "3")],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.data()[0]["uids"], json!([]), "cleared");
     assert_eq!(reply.data()[0]["passwordProtected"], true);
 
-    let reply = h.get("/Marti/api/missions/Secret?password=wrong", "other").await;
+    let reply = h
+        .get("/Marti/api/missions/Secret?password=wrong", "other")
+        .await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
-    let reply = h.get("/Marti/api/missions/Secret?password=pw", "other").await;
+    let reply = h
+        .get("/Marti/api/missions/Secret?password=pw", "other")
+        .await;
     assert_eq!(reply.status, StatusCode::OK);
     let access = reply.data()[0]["token"].as_str().unwrap().to_string();
-    assert_eq!(h.state.tokens.decode(&access).unwrap().token_type, TokenType::Access);
+    assert_eq!(
+        h.state.tokens.decode(&access).unwrap().token_type,
+        TokenType::Access
+    );
     assert_eq!(reply.data()[0]["uids"][0]["data"], "u-1");
 
     // The ACCESS token gives the default role from now on.
-    let reply = h.call("GET", "/Marti/api/missions/Secret/changes", "other", &[("MissionAuthorization", &bearer(&access))], "").await;
+    let reply = h
+        .call(
+            "GET",
+            "/Marti/api/missions/Secret/changes",
+            "other",
+            &[("MissionAuthorization", &bearer(&access))],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::OK);
     // A token for another mission doesn't count.
     let (_, other_owner) = h.create("Other", "jz", "").await;
-    let reply = h.call("GET", "/Marti/api/missions/Secret/changes", "other", &[("MissionAuthorization", &bearer(&other_owner))], "").await;
+    let reply = h
+        .call(
+            "GET",
+            "/Marti/api/missions/Secret/changes",
+            "other",
+            &[("MissionAuthorization", &bearer(&other_owner))],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     // The admin is owner everywhere.
-    assert_eq!(h.get("/Marti/api/missions/Secret/changes", "admin").await.status, StatusCode::OK);
+    assert_eq!(
+        h.get("/Marti/api/missions/Secret/changes", "admin")
+            .await
+            .status,
+        StatusCode::OK
+    );
 }
 
 /// `getAllMissions` → `getAllMissionsByToolNoGroupCheck`: no invite-only,
@@ -227,15 +355,37 @@ async fn the_list_follows_the_official_query() {
     h.create("Locked", "jz", "&password=pw").await;
     h.create("Invite", "jz", "&inviteOnly=true").await;
     h.create("Tooled", "jz", "&tool=other").await;
-    h.create("Viewer", "jz", "&defaultRole=MISSION_READONLY_SUBSCRIBER").await;
+    h.create("Viewer", "jz", "&defaultRole=MISSION_READONLY_SUBSCRIBER")
+        .await;
 
     let names = |reply: &Reply| -> Vec<String> {
-        reply.data().as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap().to_string()).collect()
+        reply
+            .data()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap().to_string())
+            .collect()
     };
-    assert_eq!(names(&h.get("/Marti/api/missions", "jz").await), ["Alpha", "bravo"]);
-    assert_eq!(names(&h.get("/Marti/api/missions?passwordProtected=true", "jz").await), ["Alpha", "bravo", "Locked"]);
-    assert_eq!(names(&h.get("/Marti/api/missions?defaultRole=true", "jz").await), ["Alpha", "bravo", "Viewer"]);
-    assert_eq!(names(&h.get("/Marti/api/missions?tool=other", "jz").await), ["Tooled"]);
+    assert_eq!(
+        names(&h.get("/Marti/api/missions", "jz").await),
+        ["Alpha", "bravo"]
+    );
+    assert_eq!(
+        names(
+            &h.get("/Marti/api/missions?passwordProtected=true", "jz")
+                .await
+        ),
+        ["Alpha", "bravo", "Locked"]
+    );
+    assert_eq!(
+        names(&h.get("/Marti/api/missions?defaultRole=true", "jz").await),
+        ["Alpha", "bravo", "Viewer"]
+    );
+    assert_eq!(
+        names(&h.get("/Marti/api/missions?tool=other", "jz").await),
+        ["Tooled"]
+    );
 }
 
 /// Groups: a mission is invisible outside its groups.
@@ -243,14 +393,39 @@ async fn the_list_follows_the_official_query() {
 async fn missions_are_invisible_outside_their_groups() {
     let h = harness();
     h.state.groups.create("Red", None, 0).unwrap();
-    h.state.groups.set_member("Red", "red-1", Some(crate::groups::Membership::Both)).unwrap();
-    let reply = h.call("PUT", "/Marti/api/missions/RedOps?creatorUid=R&group=Red", "red-1", &[], "").await;
+    h.state
+        .groups
+        .set_member("Red", "red-1", Some(crate::groups::Membership::Both))
+        .unwrap();
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/RedOps?creatorUid=R&group=Red",
+            "red-1",
+            &[],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::CREATED);
     assert_eq!(reply.data()[0]["groups"], json!(["Red"]));
-    assert_eq!(h.get("/Marti/api/missions/RedOps", "outsider").await.status, StatusCode::NOT_FOUND);
-    assert_eq!(h.get("/Marti/api/missions", "outsider").await.data(), json!([]));
+    assert_eq!(
+        h.get("/Marti/api/missions/RedOps", "outsider").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        h.get("/Marti/api/missions", "outsider").await.data(),
+        json!([])
+    );
     // A non-member can't put a mission into Red.
-    let reply = h.call("PUT", "/Marti/api/missions/Sneaky?creatorUid=X&group=Red", "outsider", &[], "").await;
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Sneaky?creatorUid=X&group=Red",
+            "outsider",
+            &[],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
 }
 
@@ -265,7 +440,12 @@ async fn contents_and_changes() {
     h.state
         .resources
         .insert(
-            crate::sync::NewResource { uid: "r-1".into(), name: Some("map.png".into()), submission_user: "jz".into(), ..Default::default() },
+            crate::sync::NewResource {
+                uid: "r-1".into(),
+                name: Some("map.png".into()),
+                submission_user: "jz".into(),
+                ..Default::default()
+            },
             &hash,
             10,
             1,
@@ -274,32 +454,77 @@ async fn contents_and_changes() {
     let (_, token) = h.create("Ops", "jz", "").await;
     let auth = [("MissionAuthorization", bearer(&token))];
     let auth: Vec<(&str, &str)> = auth.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let body = format!(r#"{{"hashes":["{hash}","{}"],"uids":["marker-1"]}}"#, "c".repeat(64));
-    let reply = h.call("PUT", "/Marti/api/missions/Ops/contents?creatorUid=ANDROID-1", "jz", &auth, &body).await;
+    let body = format!(
+        r#"{{"hashes":["{hash}","{}"],"uids":["marker-1"]}}"#,
+        "c".repeat(64)
+    );
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/contents?creatorUid=ANDROID-1",
+            "jz",
+            &auth,
+            &body,
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     let m = &reply.data()[0];
-    assert_eq!(m["groups"], json!([]), "the official response clears groups");
-    assert_eq!(m["contents"].as_array().unwrap().len(), 1, "unknown hash skipped");
+    assert_eq!(
+        m["groups"],
+        json!([]),
+        "the official response clears groups"
+    );
+    assert_eq!(
+        m["contents"].as_array().unwrap().len(),
+        1,
+        "unknown hash skipped"
+    );
     assert_eq!(m["contents"][0]["data"]["hash"], hash);
     assert_eq!(m["contents"][0]["creatorUid"], "ANDROID-1");
     assert_eq!(m["uids"][0]["data"], "marker-1");
 
-    let reply = h.call("PUT", "/Marti/api/missions/Ops/contents", "jz", &auth, r#"{"hashes":[],"uids":[]}"#).await;
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/contents",
+            "jz",
+            &auth,
+            r#"{"hashes":[],"uids":[]}"#,
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-    assert_eq!(reply.json()["message"], "Invalid Request: at least one hash or uid must be provided in request");
+    assert_eq!(
+        reply.json()["message"],
+        "Invalid Request: at least one hash or uid must be provided in request"
+    );
 
-    let reply = h.call("DELETE", "/Marti/api/missions/Ops/contents?uid=marker-1&creatorUid=ANDROID-2", "jz", &auth, "").await;
+    let reply = h
+        .call(
+            "DELETE",
+            "/Marti/api/missions/Ops/contents?uid=marker-1&creatorUid=ANDROID-2",
+            "jz",
+            &auth,
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.data()[0]["uids"], json!([]));
 
-    let changes = h.call("GET", "/Marti/api/missions/Ops/changes", "jz", &auth, "").await;
+    let changes = h
+        .call("GET", "/Marti/api/missions/Ops/changes", "jz", &auth, "")
+        .await;
     assert_eq!(changes.json()["type"], "MissionChange");
     let types: Vec<(String, Option<String>)> = changes
         .data()
         .as_array()
         .unwrap()
         .iter()
-        .map(|c| (c["type"].as_str().unwrap().to_string(), c["contentUid"].as_str().map(String::from)))
+        .map(|c| {
+            (
+                c["type"].as_str().unwrap().to_string(),
+                c["contentUid"].as_str().map(String::from),
+            )
+        })
         .collect();
     assert_eq!(
         types,
@@ -313,7 +538,15 @@ async fn contents_and_changes() {
     assert_eq!(add["contentResource"]["hash"], hash);
     assert!(add.get("contentHash").is_none(), "@JsonIgnore");
     assert!(is_pad_millis(&add["serverTime"]));
-    let full = h.call("GET", "/Marti/api/missions/Ops/changes?squashed=false", "jz", &auth, "").await;
+    let full = h
+        .call(
+            "GET",
+            "/Marti/api/missions/Ops/changes?squashed=false",
+            "jz",
+            &auth,
+            "",
+        )
+        .await;
     assert_eq!(full.data().as_array().unwrap().len(), 4);
 }
 
@@ -321,10 +554,24 @@ async fn contents_and_changes() {
 #[tokio::test]
 async fn read_only_subscribers_cannot_write() {
     let h = harness();
-    h.create("Ops", "jz", "&defaultRole=MISSION_READONLY_SUBSCRIBER").await;
-    let reply = h.call("PUT", "/Marti/api/missions/Ops/contents", "viewer", &[], r#"{"uids":["x"]}"#).await;
+    h.create("Ops", "jz", "&defaultRole=MISSION_READONLY_SUBSCRIBER")
+        .await;
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/contents",
+            "viewer",
+            &[],
+            r#"{"uids":["x"]}"#,
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
-    assert_eq!(h.get("/Marti/api/missions/Ops/changes", "viewer").await.status, StatusCode::OK);
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops/changes", "viewer")
+            .await
+            .status,
+        StatusCode::OK
+    );
 }
 
 // --- keywords ----------------------------------------------------------------------------------
@@ -333,21 +580,88 @@ async fn read_only_subscribers_cannot_write() {
 async fn keywords() {
     let h = harness();
     h.create("Ops", "jz", "").await;
-    let reply = h.call("PUT", "/Marti/api/missions/Ops/keywords", "jz", &[("content-type", "application/json")], r#"["b","a","b"]"#).await;
-    assert_eq!(reply.data()[0]["keywords"], json!(["a", "b"]), "a sorted set");
-    let reply = h.call("DELETE", "/Marti/api/missions/Ops/keywords/zzz", "jz", &[], "").await;
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/keywords",
+            "jz",
+            &[("content-type", "application/json")],
+            r#"["b","a","b"]"#,
+        )
+        .await;
+    assert_eq!(
+        reply.data()[0]["keywords"],
+        json!(["a", "b"]),
+        "a sorted set"
+    );
+    let reply = h
+        .call(
+            "DELETE",
+            "/Marti/api/missions/Ops/keywords/zzz",
+            "jz",
+            &[],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-    let reply = h.call("DELETE", "/Marti/api/missions/Ops/keywords/a", "jz", &[], "").await;
+    let reply = h
+        .call(
+            "DELETE",
+            "/Marti/api/missions/Ops/keywords/a",
+            "jz",
+            &[],
+            "",
+        )
+        .await;
     assert_eq!(reply.data()[0]["keywords"], json!(["b"]));
 
-    h.call("PUT", "/Marti/api/missions/Ops/contents", "jz", &[], r#"{"uids":["u-1"]}"#).await;
-    assert_eq!(h.call("PUT", "/Marti/api/missions/Ops/uid/u-1/keywords", "jz", &[], r#"[]"#).await.status, StatusCode::BAD_REQUEST);
-    assert_eq!(h.call("PUT", "/Marti/api/missions/Ops/uid/u-1/keywords", "jz", &[], r#"["k1"]"#).await.status, StatusCode::OK);
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/contents",
+        "jz",
+        &[],
+        r#"{"uids":["u-1"]}"#,
+    )
+    .await;
+    assert_eq!(
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Ops/uid/u-1/keywords",
+            "jz",
+            &[],
+            r#"[]"#
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Ops/uid/u-1/keywords",
+            "jz",
+            &[],
+            r#"["k1"]"#
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
     let m = h.get("/Marti/api/missions/Ops", "jz").await.data()[0].clone();
     assert_eq!(m["uids"][0]["keywords"], json!(["k1"]));
-    h.call("DELETE", "/Marti/api/missions/Ops/uid/u-1/keywords", "jz", &[], "").await;
+    h.call(
+        "DELETE",
+        "/Marti/api/missions/Ops/uid/u-1/keywords",
+        "jz",
+        &[],
+        "",
+    )
+    .await;
     let m = h.get("/Marti/api/missions/Ops", "jz").await.data()[0].clone();
-    assert!(m["uids"][0].get("keywords").is_none(), "null keywords are omitted");
+    assert!(
+        m["uids"][0].get("keywords").is_none(),
+        "null keywords are omitted"
+    );
 }
 
 // --- subscriptions and roles -------------------------------------------------------------------
@@ -357,12 +671,35 @@ async fn keywords() {
 async fn subscribing_and_unsubscribing() {
     let h = harness();
     h.create("Ops", "jz", "").await;
-    let reply = h.call("PUT", "/Marti/api/missions/Ops/subscription", "alpha", &[], "").await;
-    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "uid or topic required");
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/subscription",
+            "alpha",
+            &[],
+            "",
+        )
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::BAD_REQUEST,
+        "uid or topic required"
+    );
 
-    let reply = h.call("PUT", "/Marti/api/missions/Ops/subscription?uid=ANDROID-A", "alpha", &[], "").await;
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/subscription?uid=ANDROID-A",
+            "alpha",
+            &[],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::CREATED);
-    assert_eq!(reply.json()["type"], "com.bbn.marti.sync.model.MissionSubscription");
+    assert_eq!(
+        reply.json()["type"],
+        "com.bbn.marti.sync.model.MissionSubscription"
+    );
     let sub = reply.data();
     assert_eq!(sub["clientUid"], "ANDROID-A");
     assert_eq!(sub["username"], "alpha");
@@ -370,30 +707,104 @@ async fn subscribing_and_unsubscribing() {
     assert!(sub.get("mission").is_none(), "API version 2: no mission");
     let token = sub["token"].as_str().unwrap().to_string();
 
-    let again = h.call("PUT", "/Marti/api/missions/Ops/subscription?uid=ANDROID-A", "alpha", &[("API_VERSION", "3")], "").await;
-    assert_eq!(again.data()["token"], token.as_str(), "the same subscription");
+    let again = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/subscription?uid=ANDROID-A",
+            "alpha",
+            &[("API_VERSION", "3")],
+            "",
+        )
+        .await;
+    assert_eq!(
+        again.data()["token"],
+        token.as_str(),
+        "the same subscription"
+    );
     assert_eq!(again.data()["mission"]["name"], "Ops");
 
-    let mine = h.get("/Marti/api/missions/Ops/subscription?uid=ANDROID-A", "alpha").await;
+    let mine = h
+        .get(
+            "/Marti/api/missions/Ops/subscription?uid=ANDROID-A",
+            "alpha",
+        )
+        .await;
     assert_eq!(mine.data()["token"], token.as_str());
-    assert_eq!(h.get("/Marti/api/missions/Ops/subscription?uid=ANDROID-A", "someone-else").await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        h.get(
+            "/Marti/api/missions/Ops/subscription?uid=ANDROID-A",
+            "someone-else"
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
 
-    let list = h.get("/Marti/api/missions/Ops/subscriptions", "alpha").await;
+    let list = h
+        .get("/Marti/api/missions/Ops/subscriptions", "alpha")
+        .await;
     assert_eq!(list.json()["type"], "MissionSubscription");
     assert_eq!(list.data(), json!(["ANDROID-jz", "ANDROID-A"]));
-    let roles = h.get("/Marti/api/missions/Ops/subscriptions/roles", "alpha").await;
-    assert!(roles.data().as_array().unwrap().iter().all(|s| s.get("token").is_none()), "no tokens");
+    let roles = h
+        .get("/Marti/api/missions/Ops/subscriptions/roles", "alpha")
+        .await;
+    assert!(
+        roles
+            .data()
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s.get("token").is_none()),
+        "no tokens"
+    );
 
     // disconnectOnly defaults to true: the stored subscription stays.
-    assert_eq!(h.call("DELETE", "/Marti/api/missions/Ops/subscription?uid=ANDROID-A", "alpha", &[], "").await.status, StatusCode::OK);
-    assert_eq!(h.get("/Marti/api/missions/Ops/subscriptions", "alpha").await.data().as_array().unwrap().len(), 2);
-    h.call("DELETE", "/Marti/api/missions/Ops/subscription?uid=ANDROID-A&disconnectOnly=false", "alpha", &[], "").await;
-    assert_eq!(h.get("/Marti/api/missions/Ops/subscriptions", "alpha").await.data(), json!(["ANDROID-jz"]));
+    assert_eq!(
+        h.call(
+            "DELETE",
+            "/Marti/api/missions/Ops/subscription?uid=ANDROID-A",
+            "alpha",
+            &[],
+            ""
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops/subscriptions", "alpha")
+            .await
+            .data()
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    h.call(
+        "DELETE",
+        "/Marti/api/missions/Ops/subscription?uid=ANDROID-A&disconnectOnly=false",
+        "alpha",
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops/subscriptions", "alpha")
+            .await
+            .data(),
+        json!(["ANDROID-jz"])
+    );
 
     // the subscription token decides the role
-    let role = h.call("GET", "/Marti/api/missions/Ops/role", "jz", &[], "").await;
+    let role = h
+        .call("GET", "/Marti/api/missions/Ops/role", "jz", &[], "")
+        .await;
     assert_eq!(role.json()["type"], "com.bbn.marti.sync.model.MissionRole");
-    assert_eq!(role.data()["type"], "MISSION_SUBSCRIBER", "no token: the default role");
+    assert_eq!(
+        role.data()["type"],
+        "MISSION_SUBSCRIBER",
+        "no token: the default role"
+    );
 }
 
 /// `subscribe` to password-protected and invite-only missions.
@@ -401,28 +812,99 @@ async fn subscribing_and_unsubscribing() {
 async fn subscribing_needs_the_password_or_an_invitation() {
     let h = harness();
     h.create("Secret", "jz", "&password=pw").await;
-    assert_eq!(h.call("PUT", "/Marti/api/missions/Secret/subscription?uid=X", "alpha", &[], "").await.status, StatusCode::FORBIDDEN);
-    assert_eq!(h.call("PUT", "/Marti/api/missions/Secret/subscription?uid=X&password=no", "alpha", &[], "").await.status, StatusCode::FORBIDDEN);
-    assert_eq!(h.call("PUT", "/Marti/api/missions/Secret/subscription?uid=X&password=pw", "alpha", &[], "").await.status, StatusCode::CREATED);
+    assert_eq!(
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Secret/subscription?uid=X",
+            "alpha",
+            &[],
+            ""
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Secret/subscription?uid=X&password=no",
+            "alpha",
+            &[],
+            ""
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Secret/subscription?uid=X&password=pw",
+            "alpha",
+            &[],
+            ""
+        )
+        .await
+        .status,
+        StatusCode::CREATED
+    );
     let (_, _) = h.create("Open", "jz", "").await;
     assert_eq!(
-        h.call("PUT", "/Marti/api/missions/Open/subscription?uid=X&password=pw", "alpha", &[], "").await.status,
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Open/subscription?uid=X&password=pw",
+            "alpha",
+            &[],
+            ""
+        )
+        .await
+        .status,
         StatusCode::FORBIDDEN,
         "a password for a mission without one"
     );
 
     let (_, owner) = h.create("Invited", "jz", "&inviteOnly=true").await;
-    assert_eq!(h.call("PUT", "/Marti/api/missions/Invited/subscription?uid=X", "alpha", &[], "").await.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Invited/subscription?uid=X",
+            "alpha",
+            &[],
+            ""
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
     let reply = h
-        .call("PUT", "/Marti/api/missions/Invited/invite/userName/alpha?creatorUid=ANDROID-jz", "jz", &[("MissionAuthorization", &bearer(&owner))], "")
+        .call(
+            "PUT",
+            "/Marti/api/missions/Invited/invite/userName/alpha?creatorUid=ANDROID-jz",
+            "jz",
+            &[("MissionAuthorization", &bearer(&owner))],
+            "",
+        )
         .await;
     assert_eq!(reply.status, StatusCode::OK);
-    let invitations = h.get("/Marti/api/missions/invitations?clientUid=X", "alpha").await;
+    let invitations = h
+        .get("/Marti/api/missions/invitations?clientUid=X", "alpha")
+        .await;
     assert_eq!(invitations.json()["type"], "MissionInvitation");
     assert_eq!(invitations.data()[0]["missionName"], "Invited");
     assert_eq!(invitations.data()[0]["type"], "userName");
     assert_eq!(invitations.data()[0]["role"]["type"], "MISSION_SUBSCRIBER");
-    assert_eq!(h.call("PUT", "/Marti/api/missions/Invited/subscription?uid=X", "alpha", &[], "").await.status, StatusCode::CREATED);
+    assert_eq!(
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Invited/subscription?uid=X",
+            "alpha",
+            &[],
+            ""
+        )
+        .await
+        .status,
+        StatusCode::CREATED
+    );
 }
 
 #[tokio::test]
@@ -430,15 +912,41 @@ async fn invitations() {
     let h = harness();
     let (_, owner) = h.create("Ops", "jz", "").await;
     let auth = bearer(&owner);
-    let reply = h.call("PUT", "/Marti/api/missions/Ops/invite/clientUid/ANDROID-B", "jz", &[("MissionAuthorization", &auth)], "").await;
-    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "creatorUid is required");
     let reply = h
-        .call("PUT", "/Marti/api/missions/Ops/invite/clientUid/ANDROID-B?creatorUid=C&role=MISSION_OWNER", "jz", &[("MissionAuthorization", &auth)], "")
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/invite/clientUid/ANDROID-B",
+            "jz",
+            &[("MissionAuthorization", &auth)],
+            "",
+        )
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::BAD_REQUEST,
+        "creatorUid is required"
+    );
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/invite/clientUid/ANDROID-B?creatorUid=C&role=MISSION_OWNER",
+            "jz",
+            &[("MissionAuthorization", &auth)],
+            "",
+        )
         .await;
     assert_eq!(reply.status, StatusCode::OK);
     // Without a token the caller only has the default (subscriber) role,
     // which can't hand out owner.
-    let reply = h.call("PUT", "/Marti/api/missions/Ops/invite/clientUid/ANDROID-C?creatorUid=C&role=MISSION_OWNER", "jz", &[], "").await;
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/invite/clientUid/ANDROID-C?creatorUid=C&role=MISSION_OWNER",
+            "jz",
+            &[],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     // Nor anything below the default role.
     let reply = h
@@ -446,7 +954,12 @@ async fn invitations() {
         .await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
 
-    let names = h.get("/Marti/api/missions/all/invitations?clientUid=ANDROID-B", "anyone").await;
+    let names = h
+        .get(
+            "/Marti/api/missions/all/invitations?clientUid=ANDROID-B",
+            "anyone",
+        )
+        .await;
     assert_eq!(names.data(), json!(["Ops"]));
     let listed = h.get("/Marti/api/missions/Ops/invitations", "jz").await;
     assert_eq!(listed.data()[0]["invitee"], "ANDROID-B");
@@ -454,14 +967,47 @@ async fn invitations() {
 
     // Subscribing consumes the clientUid invitation and uses its role.
     let token = listed.data()[0]["token"].as_str().unwrap().to_string();
-    let sub = h.call("PUT", "/Marti/api/missions/Ops/subscription?uid=ANDROID-B", "bee", &[("MissionAuthorization", &bearer(&token))], "").await;
+    let sub = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/subscription?uid=ANDROID-B",
+            "bee",
+            &[("MissionAuthorization", &bearer(&token))],
+            "",
+        )
+        .await;
     assert_eq!(sub.data()["role"]["type"], "MISSION_OWNER");
-    assert_eq!(h.get("/Marti/api/missions/Ops/invitations", "jz").await.data(), json!([]));
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops/invitations", "jz")
+            .await
+            .data(),
+        json!([])
+    );
 
-    h.call("PUT", "/Marti/api/missions/Ops/invite/callsign/Zulu?creatorUid=C", "jz", &[("MissionAuthorization", &auth)], "").await;
-    let reply = h.call("DELETE", "/Marti/api/missions/Ops/invite/callsign/zulu?creatorUid=C", "jz", &[], "").await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/invite/callsign/Zulu?creatorUid=C",
+        "jz",
+        &[("MissionAuthorization", &auth)],
+        "",
+    )
+    .await;
+    let reply = h
+        .call(
+            "DELETE",
+            "/Marti/api/missions/Ops/invite/callsign/zulu?creatorUid=C",
+            "jz",
+            &[],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::OK);
-    assert_eq!(h.get("/Marti/api/missions/Ops/invitations", "jz").await.data(), json!([]));
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops/invitations", "jz")
+            .await
+            .data(),
+        json!([])
+    );
 }
 
 /// `setMissionRole`: `MISSION_SET_ROLE`, and only on missions with a
@@ -471,18 +1017,79 @@ async fn setting_a_role() {
     let h = harness();
     let (_, owner) = h.create("Ops", "jz", "").await;
     let auth = bearer(&owner);
-    h.call("PUT", "/Marti/api/missions/Ops/subscription?uid=ANDROID-A", "alpha", &[], "").await;
-    let reply = h.call("PUT", "/Marti/api/missions/Ops/role?clientUid=ANDROID-A&role=MISSION_OWNER", "jz", &[("MissionAuthorization", &auth)], "").await;
-    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "no default role on this mission");
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/subscription?uid=ANDROID-A",
+        "alpha",
+        &[],
+        "",
+    )
+    .await;
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/role?clientUid=ANDROID-A&role=MISSION_OWNER",
+            "jz",
+            &[("MissionAuthorization", &auth)],
+            "",
+        )
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::BAD_REQUEST,
+        "no default role on this mission"
+    );
 
-    let (_, owner) = h.create("Roles", "jz", "&defaultRole=MISSION_SUBSCRIBER").await;
+    let (_, owner) = h
+        .create("Roles", "jz", "&defaultRole=MISSION_SUBSCRIBER")
+        .await;
     let auth = bearer(&owner);
-    let sub = h.call("PUT", "/Marti/api/missions/Roles/subscription?uid=ANDROID-A", "alpha", &[], "").await.data();
-    let reply = h.call("PUT", "/Marti/api/missions/Roles/role?clientUid=ANDROID-A&role=MISSION_OWNER", "alpha", &[], "").await;
-    assert_eq!(reply.status, StatusCode::FORBIDDEN, "a subscriber lacks MISSION_SET_ROLE");
-    let reply = h.call("PUT", "/Marti/api/missions/Roles/role?clientUid=ANDROID-A&role=MISSION_OWNER", "jz", &[("MissionAuthorization", &auth)], "").await;
+    let sub = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Roles/subscription?uid=ANDROID-A",
+            "alpha",
+            &[],
+            "",
+        )
+        .await
+        .data();
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Roles/role?clientUid=ANDROID-A&role=MISSION_OWNER",
+            "alpha",
+            &[],
+            "",
+        )
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::FORBIDDEN,
+        "a subscriber lacks MISSION_SET_ROLE"
+    );
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Roles/role?clientUid=ANDROID-A&role=MISSION_OWNER",
+            "jz",
+            &[("MissionAuthorization", &auth)],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::OK);
-    let role = h.call("GET", "/Marti/api/missions/Roles/role", "alpha", &[("MissionAuthorization", &bearer(sub["token"].as_str().unwrap()))], "").await;
+    let role = h
+        .call(
+            "GET",
+            "/Marti/api/missions/Roles/role",
+            "alpha",
+            &[(
+                "MissionAuthorization",
+                &bearer(sub["token"].as_str().unwrap()),
+            )],
+            "",
+        )
+        .await;
     assert_eq!(role.data()["type"], "MISSION_OWNER");
 }
 
@@ -495,23 +1102,97 @@ async fn access_tokens_and_passwords() {
     let reply = h.get("/Marti/api/missions/Ops/token", "alpha").await;
     assert_eq!(reply.status, StatusCode::CREATED);
     assert_eq!(reply.json()["type"], "java.lang.String");
-    assert_eq!(h.state.tokens.decode(reply.data().as_str().unwrap()).unwrap().token_type, TokenType::Access);
+    assert_eq!(
+        h.state
+            .tokens
+            .decode(reply.data().as_str().unwrap())
+            .unwrap()
+            .token_type,
+        TokenType::Access
+    );
 
-    assert_eq!(h.call("PUT", "/Marti/api/missions/Ops/password?password=pw", "alpha", &[], "").await.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Ops/password?password=pw",
+            "alpha",
+            &[],
+            ""
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
     let auth = bearer(&owner);
-    assert_eq!(h.call("PUT", "/Marti/api/missions/Ops/password?password=pw", "jz", &[("MissionAuthorization", &auth)], "").await.status, StatusCode::OK);
-    assert_eq!(h.get("/Marti/api/missions/Ops/changes", "alpha").await.status, StatusCode::FORBIDDEN, "now password-protected");
-    assert_eq!(h.get("/Marti/api/missions/Ops/changes", "jz").await.status, StatusCode::FORBIDDEN, "no token, no role");
-    assert_eq!(h.call("GET", "/Marti/api/missions/Ops/changes", "jz", &[("MissionAuthorization", &auth)], "").await.status, StatusCode::OK);
-    assert_eq!(h.call("DELETE", "/Marti/api/missions/Ops/password", "jz", &[("MissionAuthorization", &auth)], "").await.status, StatusCode::OK);
-    assert_eq!(h.get("/Marti/api/missions/Ops/changes", "alpha").await.status, StatusCode::OK);
+    assert_eq!(
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Ops/password?password=pw",
+            "jz",
+            &[("MissionAuthorization", &auth)],
+            ""
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops/changes", "alpha")
+            .await
+            .status,
+        StatusCode::FORBIDDEN,
+        "now password-protected"
+    );
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops/changes", "jz").await.status,
+        StatusCode::FORBIDDEN,
+        "no token, no role"
+    );
+    assert_eq!(
+        h.call(
+            "GET",
+            "/Marti/api/missions/Ops/changes",
+            "jz",
+            &[("MissionAuthorization", &auth)],
+            ""
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.call(
+            "DELETE",
+            "/Marti/api/missions/Ops/password",
+            "jz",
+            &[("MissionAuthorization", &auth)],
+            ""
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops/changes", "alpha")
+            .await
+            .status,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
 async fn log_entries() {
     let h = harness();
     h.create("Ops", "jz", "").await;
-    let reply = h.call("POST", "/Marti/api/missions/logs/entries", "jz", &[], r#"{"id":"x","missionNames":["Ops"]}"#).await;
+    let reply = h
+        .call(
+            "POST",
+            "/Marti/api/missions/logs/entries",
+            "jz",
+            &[],
+            r#"{"id":"x","missionNames":["Ops"]}"#,
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     let reply = h
         .call(
@@ -532,18 +1213,57 @@ async fn log_entries() {
     assert!(is_pad_millis(&entry["created"]), "{entry}");
     assert_ne!(entry["created"], "2020-01-01T00:00:00.000Z");
 
-    let one = h.get(&format!("/Marti/api/missions/logs/entries/{id}"), "jz").await;
+    let one = h
+        .get(&format!("/Marti/api/missions/logs/entries/{id}"), "jz")
+        .await;
     assert_eq!(one.data()[0]["content"], "contact");
     let put = h
-        .call("PUT", "/Marti/api/missions/logs/entries", "jz", &[], &format!(r#"{{"id":"{id}","content":"changed","missionNames":["Ops"]}}"#))
+        .call(
+            "PUT",
+            "/Marti/api/missions/logs/entries",
+            "jz",
+            &[],
+            &format!(r#"{{"id":"{id}","content":"changed","missionNames":["Ops"]}}"#),
+        )
         .await;
     assert_eq!(put.data()["content"], "changed");
     assert!(is_pad_millis(&put.data()["created"]));
-    assert_eq!(h.get("/Marti/api/missions/Ops/log", "jz").await.data()[0]["content"], "changed");
-    assert_eq!(h.get("/Marti/api/missions/all/logs", "jz").await.status, StatusCode::FORBIDDEN, "admin only");
-    assert_eq!(h.get("/Marti/api/missions/all/logs", "admin").await.data().as_array().unwrap().len(), 1);
-    assert_eq!(h.call("DELETE", &format!("/Marti/api/missions/logs/entries/{id}"), "jz", &[], "").await.status, StatusCode::OK);
-    assert_eq!(h.get(&format!("/Marti/api/missions/logs/entries/{id}"), "jz").await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops/log", "jz").await.data()[0]["content"],
+        "changed"
+    );
+    assert_eq!(
+        h.get("/Marti/api/missions/all/logs", "jz").await.status,
+        StatusCode::FORBIDDEN,
+        "admin only"
+    );
+    assert_eq!(
+        h.get("/Marti/api/missions/all/logs", "admin")
+            .await
+            .data()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        h.call(
+            "DELETE",
+            &format!("/Marti/api/missions/logs/entries/{id}"),
+            "jz",
+            &[],
+            ""
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.get(&format!("/Marti/api/missions/logs/entries/{id}"), "jz")
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
 }
 
 /// `getLatestMissionCotEvents`: XML, the latest event of each mission uid;
@@ -552,15 +1272,32 @@ async fn log_entries() {
 async fn mission_cot_and_uid_details() {
     let h = harness();
     h.create("Ops", "jz", "").await;
-    h.call("PUT", "/Marti/api/missions/Ops/contents", "jz", &[], r#"{"uids":["m-1","never-seen"]}"#).await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/contents",
+        "jz",
+        &[],
+        r#"{"uids":["m-1","never-seen"]}"#,
+    )
+    .await;
     let event = r#"<event version="2.0" uid="m-1" type="a-h-G" how="h-g-i-g-o" time="t" start="t" stale="t"><point lat="1.5" lon="2.5" hae="0" ce="0" le="0"/><detail><contact callsign="Hostile"/></detail></event>"#;
-    h.state.latest_cot.record("m-1", &format!("<?xml version=\"1.0\"?>{event}"), 1);
+    h.state
+        .latest_cot
+        .record("m-1", &format!("<?xml version=\"1.0\"?>{event}"), 1);
     let reply = h.get("/Marti/api/missions/Ops/cot", "jz").await;
     assert_eq!(reply.content_type.as_deref(), Some("application/xml"));
-    assert_eq!(reply.text(), format!("<?xml version='1.0' encoding='UTF-8' standalone='yes'?><events>{event}\n</events>"));
+    assert_eq!(
+        reply.text(),
+        format!(
+            "<?xml version='1.0' encoding='UTF-8' standalone='yes'?><events>{event}\n</events>"
+        )
+    );
     let m = h.get("/Marti/api/missions/Ops", "jz").await.data()[0].clone();
     assert_eq!(m["uids"][0]["details"]["callsign"], "Hostile");
-    assert_eq!(m["uids"][0]["details"]["location"], json!({ "lat": 1.5, "lon": 2.5 }));
+    assert_eq!(
+        m["uids"][0]["details"]["location"],
+        json!({ "lat": 1.5, "lon": 2.5 })
+    );
     assert!(m["uids"][1].get("details").is_none());
 }
 
@@ -569,13 +1306,28 @@ async fn mission_cot_and_uid_details() {
 async fn errors_have_the_official_body() {
     let h = harness();
     h.create("Ops", "jz", "").await;
-    let reply = h.get("/Marti/api/missions/Ops/changes?secago=abc", "jz").await;
+    let reply = h
+        .get("/Marti/api/missions/Ops/changes?secago=abc", "jz")
+        .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert_eq!(reply.json()["status"], "BAD_REQUEST");
     assert_eq!(reply.json()["code"], 2);
-    assert!(reply.json()["message"].as_str().unwrap().starts_with("Invalid Request: "));
-    let reply = h.get("/Marti/api/missions/Ops/changes?start=2026-10-18T00:00:00Z&end=2026-10-17T00:00:00Z", "jz").await;
-    assert_eq!(reply.json()["message"], "Invalid Request: invalid time range");
+    assert!(
+        reply.json()["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Invalid Request: ")
+    );
+    let reply = h
+        .get(
+            "/Marti/api/missions/Ops/changes?start=2026-10-18T00:00:00Z&end=2026-10-17T00:00:00Z",
+            "jz",
+        )
+        .await;
+    assert_eq!(
+        reply.json()["message"],
+        "Invalid Request: invalid time range"
+    );
 }
 
 /// `COT_DATE_FORMAT_PAD_MILLIS` always has three-digit milliseconds.
@@ -592,17 +1344,45 @@ fn mission_dates_pad_milliseconds() {
 async fn a_subscription_token_carries_its_own_role() {
     let h = harness();
     h.create("Secret", "jz", "&password=pw").await;
-    let sub = h.call("PUT", "/Marti/api/missions/Secret/subscription?uid=ANDROID-V&password=pw", "visitor", &[], "").await.data();
+    let sub = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Secret/subscription?uid=ANDROID-V&password=pw",
+            "visitor",
+            &[],
+            "",
+        )
+        .await
+        .data();
     let auth = bearer(sub["token"].as_str().unwrap());
-    let role = h.call("GET", "/Marti/api/missions/Secret/role", "visitor", &[("MissionAuthorization", &auth)], "").await;
+    let role = h
+        .call(
+            "GET",
+            "/Marti/api/missions/Secret/role",
+            "visitor",
+            &[("MissionAuthorization", &auth)],
+            "",
+        )
+        .await;
     assert_eq!(role.data()["type"], "MISSION_SUBSCRIBER");
-    let reply = h.call("PUT", "/Marti/api/missions/Secret/password?password=x", "visitor", &[("MissionAuthorization", &auth)], "").await;
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Secret/password?password=x",
+            "visitor",
+            &[("MissionAuthorization", &auth)],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
 }
 
 // --- notifications (`DistributedSubscriptionManager`) ------------------------------------------
 
-fn harness_with_hub() -> (Harness, tokio::sync::broadcast::Receiver<crate::transport::hub::Outbound>) {
+fn harness_with_hub() -> (
+    Harness,
+    tokio::sync::broadcast::Receiver<crate::transport::hub::Outbound>,
+) {
     let (tx, rx) = tokio::sync::broadcast::channel(64);
     let mut state = MissionsState::with_hub(tx);
     state.admin_common_name = Some("admin".into());
@@ -610,7 +1390,9 @@ fn harness_with_hub() -> (Harness, tokio::sync::broadcast::Receiver<crate::trans
     (Harness { state, app }, rx)
 }
 
-fn drain(rx: &mut tokio::sync::broadcast::Receiver<crate::transport::hub::Outbound>) -> Vec<crate::transport::hub::Outbound> {
+fn drain(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::transport::hub::Outbound>,
+) -> Vec<crate::transport::hub::Outbound> {
     let mut out = Vec::new();
     while let Ok(m) = rx.try_recv() {
         out.push(m);
@@ -632,11 +1414,29 @@ async fn create_and_delete_are_broadcast() {
     let sent = drain(&mut rx);
     assert_eq!(sent.len(), 1);
     assert_eq!(cot_type(&sent[0].xml), "t-x-m-n");
-    assert!(sent[0].xml.contains(r#"<mission type="CREATE" tool="public" name="Ops""#), "{}", sent[0].xml);
+    assert!(
+        sent[0]
+            .xml
+            .contains(r#"<mission type="CREATE" tool="public" name="Ops""#),
+        "{}",
+        sent[0].xml
+    );
     assert!(sent[0].dest_uids.is_none(), "a broadcast");
-    assert_eq!(sent[0].origin, crate::transport::hub::Origin::Server { skip_uid: Some("ANDROID-jz".into()) });
+    assert_eq!(
+        sent[0].origin,
+        crate::transport::hub::Origin::Server {
+            skip_uid: Some("ANDROID-jz".into())
+        }
+    );
 
-    h.call("DELETE", "/Marti/api/missions/Ops?creatorUid=ANDROID-jz", "jz", &[("MissionAuthorization", &bearer(&token))], "").await;
+    h.call(
+        "DELETE",
+        "/Marti/api/missions/Ops?creatorUid=ANDROID-jz",
+        "jz",
+        &[("MissionAuthorization", &bearer(&token))],
+        "",
+    )
+    .await;
     let sent = drain(&mut rx);
     assert_eq!(cot_type(&sent[0].xml), "t-x-m-d");
 }
@@ -647,25 +1447,71 @@ async fn create_and_delete_are_broadcast() {
 async fn content_changes_go_to_live_subscribers() {
     let (h, mut rx) = harness_with_hub();
     h.create("Ops", "jz", "").await;
-    h.call("PUT", "/Marti/api/missions/Ops/subscription?uid=ANDROID-B", "bee", &[], "").await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/subscription?uid=ANDROID-B",
+        "bee",
+        &[],
+        "",
+    )
+    .await;
     drain(&mut rx);
 
-    h.call("PUT", "/Marti/api/missions/Ops/contents?creatorUid=ANDROID-jz", "jz", &[], r#"{"uids":["u-1","u-2"]}"#).await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/contents?creatorUid=ANDROID-jz",
+        "jz",
+        &[],
+        r#"{"uids":["u-1","u-2"]}"#,
+    )
+    .await;
     let sent = drain(&mut rx);
     assert_eq!(sent.len(), 2, "one per change");
     for (m, uid) in sent.iter().zip(["u-1", "u-2"]) {
         assert_eq!(cot_type(&m.xml), "t-x-m-c");
-        assert!(m.dest_uids.as_deref().unwrap().contains(&"ANDROID-jz".to_string()), "the creator's own subscription");
-        assert!(m.dest_uids.as_deref().unwrap().contains(&"ANDROID-B".to_string()));
+        assert!(
+            m.dest_uids
+                .as_deref()
+                .unwrap()
+                .contains(&"ANDROID-jz".to_string()),
+            "the creator's own subscription"
+        );
+        assert!(
+            m.dest_uids
+                .as_deref()
+                .unwrap()
+                .contains(&"ANDROID-B".to_string())
+        );
         assert!(m.xml.contains(&format!("<MissionChanges><MissionChange><contentUid>{uid}</contentUid><creatorUid>ANDROID-jz</creatorUid>")), "{}", m.xml);
         assert!(m.xml.contains("<type>ADD_CONTENT</type>"));
     }
 
-    h.call("DELETE", "/Marti/api/missions/Ops/subscription?uid=ANDROID-B", "bee", &[], "").await;
-    h.call("DELETE", "/Marti/api/missions/Ops/contents?uid=u-1&creatorUid=ANDROID-jz", "jz", &[], "").await;
+    h.call(
+        "DELETE",
+        "/Marti/api/missions/Ops/subscription?uid=ANDROID-B",
+        "bee",
+        &[],
+        "",
+    )
+    .await;
+    h.call(
+        "DELETE",
+        "/Marti/api/missions/Ops/contents?uid=u-1&creatorUid=ANDROID-jz",
+        "jz",
+        &[],
+        "",
+    )
+    .await;
     let sent = drain(&mut rx);
     assert_eq!(sent.len(), 1);
-    assert!(!sent[0].dest_uids.as_deref().unwrap().contains(&"ANDROID-B".to_string()), "disconnected");
+    assert!(
+        !sent[0]
+            .dest_uids
+            .as_deref()
+            .unwrap()
+            .contains(&"ANDROID-B".to_string()),
+        "disconnected"
+    );
     assert!(sent[0].xml.contains("<type>REMOVE_CONTENT</type>"));
 }
 
@@ -673,18 +1519,61 @@ async fn content_changes_go_to_live_subscribers() {
 async fn logs_and_keywords_are_announced() {
     let (h, mut rx) = harness_with_hub();
     h.create("Ops", "jz", "").await;
-    h.call("PUT", "/Marti/api/missions/Ops/subscription?uid=ANDROID-B", "bee", &[], "").await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/subscription?uid=ANDROID-B",
+        "bee",
+        &[],
+        "",
+    )
+    .await;
     drain(&mut rx);
 
-    h.call("POST", "/Marti/api/missions/logs/entries", "jz", &[], r#"{"content":"x","creatorUid":"ANDROID-jz","missionNames":["Ops"]}"#).await;
-    h.call("PUT", "/Marti/api/missions/Ops/keywords?creatorUid=ANDROID-jz", "jz", &[], r#"["k"]"#).await;
-    h.call("PUT", "/Marti/api/missions/Ops/uid/u-1/keywords?creatorUid=ANDROID-jz", "jz", &[], r#"["a","b"]"#).await;
-    h.call("DELETE", "/Marti/api/missions/Ops/content/abc/keywords?creatorUid=ANDROID-jz", "jz", &[], "").await;
+    h.call(
+        "POST",
+        "/Marti/api/missions/logs/entries",
+        "jz",
+        &[],
+        r#"{"content":"x","creatorUid":"ANDROID-jz","missionNames":["Ops"]}"#,
+    )
+    .await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/keywords?creatorUid=ANDROID-jz",
+        "jz",
+        &[],
+        r#"["k"]"#,
+    )
+    .await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/uid/u-1/keywords?creatorUid=ANDROID-jz",
+        "jz",
+        &[],
+        r#"["a","b"]"#,
+    )
+    .await;
+    h.call(
+        "DELETE",
+        "/Marti/api/missions/Ops/content/abc/keywords?creatorUid=ANDROID-jz",
+        "jz",
+        &[],
+        "",
+    )
+    .await;
     let sent = drain(&mut rx);
     let types: Vec<String> = sent.iter().map(|m| cot_type(&m.xml)).collect();
-    assert_eq!(types, ["t-x-m-c-l", "t-x-m-c-k", "t-x-m-c-k-u", "t-x-m-c-k-c"]);
-    assert!(sent[1].dest_uids.is_none(), "mission keywords are broadcast");
-    assert!(sent[2].xml.contains(r#"<uidKeywords uid="u-1"><uidKeyword keyword="a"/><uidKeyword keyword="b"/></uidKeywords>"#));
+    assert_eq!(
+        types,
+        ["t-x-m-c-l", "t-x-m-c-k", "t-x-m-c-k-u", "t-x-m-c-k-c"]
+    );
+    assert!(
+        sent[1].dest_uids.is_none(),
+        "mission keywords are broadcast"
+    );
+    assert!(sent[2].xml.contains(
+        r#"<uidKeywords uid="u-1"><uidKeyword keyword="a"/><uidKeyword keyword="b"/></uidKeywords>"#
+    ));
     assert!(sent[3].xml.contains("<contentKeywords/>"));
 }
 
@@ -693,26 +1582,71 @@ async fn logs_and_keywords_are_announced() {
 #[tokio::test]
 async fn invitations_and_role_changes_are_sent_to_the_client() {
     let (h, mut rx) = harness_with_hub();
-    let (_, owner) = h.create("Ops", "jz", "&defaultRole=MISSION_SUBSCRIBER").await;
+    let (_, owner) = h
+        .create("Ops", "jz", "&defaultRole=MISSION_SUBSCRIBER")
+        .await;
     let auth = bearer(&owner);
     drain(&mut rx);
-    let reply = h.call("PUT", "/Marti/api/missions/Ops/invite/clientUid/ANDROID-C?creatorUid=ANDROID-jz", "jz", &[("MissionAuthorization", &auth)], "").await;
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/invite/clientUid/ANDROID-C?creatorUid=ANDROID-jz",
+            "jz",
+            &[("MissionAuthorization", &auth)],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::OK);
     let sent = drain(&mut rx);
     assert_eq!(cot_type(&sent[0].xml), "t-x-m-i");
-    assert_eq!(sent[0].dest_uids.as_deref(), Some(&["ANDROID-C".to_string()][..]));
-    let invitation = h.get("/Marti/api/missions/Ops/invitations", "jz").await.data()[0].clone();
-    assert!(sent[0].xml.contains(&format!(r#"token="{}""#, invitation["token"].as_str().unwrap())));
+    assert_eq!(
+        sent[0].dest_uids.as_deref(),
+        Some(&["ANDROID-C".to_string()][..])
+    );
+    let invitation = h
+        .get("/Marti/api/missions/Ops/invitations", "jz")
+        .await
+        .data()[0]
+        .clone();
+    assert!(sent[0].xml.contains(&format!(
+        r#"token="{}""#,
+        invitation["token"].as_str().unwrap()
+    )));
     assert!(sent[0].xml.contains(r#"<role type="MISSION_SUBSCRIBER"><permissions><permission type="MISSION_READ"/><permission type="MISSION_WRITE"/></permissions></role>"#));
-    let again = h.call("PUT", "/Marti/api/missions/Ops/invite/clientUid/ANDROID-C?creatorUid=ANDROID-jz", "jz", &[("MissionAuthorization", &auth)], "").await;
+    let again = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/invite/clientUid/ANDROID-C?creatorUid=ANDROID-jz",
+            "jz",
+            &[("MissionAuthorization", &auth)],
+            "",
+        )
+        .await;
     assert_eq!(again.status, StatusCode::INTERNAL_SERVER_ERROR);
 
-    h.call("PUT", "/Marti/api/missions/Ops/subscription?uid=ANDROID-D", "dee", &[], "").await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/subscription?uid=ANDROID-D",
+        "dee",
+        &[],
+        "",
+    )
+    .await;
     drain(&mut rx);
-    h.call("PUT", "/Marti/api/missions/Ops/role?clientUid=ANDROID-D&role=MISSION_OWNER", "jz", &[("MissionAuthorization", &auth)], "").await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/role?clientUid=ANDROID-D&role=MISSION_OWNER",
+        "jz",
+        &[("MissionAuthorization", &auth)],
+        "",
+    )
+    .await;
     let sent = drain(&mut rx);
     assert_eq!(cot_type(&sent[0].xml), "t-x-m-r");
-    assert_eq!(sent[0].dest_uids.as_deref(), Some(&["ANDROID-D".to_string()][..]));
+    assert_eq!(
+        sent[0].dest_uids.as_deref(),
+        Some(&["ANDROID-D".to_string()][..])
+    );
     assert!(sent[0].xml.contains(r#"<role type="MISSION_OWNER">"#));
 }
 
@@ -725,11 +1659,22 @@ async fn invitations_and_role_changes_are_sent_to_the_client() {
 async fn layers_like_cloudtak_uses_them() {
     let (h, mut rx) = harness_with_hub();
     h.create("Ops", "jz", "").await;
-    let reply = h.call("PUT", "/Marti/api/missions/Ops/layers?name=Recon&type=GROUP&creatorUid=A", "jz", &[], "").await;
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/layers?name=Recon&type=GROUP&creatorUid=A",
+            "jz",
+            &[],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     assert_eq!(reply.json()["type"], "MissionLayer");
     let recon = reply.data();
-    assert_eq!((recon["name"].as_str(), recon["type"].as_str()), (Some("Recon"), Some("GROUP")));
+    assert_eq!(
+        (recon["name"].as_str(), recon["type"].as_str()),
+        (Some("Recon"), Some("GROUP"))
+    );
     assert!(recon.get("mission_layers").is_none(), "NON_EMPTY");
     let recon_uid = recon["uid"].as_str().unwrap().to_string();
     let markers = h
@@ -739,41 +1684,129 @@ async fn layers_like_cloudtak_uses_them() {
     assert_eq!(markers["parentUid"], recon_uid.as_str());
     let markers_uid = markers["uid"].as_str().unwrap().to_string();
     assert_eq!(
-        h.call("PUT", "/Marti/api/missions/Ops/layers?name=x&creatorUid=A", "jz", &[], "").await.status,
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Ops/layers?name=x&creatorUid=A",
+            "jz",
+            &[],
+            ""
+        )
+        .await
+        .status,
         StatusCode::BAD_REQUEST,
         "type is required"
     );
 
     let body = format!(r#"{{"paths":{{"{markers_uid}":[{{"uids":["m-1","m-2"]}}]}}}}"#);
-    assert_eq!(h.call("PUT", "/Marti/api/missions/Ops/contents?creatorUid=A", "jz", &[], &body).await.status, StatusCode::OK);
+    assert_eq!(
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Ops/contents?creatorUid=A",
+            "jz",
+            &[],
+            &body
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
     let layers = h.get("/Marti/api/missions/Ops/layers", "jz").await.data();
     assert_eq!(layers.as_array().unwrap().len(), 1, "only the top level");
     let nested = &layers[0]["mission_layers"];
-    assert_eq!(nested.as_array().unwrap().len(), 1, "ITEM layers are not listed as layers");
-    let uids: Vec<&str> = nested[0]["uids"].as_array().unwrap().iter().map(|u| u["data"].as_str().unwrap()).collect();
+    assert_eq!(
+        nested.as_array().unwrap().len(),
+        1,
+        "ITEM layers are not listed as layers"
+    );
+    let uids: Vec<&str> = nested[0]["uids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["data"].as_str().unwrap())
+        .collect();
     assert_eq!(uids, ["m-1", "m-2"], "filed in order");
-    let one = h.get(&format!("/Marti/api/missions/Ops/layers/{markers_uid}"), "jz").await.data();
+    let one = h
+        .get(
+            &format!("/Marti/api/missions/Ops/layers/{markers_uid}"),
+            "jz",
+        )
+        .await
+        .data();
     assert_eq!(one["parentUid"], recon_uid.as_str());
     assert_eq!(one["uids"].as_array().unwrap().len(), 2);
-    assert_eq!(h.get("/Marti/api/missions/Ops/layers/nope", "jz").await.status, StatusCode::NOT_FOUND);
-
-    h.call("PUT", &format!("/Marti/api/missions/Ops/layers/{markers_uid}/name?name=Pins&creatorUid=A"), "jz", &[], "").await;
-    let reply = h.call("PUT", &format!("/Marti/api/missions/Ops/layers/parent?layerUid={markers_uid}&creatorUid=A"), "jz", &[], "").await;
-    assert_eq!(reply.status, StatusCode::OK);
-    let names: Vec<String> = h.get("/Marti/api/missions/Ops/layers", "jz").await.data().as_array().unwrap().iter().map(|l| l["name"].as_str().unwrap().to_string()).collect();
-    assert_eq!(names.len(), 2);
-    assert!(names.contains(&"Pins".to_string()) && names.contains(&"Recon".to_string()), "{names:?}");
     assert_eq!(
-        h.call("PUT", "/Marti/api/missions/Ops/layers/parent?layerUid=nope&creatorUid=A", "jz", &[], "").await.status,
+        h.get("/Marti/api/missions/Ops/layers/nope", "jz")
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+
+    h.call(
+        "PUT",
+        &format!("/Marti/api/missions/Ops/layers/{markers_uid}/name?name=Pins&creatorUid=A"),
+        "jz",
+        &[],
+        "",
+    )
+    .await;
+    let reply = h
+        .call(
+            "PUT",
+            &format!("/Marti/api/missions/Ops/layers/parent?layerUid={markers_uid}&creatorUid=A"),
+            "jz",
+            &[],
+            "",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let names: Vec<String> = h
+        .get("/Marti/api/missions/Ops/layers", "jz")
+        .await
+        .data()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names.len(), 2);
+    assert!(
+        names.contains(&"Pins".to_string()) && names.contains(&"Recon".to_string()),
+        "{names:?}"
+    );
+    assert_eq!(
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Ops/layers/parent?layerUid=nope&creatorUid=A",
+            "jz",
+            &[],
+            ""
+        )
+        .await
+        .status,
         StatusCode::NOT_FOUND
     );
 
     drain(&mut rx);
-    h.call("DELETE", &format!("/Marti/api/missions/Ops/layers?uid={markers_uid}&creatorUid=A"), "jz", &[], "").await;
+    h.call(
+        "DELETE",
+        &format!("/Marti/api/missions/Ops/layers?uid={markers_uid}&creatorUid=A"),
+        "jz",
+        &[],
+        "",
+    )
+    .await;
     let mission = h.get("/Marti/api/missions/Ops", "jz").await.data()[0].clone();
-    assert_eq!(mission["uids"], json!([]), "content filed in the layer is removed");
+    assert_eq!(
+        mission["uids"],
+        json!([]),
+        "content filed in the layer is removed"
+    );
     let types: Vec<String> = drain(&mut rx).iter().map(|m| cot_type(&m.xml)).collect();
-    assert_eq!(types, ["t-x-m-c", "t-x-m-c", "t-x-m-c-h"], "two removals, then the layer");
+    assert_eq!(
+        types,
+        ["t-x-m-c", "t-x-m-c", "t-x-m-c-h"],
+        "two removals, then the layer"
+    );
 }
 
 // --- mission packages -------------------------------------------------------------------------
@@ -783,24 +1816,63 @@ async fn layers_like_cloudtak_uses_them() {
 #[tokio::test]
 async fn a_mission_exports_as_a_data_package() {
     let h = harness();
-    h.create("Ops", "jz", "&defaultRole=MISSION_SUBSCRIBER").await;
+    h.create("Ops", "jz", "&defaultRole=MISSION_SUBSCRIBER")
+        .await;
     let hash = h.state.content.put(b"map bytes", None).unwrap();
     h.state
         .resources
-        .insert(crate::sync::NewResource { uid: "r".into(), name: Some("map.png".into()), submission_user: "jz".into(), keywords: vec!["a".into(), "b".into()], ..Default::default() }, &hash, 9, 1)
+        .insert(
+            crate::sync::NewResource {
+                uid: "r".into(),
+                name: Some("map.png".into()),
+                submission_user: "jz".into(),
+                keywords: vec!["a".into(), "b".into()],
+                ..Default::default()
+            },
+            &hash,
+            9,
+            1,
+        )
         .unwrap();
     h.state.latest_cot.record("pin-1", r#"<event version="2.0" uid="pin-1" type="a-u-G" how="h-e" time="t" start="t" stale="t"><point lat="1" lon="2" hae="0" ce="0" le="0"/><detail/></event>"#, 1);
-    h.call("PUT", "/Marti/api/missions/Ops/contents?creatorUid=A", "jz", &[], &format!(r#"{{"hashes":["{hash}"],"uids":["pin-1"]}}"#)).await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/contents?creatorUid=A",
+        "jz",
+        &[],
+        &format!(r#"{{"hashes":["{hash}"],"uids":["pin-1"]}}"#),
+    )
+    .await;
 
-    let reply = h.call("GET", "/Marti/api/missions/Ops/archive", "jz", &[("host", "ops.example:8443")], "").await;
+    let reply = h
+        .call(
+            "GET",
+            "/Marti/api/missions/Ops/archive",
+            "jz",
+            &[("host", "ops.example:8443")],
+            "",
+        )
+        .await;
     assert_eq!(reply.status, StatusCode::OK);
     let files = super::super::mission_package::extract(&reply.body).unwrap();
     let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["cot/pin-1.cot", "contents/0_map.png", "MANIFEST/manifest.xml"]);
+    assert_eq!(
+        names,
+        [
+            "cot/pin-1.cot",
+            "contents/0_map.png",
+            "MANIFEST/manifest.xml"
+        ]
+    );
     assert_eq!(files[1].1, b"map bytes");
     let manifest = String::from_utf8(files[2].1.clone()).unwrap();
-    assert!(manifest.contains(r#"<Parameter name="mission_uid" value="ops.example-8443-ssl-Ops"/>"#), "{manifest}");
-    assert!(manifest.contains(r#"<Parameter name="mission_server" value="ops.example:8443:ssl"/>"#));
+    assert!(
+        manifest.contains(r#"<Parameter name="mission_uid" value="ops.example-8443-ssl-Ops"/>"#),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains(r#"<Parameter name="mission_server" value="ops.example:8443:ssl"/>"#)
+    );
     assert!(manifest.contains(r#"<Content zipEntry="cot/pin-1.cot" ignore="false">"#));
     assert!(manifest.contains(r#"<Content zipEntry="contents/0_map.png" ignore="false" keywords="a,b" name="map.png" submitter="jz" uid="r" size="9""#), "{manifest}");
     assert!(manifest.contains(r#"<Role name="MISSION_SUBSCRIBER">"#));
@@ -814,7 +1886,10 @@ async fn a_data_package_imports_into_a_mission() {
     h.create("Ops", "jz", "").await;
     let cot = r#"<?xml version="1.0"?><event version="2.0" uid="pin-7" type="a-u-G" how="h-e" time="t" start="t" stale="t"><point lat="1" lon="2" hae="0" ce="0" le="0"/><detail><contact callsign="Seven"/></detail></event>"#;
     let package = crate::zip::stored(&[
-        ("MANIFEST/manifest.xml".into(), b"<MissionPackageManifest/>".to_vec()),
+        (
+            "MANIFEST/manifest.xml".into(),
+            b"<MissionPackageManifest/>".to_vec(),
+        ),
         ("abc/pin-7.cot".into(), cot.as_bytes().to_vec()),
         ("files/photo.jpg".into(), b"jpeg".to_vec()),
     ]);
@@ -833,7 +1908,15 @@ async fn a_data_package_imports_into_a_mission() {
     let hash = m["contents"][0]["data"]["hash"].as_str().unwrap();
     assert_eq!(h.state.content.get(hash).unwrap().unwrap(), b"jpeg");
     assert_eq!(
-        h.call("PUT", "/Marti/api/missions/Ops/contents/missionpackage", "jz", &[], "x").await.status,
+        h.call(
+            "PUT",
+            "/Marti/api/missions/Ops/contents/missionpackage",
+            "jz",
+            &[],
+            "x"
+        )
+        .await
+        .status,
         StatusCode::BAD_REQUEST,
         "creatorUid is required"
     );
@@ -844,13 +1927,15 @@ async fn a_data_package_imports_into_a_mission() {
 async fn mission_contacts_are_a_bare_list() {
     let h = harness();
     h.create("Ops", "jz", "").await;
-    h.state.clients.register(crate::transport::connections::ClientEndpoint {
-        remote_addr: "127.0.0.1:9".parse().unwrap(),
-        transport: crate::transport::connections::Transport::Tls,
-        common_name: Some("dev".into()),
-        uid: Some("ANDROID-9".into()),
-        connected_at_unix: 0,
-    });
+    h.state
+        .clients
+        .register(crate::transport::connections::ClientEndpoint {
+            remote_addr: "127.0.0.1:9".parse().unwrap(),
+            transport: crate::transport::connections::Transport::Tls,
+            common_name: Some("dev".into()),
+            uid: Some("ANDROID-9".into()),
+            connected_at_unix: 0,
+        });
     let reply = h.get("/Marti/api/missions/Ops/contacts", "jz").await;
     assert_eq!(reply.status, StatusCode::OK);
     let list = reply.json();

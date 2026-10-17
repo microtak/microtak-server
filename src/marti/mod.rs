@@ -58,10 +58,10 @@ pub mod admin;
 pub mod client_endpoints;
 pub mod contacts;
 pub mod content;
-pub mod file_manager;
 pub mod discovery;
 pub mod enrollment;
 pub mod envelope;
+pub mod file_manager;
 pub mod groups;
 pub mod mission_notify;
 pub mod mission_package;
@@ -175,30 +175,31 @@ impl TlsHttpServer {
                 let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
                     return;
                 };
-                let tls_stream =
-                    match tokio::time::timeout(admission.handshake_timeout(), acceptor.accept(stream)).await {
-                        Ok(Ok(stream)) => stream,
-                        Ok(Err(error)) => {
-                            if is_plaintext_http(&error) {
-                                warn!(%peer, "client spoke plain HTTP to the enrollment port -- it is HTTPS only");
-                            } else {
-                                warn!(%peer, %error, "TLS handshake failed on the enrollment port");
-                            }
-                            return;
+                let tls_stream = match tokio::time::timeout(
+                    admission.handshake_timeout(),
+                    acceptor.accept(stream),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        if is_plaintext_http(&error) {
+                            warn!(%peer, "client spoke plain HTTP to the enrollment port -- it is HTTPS only");
+                        } else {
+                            warn!(%peer, %error, "TLS handshake failed on the enrollment port");
                         }
-                        Err(_) => {
-                            warn!(%peer, "TLS handshake timed out on the enrollment port");
-                            return;
-                        }
-                    };
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(%peer, "TLS handshake timed out on the enrollment port");
+                        return;
+                    }
+                };
 
                 let router = router.layer(Extension(axum::extract::ConnectInfo(peer)));
                 let io = TokioIo::new(tls_stream);
                 let service = TowerToHyperService::new(router);
-                if let Err(error) = http_builder(&admission)
-                    .serve_connection(io, service)
-                    .await
-                {
+                if let Err(error) = http_builder(&admission).serve_connection(io, service).await {
                     warn!(%peer, %error, "error serving enrollment connection");
                 }
             });
@@ -301,18 +302,22 @@ impl MtlsHttpServer {
                 let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
                     return;
                 };
-                let mut tls_stream =
-                    match tokio::time::timeout(admission.handshake_timeout(), acceptor.accept(stream)).await {
-                        Ok(Ok(stream)) => stream,
-                        Ok(Err(error)) => {
-                            warn!(%peer, %error, "TLS handshake failed for Marti API request, rejecting client");
-                            return;
-                        }
-                        Err(_) => {
-                            warn!(%peer, "TLS handshake timed out on the Marti API port");
-                            return;
-                        }
-                    };
+                let mut tls_stream = match tokio::time::timeout(
+                    admission.handshake_timeout(),
+                    acceptor.accept(stream),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        warn!(%peer, %error, "TLS handshake failed for Marti API request, rejecting client");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(%peer, "TLS handshake timed out on the Marti API port");
+                        return;
+                    }
+                };
 
                 let peer_cert: Option<Vec<u8>> = {
                     let (_, connection) = tls_stream.get_ref();
@@ -336,30 +341,29 @@ impl MtlsHttpServer {
                         let _ = tokio::io::AsyncWriteExt::shutdown(&mut tls_stream).await;
                         return;
                     }
-                    router = router.layer(axum::middleware::from_fn(move |request, next: axum::middleware::Next| {
-                        let registry = Arc::clone(&registry);
-                        let cn = cn.clone();
-                        let peer_cert = peer_cert.clone();
-                        async move {
-                            if registry.access(&cn, &peer_cert) != Access::Allowed {
-                                return (
-                                    axum::http::StatusCode::FORBIDDEN,
-                                    axum::Json(serde_json::json!({
-                                        "error": "certificate revoked or identity blocked"
-                                    })),
-                                )
-                                    .into_response();
+                    router = router.layer(axum::middleware::from_fn(
+                        move |request, next: axum::middleware::Next| {
+                            let registry = Arc::clone(&registry);
+                            let cn = cn.clone();
+                            let peer_cert = peer_cert.clone();
+                            async move {
+                                if registry.access(&cn, &peer_cert) != Access::Allowed {
+                                    return (
+                                        axum::http::StatusCode::FORBIDDEN,
+                                        axum::Json(serde_json::json!({
+                                            "error": "certificate revoked or identity blocked"
+                                        })),
+                                    )
+                                        .into_response();
+                                }
+                                next.run(request).await
                             }
-                            next.run(request).await
-                        }
-                    }));
+                        },
+                    ));
                 }
                 let io = TokioIo::new(tls_stream);
                 let service = TowerToHyperService::new(router);
-                if let Err(error) = http_builder(&admission)
-                    .serve_connection(io, service)
-                    .await
-                {
+                if let Err(error) = http_builder(&admission).serve_connection(io, service).await {
                     warn!(%peer, %error, "error serving Marti API connection");
                 }
             });
@@ -370,7 +374,7 @@ impl MtlsHttpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pki::{build_csr, CertificateAuthority};
+    use crate::pki::{CertificateAuthority, build_csr};
     use crate::transport::admission::{Admission, AdmissionLimits};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -384,10 +388,19 @@ mod tests {
         })
     }
 
-    fn server_cert(ca: &CertificateAuthority) -> (Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>) {
+    fn server_cert(
+        ca: &CertificateAuthority,
+    ) -> (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ) {
         let (csr, key) = build_csr("microtak-server").unwrap();
         let signed = ca
-            .sign_server_csr(&csr, &["microtak-server".to_string()], time::Duration::days(1))
+            .sign_server_csr(
+                &csr,
+                &["microtak-server".to_string()],
+                time::Duration::days(1),
+            )
             .unwrap();
         (
             vec![crate::pki::cert_pem_to_der(&signed.cert_pem).unwrap()],
@@ -416,10 +429,11 @@ mod tests {
         let (chain, key) = server_cert(&ca);
         let ca_der = crate::pki::cert_pem_to_der(&ca.ca_cert_pem()).unwrap();
         let tls = crate::transport::tls::server_config(ca_der, chain, key).unwrap();
-        let server = MtlsHttpServer::bind("127.0.0.1:0".parse().unwrap(), Arc::new(tls), Router::new())
-            .await
-            .unwrap()
-            .with_admission(short_limits());
+        let server =
+            MtlsHttpServer::bind("127.0.0.1:0".parse().unwrap(), Arc::new(tls), Router::new())
+                .await
+                .unwrap()
+                .with_admission(short_limits());
         let addr = server.local_addr().unwrap();
         tokio::spawn(server.run());
 
@@ -437,22 +451,28 @@ mod tests {
         let tls = crate::transport::tls::server_auth_only_config(Arc::new(
             crate::certsource::SwappableCert::new(cert),
         ));
-        let server = TlsHttpServer::bind("127.0.0.1:0".parse().unwrap(), Arc::new(tls), Router::new())
-            .await
-            .unwrap()
-            .with_admission(short_limits());
+        let server =
+            TlsHttpServer::bind("127.0.0.1:0".parse().unwrap(), Arc::new(tls), Router::new())
+                .await
+                .unwrap()
+                .with_admission(short_limits());
         let addr = server.local_addr().unwrap();
         tokio::spawn(server.run());
 
         let mut roots = rustls::RootCertStore::empty();
-        roots.add(crate::pki::cert_pem_to_der(&ca.ca_cert_pem()).unwrap()).unwrap();
+        roots
+            .add(crate::pki::cert_pem_to_der(&ca.ca_cert_pem()).unwrap())
+            .unwrap();
         let client = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
         let tcp = TcpStream::connect(addr).await.unwrap();
         let mut tls = connector
-            .connect(rustls::pki_types::ServerName::try_from("microtak-server").unwrap(), tcp)
+            .connect(
+                rustls::pki_types::ServerName::try_from("microtak-server").unwrap(),
+                tcp,
+            )
             .await
             .unwrap();
         tls.write_all(b"GET /Marti/api/tls/config HTTP/1.1\r\nHost: microtak-server\r\n")

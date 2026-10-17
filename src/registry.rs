@@ -32,9 +32,7 @@ pub enum RegistryError {
     AlreadyEnrolled(String),
     #[error("uid '{uid}' is already bound to a different device (common name '{owner}')")]
     UidOwnedByOtherDevice { uid: String, owner: String },
-    #[error(
-        "device '{common_name}' already claims uid '{existing}', cannot rebind to '{claimed}'"
-    )]
+    #[error("device '{common_name}' already claims uid '{existing}', cannot rebind to '{claimed}'")]
     DeviceUidMismatch {
         common_name: String,
         existing: String,
@@ -264,7 +262,13 @@ impl DeviceRegistry {
     /// a matching cert fingerprint -- fine at this project's scale (see
     /// this module's own doc comment).
     pub fn all(&self) -> Vec<DeviceRecord> {
-        self.state.read().unwrap().devices.values().cloned().collect()
+        self.state
+            .read()
+            .unwrap()
+            .devices
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn is_revoked(&self, common_name: &str) -> bool {
@@ -363,7 +367,10 @@ impl DeviceRegistry {
         let mut state = self.state.write().unwrap();
         if !state.revoked_certs.contains_key(&fingerprint) {
             let at_unix = time::OffsetDateTime::now_utc().unix_timestamp();
-            let event = RegistryEvent::CertRevoked { fingerprint, at_unix };
+            let event = RegistryEvent::CertRevoked {
+                fingerprint,
+                at_unix,
+            };
             if let Some(log) = &self.log {
                 log.append(&event)?;
             }
@@ -517,8 +524,14 @@ fn apply_event(state: &mut RegistryState, event: &RegistryEvent) {
                 device.uid = Some(uid.clone());
             }
         }
-        RegistryEvent::CertRevoked { fingerprint, at_unix } => {
-            state.revoked_certs.entry(fingerprint.clone()).or_insert(*at_unix);
+        RegistryEvent::CertRevoked {
+            fingerprint,
+            at_unix,
+        } => {
+            state
+                .revoked_certs
+                .entry(fingerprint.clone())
+                .or_insert(*at_unix);
         }
         RegistryEvent::CertDeleted { id } => {
             state.certificates.retain(|c| c.id != *id);
@@ -547,7 +560,9 @@ mod tests {
     #[test]
     fn enrolls_and_finds_a_device() {
         let registry = DeviceRegistry::in_memory();
-        let record = registry.enroll("device-a", "-----BEGIN CERTIFICATE-----...", 1_000).unwrap();
+        let record = registry
+            .enroll("device-a", "-----BEGIN CERTIFICATE-----...", 1_000)
+            .unwrap();
         assert_eq!(record.common_name, "device-a");
         assert!(!record.revoked);
         assert!(record.uid.is_none());
@@ -584,7 +599,10 @@ mod tests {
         let registry = DeviceRegistry::in_memory();
         registry.enroll("device-a", "cert", 1_000).unwrap();
         registry.bind_uid("device-a", "UID-A").unwrap();
-        assert_eq!(registry.find("device-a").unwrap().uid.as_deref(), Some("UID-A"));
+        assert_eq!(
+            registry.find("device-a").unwrap().uid.as_deref(),
+            Some("UID-A")
+        );
     }
 
     #[test]
@@ -593,7 +611,10 @@ mod tests {
         registry.enroll("device-a", "cert", 1_000).unwrap();
         registry.bind_uid("device-a", "UID-A").unwrap();
         registry.bind_uid("device-a", "UID-A").unwrap(); // no error
-        assert_eq!(registry.find("device-a").unwrap().uid.as_deref(), Some("UID-A"));
+        assert_eq!(
+            registry.find("device-a").unwrap().uid.as_deref(),
+            Some("UID-A")
+        );
     }
 
     #[test]
@@ -657,7 +678,8 @@ mod tests {
 
     #[test]
     fn persists_across_reload() {
-        let dir = std::env::temp_dir().join(format!("microtak-registry-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("microtak-registry-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("devices.log");
 
@@ -677,7 +699,8 @@ mod tests {
 
     #[test]
     fn loading_nonexistent_path_starts_empty() {
-        let dir = std::env::temp_dir().join(format!("microtak-registry-empty-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("microtak-registry-empty-{}", std::process::id()));
         let path = dir.join("does-not-exist.log");
         let registry = DeviceRegistry::load_or_create(&path).unwrap();
         assert!(registry.find("anything").is_none());
@@ -688,7 +711,10 @@ mod tests {
     fn issue(ca: &crate::pki::CertificateAuthority, cn: &str) -> (String, Vec<u8>) {
         let (csr, _key) = crate::pki::build_csr(cn).unwrap();
         let signed = ca.sign_csr(&csr, time::Duration::days(1)).unwrap();
-        let der = crate::pki::cert_pem_to_der(&signed.cert_pem).unwrap().as_ref().to_vec();
+        let der = crate::pki::cert_pem_to_der(&signed.cert_pem)
+            .unwrap()
+            .as_ref()
+            .to_vec();
         (signed.cert_pem, der)
     }
 
@@ -708,7 +734,10 @@ mod tests {
 
         registry.revoke_current_cert("alice").unwrap();
         assert_eq!(registry.access("alice", &old_der), Access::CertRevoked);
-        assert!(!registry.is_revoked("alice"), "the identity itself is not blocked");
+        assert!(
+            !registry.is_revoked("alice"),
+            "the identity itself is not blocked"
+        );
 
         let (new_pem, new_der) = issue(&ca, "alice");
         registry.enroll("alice", &new_pem, 2).unwrap();
@@ -760,8 +789,14 @@ mod tests {
     #[test]
     fn unblocking_or_revoking_the_cert_of_an_unknown_device_errors() {
         let registry = DeviceRegistry::in_memory();
-        assert!(matches!(registry.unblock("nobody"), Err(RegistryError::NotFound(_))));
-        assert!(matches!(registry.revoke_current_cert("nobody"), Err(RegistryError::NotFound(_))));
+        assert!(matches!(
+            registry.unblock("nobody"),
+            Err(RegistryError::NotFound(_))
+        ));
+        assert!(matches!(
+            registry.revoke_current_cert("nobody"),
+            Err(RegistryError::NotFound(_))
+        ));
     }
 
     /// Live connections re-check their access when this changes.
@@ -787,7 +822,8 @@ mod tests {
     #[test]
     fn certificate_revocations_and_unblocks_survive_a_reload() {
         let ca = test_ca();
-        let dir = std::env::temp_dir().join(format!("microtak-registry-revoke-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("microtak-registry-revoke-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("devices.log");
         let (pem_a, der_a) = issue(&ca, "frank");
@@ -813,7 +849,8 @@ mod tests {
     /// single write-then-read.
     #[test]
     fn replay_reconstructs_a_realistic_mutation_sequence_exactly() {
-        let dir = std::env::temp_dir().join(format!("microtak-registry-replay-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("microtak-registry-replay-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("devices.log");
 

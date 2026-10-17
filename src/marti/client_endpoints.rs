@@ -17,7 +17,9 @@ pub fn router(clients: ConnectedClients) -> Router {
         .with_state(clients)
 }
 
-async fn list_client_endpoints(State(clients): State<ConnectedClients>) -> Json<Vec<ClientEndpoint>> {
+async fn list_client_endpoints(
+    State(clients): State<ConnectedClients>,
+) -> Json<Vec<ClientEndpoint>> {
     Json(clients.list())
 }
 

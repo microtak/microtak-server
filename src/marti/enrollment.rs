@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -44,7 +44,7 @@ use crate::bootstrap::{BootstrapError, BootstrapToken};
 use crate::enrollment_tokens::EnrollmentTokenStore;
 use crate::groups::{GroupGrant, GroupStore};
 use crate::pki::CertificateAuthority;
-use crate::ratelimit::{user_key, AuthLimiter};
+use crate::ratelimit::{AuthLimiter, user_key};
 use crate::registry::{DeviceRegistry, RegistryError};
 use crate::users::UserStore;
 
@@ -262,7 +262,11 @@ async fn sign_client_v2(
                 warn!(%username, "signClient/v2 rate-limited after repeated failed attempts");
                 return too_many_attempts();
             }
-            if !state.limiter.verify_password(&state.users, &username, &password).await {
+            if !state
+                .limiter
+                .verify_password(&state.users, &username, &password)
+                .await
+            {
                 state.limiter.record_failure(&ip_key);
                 state.limiter.record_failure(&user_key);
                 warn!(%username, "signClient/v2 rejected: invalid username or password");
@@ -293,11 +297,19 @@ async fn sign_client_v2(
             }
             // A blocked identity gets no new certificate, credentials or not.
             if state.registry.is_revoked(common_name) {
-                warn!(common_name, "signClient/v2 rejected: the identity is blocked");
+                warn!(
+                    common_name,
+                    "signClient/v2 rejected: the identity is blocked"
+                );
                 return error_response(StatusCode::FORBIDDEN, "this identity is blocked");
             }
             // Proven owner of this identity: may create or rotate it.
-            state.registry.enroll_with_client_uid(common_name, &signed.cert_pem, now, query.client_uid.as_deref())
+            state.registry.enroll_with_client_uid(
+                common_name,
+                &signed.cert_pem,
+                now,
+                query.client_uid.as_deref(),
+            )
         }
         None if state.is_admin_cn(common_name) => {
             let Some(token) = presented_token.as_deref() else {
@@ -308,10 +320,18 @@ async fn sign_client_v2(
                 return too_many_attempts();
             }
             match state.bootstrap.consume_with(token, || {
-                state.registry.enroll_new_with_client_uid(common_name, &signed.cert_pem, now, query.client_uid.as_deref())
+                state.registry.enroll_new_with_client_uid(
+                    common_name,
+                    &signed.cert_pem,
+                    now,
+                    query.client_uid.as_deref(),
+                )
             }) {
                 Ok(record) => {
-                    info!(common_name, "admin device enrolled with the bootstrap token");
+                    info!(
+                        common_name,
+                        "admin device enrolled with the bootstrap token"
+                    );
                     Ok(record)
                 }
                 Err(BootstrapError::Action(error)) => Err(error),
@@ -324,7 +344,10 @@ async fn sign_client_v2(
         }
         None => {
             if state.registry.find(common_name).is_some() {
-                warn!(common_name, "enrollment rejected: identity already enrolled");
+                warn!(
+                    common_name,
+                    "enrollment rejected: identity already enrolled"
+                );
                 return already_enrolled(common_name);
             }
             if state.is_locked_down() {
@@ -353,7 +376,12 @@ async fn sign_client_v2(
                     );
                 }
             }
-            state.registry.enroll_new_with_client_uid(common_name, &signed.cert_pem, now, query.client_uid.as_deref())
+            state.registry.enroll_new_with_client_uid(
+                common_name,
+                &signed.cert_pem,
+                now,
+                query.client_uid.as_deref(),
+            )
         }
     };
 
@@ -378,7 +406,10 @@ async fn sign_client_v2(
 }
 
 fn missing_group(common_name: &str, group: &str) -> Response {
-    warn!(common_name, group, "enrollment refused: its group no longer exists");
+    warn!(
+        common_name,
+        group, "enrollment refused: its group no longer exists"
+    );
     error_response(
         StatusCode::CONFLICT,
         &format!("group '{group}' this enrollment would add the device to no longer exists"),
@@ -416,7 +447,9 @@ fn already_enrolled(common_name: &str) -> Response {
 fn basic_auth_credentials(headers: &HeaderMap) -> Option<(String, String)> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let encoded = value.strip_prefix("Basic ")?;
-    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
     let decoded = String::from_utf8(decoded).ok()?;
     let (username, password) = decoded.split_once(':')?;
     Some((username.to_string(), password.to_string()))
@@ -497,7 +530,12 @@ fn shaped_success_response(headers: &HeaderMap, cert_pem: &str, ca_cert_pem: &st
         let xml = format!(
             "<enrollmentResponse><signedCert><![CDATA[{bare_cert}]]></signedCert><ca0><![CDATA[{bare_ca}]]></ca0></enrollmentResponse>"
         );
-        (StatusCode::OK, [(header::CONTENT_TYPE, "application/xml")], xml).into_response()
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/xml")],
+            xml,
+        )
+            .into_response()
     }
 }
 
@@ -545,13 +583,10 @@ mod tests {
         let tls = crate::transport::tls::server_auth_only_config(Arc::new(
             crate::certsource::SwappableCert::new(cert),
         ));
-        let server = super::super::TlsHttpServer::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            Arc::new(tls),
-            app,
-        )
-        .await
-        .unwrap();
+        let server =
+            super::super::TlsHttpServer::bind("127.0.0.1:0".parse().unwrap(), Arc::new(tls), app)
+                .await
+                .unwrap();
         let addr = server.local_addr().unwrap();
         tokio::spawn(server.run());
         format!("https://{addr}")
@@ -582,7 +617,9 @@ mod tests {
         let state = test_state();
         let base_url = spawn_server(state).await;
 
-        let response = test_client().get(format!("{base_url}/Marti/api/tls/config")).send()
+        let response = test_client()
+            .get(format!("{base_url}/Marti/api/tls/config"))
+            .send()
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -600,7 +637,9 @@ mod tests {
         let ca_pem = state.ca.ca_cert_pem();
         let base_url = spawn_server(state).await;
 
-        let response = test_client().get(format!("{base_url}/Marti/api/tls/ca.pem")).send()
+        let response = test_client()
+            .get(format!("{base_url}/Marti/api/tls/ca.pem"))
+            .send()
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
@@ -637,7 +676,10 @@ mod tests {
         // Real Marti wire format: bare base64, no PEM armor -- a real
         // client (`node-tak`'s `credentials.ts`) re-wraps this itself.
         assert!(!signed_cert.contains("BEGIN CERTIFICATE"));
-        assert!(!body["ca0"].as_str().unwrap().is_empty(), "expected a CA chain cert too");
+        assert!(
+            !body["ca0"].as_str().unwrap().is_empty(),
+            "expected a CA chain cert too"
+        );
 
         // Cryptographically verify the returned cert against the CA --
         // proves the enrollment endpoint's output is actually usable, not
@@ -648,9 +690,11 @@ mod tests {
         let (_, ca_x509) = X509Certificate::from_der(ca_der.contents()).unwrap();
         let leaf_der = pem::parse(wrap_pem(signed_cert)).unwrap();
         let (_, leaf_x509) = X509Certificate::from_der(leaf_der.contents()).unwrap();
-        assert!(leaf_x509
-            .verify_signature(Some(ca_x509.public_key()))
-            .is_ok());
+        assert!(
+            leaf_x509
+                .verify_signature(Some(ca_x509.public_key()))
+                .is_ok()
+        );
     }
 
     /// TC-ENROLL-03: the exact real-world bug this project found twice
@@ -687,7 +731,10 @@ mod tests {
         let base_url = spawn_server(state).await;
 
         let (csr_pem, _key) = build_csr("device-omnitak").unwrap();
-        let bare_base64: String = csr_pem.lines().filter(|line| !line.starts_with("-----")).collect();
+        let bare_base64: String = csr_pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
 
         let client = test_client();
         let response = client
@@ -740,10 +787,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 200);
-        assert_eq!(
-            response.headers().get(CONTENT_TYPE).unwrap(),
-            "text/plain"
-        );
+        assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/plain");
         let body_text = response.text().await.unwrap();
         // Still a JSON *body*, just served with a text/plain Content-Type.
         let parsed: serde_json::Value = serde_json::from_str(&body_text).unwrap();
@@ -780,7 +824,9 @@ mod tests {
     /// ever going through the HTTP layer being tested.
     fn test_state_requiring_tokens() -> Arc<EnrollmentState> {
         let registry = Arc::new(DeviceRegistry::in_memory());
-        registry.enroll("test-admin", "fake-admin-cert-pem", 0).unwrap();
+        registry
+            .enroll("test-admin", "fake-admin-cert-pem", 0)
+            .unwrap();
         Arc::new(EnrollmentState {
             ca: CertificateAuthority::generate("MicroTAK Test CA").unwrap(),
             registry,
@@ -845,7 +891,10 @@ mod tests {
         assert_eq!(response.status(), 200);
         let all = tokens.list();
         assert!(all[0].used, "the token should be consumed after use");
-        assert_eq!(all[0].used_by_common_name.as_deref(), Some("device-with-token"));
+        assert_eq!(
+            all[0].used_by_common_name.as_deref(),
+            Some("device-with-token")
+        );
     }
 
     /// The same token can't be used twice -- the second device is rejected
@@ -862,7 +911,9 @@ mod tests {
 
         let (csr_a, _key_a) = build_csr("device-a").unwrap();
         let first = client
-            .post(format!("{base_url}/Marti/api/tls/signClient/v2?token={token}"))
+            .post(format!(
+                "{base_url}/Marti/api/tls/signClient/v2?token={token}"
+            ))
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(csr_a)
             .send()
@@ -872,7 +923,9 @@ mod tests {
 
         let (csr_b, _key_b) = build_csr("device-b").unwrap();
         let second = client
-            .post(format!("{base_url}/Marti/api/tls/signClient/v2?token={token}"))
+            .post(format!(
+                "{base_url}/Marti/api/tls/signClient/v2?token={token}"
+            ))
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(csr_b)
             .send()
@@ -895,7 +948,9 @@ mod tests {
         let (csr_pem, _key) = build_csr("device-revoked-token").unwrap();
         let client = test_client();
         let response = client
-            .post(format!("{base_url}/Marti/api/tls/signClient/v2?token={token}"))
+            .post(format!(
+                "{base_url}/Marti/api/tls/signClient/v2?token={token}"
+            ))
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(csr_pem)
             .send()
@@ -912,7 +967,9 @@ mod tests {
     #[tokio::test]
     async fn open_mode_stays_open_even_after_the_admin_has_enrolled() {
         let registry = Arc::new(DeviceRegistry::in_memory());
-        registry.enroll("open-mode-admin", "fake-cert-pem", 0).unwrap();
+        registry
+            .enroll("open-mode-admin", "fake-cert-pem", 0)
+            .unwrap();
         let state = Arc::new(EnrollmentState {
             ca: CertificateAuthority::generate("MicroTAK Test CA").unwrap(),
             registry,
@@ -946,7 +1003,10 @@ mod tests {
     #[tokio::test]
     async fn basic_auth_enrollment_bypasses_the_token_gate_even_when_locked_down() {
         let state = test_state_requiring_tokens();
-        state.users.mint("device-with-password", "hunter2", 0).unwrap();
+        state
+            .users
+            .mint("device-with-password", "hunter2", 0)
+            .unwrap();
         let registry_check = Arc::clone(&state);
         let base_url = spawn_server(state).await;
 
@@ -964,7 +1024,12 @@ mod tests {
         assert_eq!(response.status(), 200);
         let body: serde_json::Value = response.json().await.unwrap();
         assert!(!body["signedCert"].as_str().unwrap().is_empty());
-        assert!(registry_check.registry.find("device-with-password").is_some());
+        assert!(
+            registry_check
+                .registry
+                .find("device-with-password")
+                .is_some()
+        );
     }
 
     /// Presenting *wrong* Basic-Auth credentials is a hard failure -- it
@@ -974,7 +1039,10 @@ mod tests {
     #[tokio::test]
     async fn basic_auth_with_wrong_password_is_rejected_even_in_open_mode() {
         let state = test_state(); // Open mode: no token would be required at all.
-        state.users.mint("device-with-password", "hunter2", 0).unwrap();
+        state
+            .users
+            .mint("device-with-password", "hunter2", 0)
+            .unwrap();
         let registry_check = Arc::clone(&state);
         let base_url = spawn_server(state).await;
 
@@ -990,7 +1058,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 401);
-        assert!(registry_check.registry.find("device-with-password").is_none());
+        assert!(
+            registry_check
+                .registry
+                .find("device-with-password")
+                .is_none()
+        );
     }
 
     async fn post_csr(base_url: &str, query: &str, csr_pem: String) -> reqwest::Response {
@@ -1010,7 +1083,10 @@ mod tests {
     #[tokio::test]
     async fn tc_enroll_13_token_cannot_take_over_an_existing_identity() {
         let state = test_state_requiring_tokens();
-        state.registry.enroll("device-victim", "victim-cert-pem", 0).unwrap();
+        state
+            .registry
+            .enroll("device-victim", "victim-cert-pem", 0)
+            .unwrap();
         let tokens = Arc::clone(&state.tokens);
         let registry_check = Arc::clone(&state);
         let base_url = spawn_server(state).await;
@@ -1020,9 +1096,16 @@ mod tests {
         let response = post_csr(&base_url, &format!("?token={token}"), csr_pem).await;
 
         assert_eq!(response.status(), 409);
-        assert!(!tokens.list()[0].used, "a rejected request must not consume the token");
+        assert!(
+            !tokens.list()[0].used,
+            "a rejected request must not consume the token"
+        );
         assert_eq!(
-            registry_check.registry.find("device-victim").unwrap().cert_pem,
+            registry_check
+                .registry
+                .find("device-victim")
+                .unwrap()
+                .cert_pem,
             "victim-cert-pem"
         );
     }
@@ -1059,7 +1142,10 @@ mod tests {
     #[tokio::test]
     async fn open_mode_cannot_re_enroll_an_existing_identity_without_credentials() {
         let state = test_state();
-        state.registry.enroll("device-victim", "victim-cert-pem", 0).unwrap();
+        state
+            .registry
+            .enroll("device-victim", "victim-cert-pem", 0)
+            .unwrap();
         let registry_check = Arc::clone(&state);
         let base_url = spawn_server(state).await;
 
@@ -1068,7 +1154,11 @@ mod tests {
 
         assert_eq!(response.status(), 409);
         assert_eq!(
-            registry_check.registry.find("device-victim").unwrap().cert_pem,
+            registry_check
+                .registry
+                .find("device-victim")
+                .unwrap()
+                .cert_pem,
             "victim-cert-pem"
         );
     }
@@ -1097,8 +1187,15 @@ mod tests {
         for attempt in attempts {
             statuses.push(attempt.await.unwrap());
         }
-        assert_eq!(statuses.iter().filter(|&&s| s == 200).count(), 1, "{statuses:?}");
-        assert!(statuses.iter().all(|&s| s == 200 || s == 409), "{statuses:?}");
+        assert_eq!(
+            statuses.iter().filter(|&&s| s == 200).count(),
+            1,
+            "{statuses:?}"
+        );
+        assert!(
+            statuses.iter().all(|&s| s == 200 || s == 409),
+            "{statuses:?}"
+        );
     }
 
     /// TC-ENROLL-15: before the admin has enrolled, nobody on the network
@@ -1125,7 +1222,10 @@ mod tests {
             let response = post_csr(&base_url, "", csr_pem).await;
 
             assert_eq!(response.status(), 403, "mode {mode:?}");
-            assert!(registry_check.registry.find("test-admin").is_none(), "mode {mode:?}");
+            assert!(
+                registry_check.registry.find("test-admin").is_none(),
+                "mode {mode:?}"
+            );
         }
     }
 
@@ -1161,7 +1261,10 @@ mod tests {
         let (csr_pem, _key) = build_csr("test-admin").unwrap();
         let second = post_csr(&base_url, &format!("?token={bootstrap}"), csr_pem).await;
         assert_eq!(second.status(), 403);
-        assert_eq!(check.registry.find("test-admin").unwrap().cert_pem, admin_cert);
+        assert_eq!(
+            check.registry.find("test-admin").unwrap().cert_pem,
+            admin_cert
+        );
     }
 
     /// The bootstrap token is not a general-purpose invite: it can't
@@ -1194,7 +1297,12 @@ mod tests {
         assert!(check.bootstrap.is_outstanding());
     }
 
-    async fn post_csr_basic(base_url: &str, user: &str, secret: &str, cn: &str) -> reqwest::Response {
+    async fn post_csr_basic(
+        base_url: &str,
+        user: &str,
+        secret: &str,
+        cn: &str,
+    ) -> reqwest::Response {
         let (csr_pem, _key) = build_csr(cn).unwrap();
         test_client()
             .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
@@ -1216,7 +1324,9 @@ mod tests {
         let tokens = Arc::clone(&state.tokens);
         let check = Arc::clone(&state);
         let base_url = spawn_server(state).await;
-        let token = tokens.mint_bound(None, None, Some("device-qr".into()), 1).unwrap();
+        let token = tokens
+            .mint_bound(None, None, Some("device-qr".into()), 1)
+            .unwrap();
 
         let wrong_cn = post_csr_basic(&base_url, "device-qr", &token, "device-other").await;
         assert_eq!(wrong_cn.status(), 403);
@@ -1255,7 +1365,9 @@ mod tests {
         let state = test_state_requiring_tokens();
         let tokens = Arc::clone(&state.tokens);
         let base_url = spawn_server(state).await;
-        let token = tokens.mint_bound(None, None, Some("device-a".into()), 1).unwrap();
+        let token = tokens
+            .mint_bound(None, None, Some("device-a".into()), 1)
+            .unwrap();
 
         let (csr_pem, _key) = build_csr("device-b").unwrap();
         let response = post_csr(&base_url, &format!("?token={token}"), csr_pem).await;
@@ -1298,7 +1410,7 @@ mod tests {
     /// An invite token's groups are applied to the device it enrolls.
     #[tokio::test]
     async fn an_invite_tokens_groups_are_applied_at_enrollment() {
-        use crate::groups::{grants_from, Direction};
+        use crate::groups::{Direction, grants_from};
         let state = test_state_requiring_tokens();
         state.groups.create("Red", None, 0).unwrap();
         let token = state
@@ -1309,12 +1421,24 @@ mod tests {
         let base_url = spawn_server(state).await;
 
         let (csr_pem, _key) = build_csr("device-red").unwrap();
-        assert_eq!(post_csr(&base_url, &format!("?token={token}"), csr_pem).await.status(), 200);
         assert_eq!(
-            check.groups.active_groups(Some("device-red"), Direction::Out),
+            post_csr(&base_url, &format!("?token={token}"), csr_pem)
+                .await
+                .status(),
+            200
+        );
+        assert_eq!(
+            check
+                .groups
+                .active_groups(Some("device-red"), Direction::Out),
             ["Red".to_string()].into()
         );
-        assert!(check.groups.active_groups(Some("device-red"), Direction::In).is_empty());
+        assert!(
+            check
+                .groups
+                .active_groups(Some("device-red"), Direction::In)
+                .is_empty()
+        );
     }
 
     /// If a token's group has been deleted since minting, enrollment is
@@ -1334,7 +1458,12 @@ mod tests {
         let base_url = spawn_server(state).await;
 
         let (csr_pem, _key) = build_csr("device-red").unwrap();
-        assert_eq!(post_csr(&base_url, &format!("?token={token}"), csr_pem).await.status(), 409);
+        assert_eq!(
+            post_csr(&base_url, &format!("?token={token}"), csr_pem)
+                .await
+                .status(),
+            409
+        );
         assert!(check.registry.find("device-red").is_none());
         assert!(!check.tokens.list()[0].used);
     }
@@ -1342,19 +1471,31 @@ mod tests {
     /// A password account's groups are applied when its device enrolls.
     #[tokio::test]
     async fn an_accounts_groups_are_applied_at_enrollment() {
-        use crate::groups::{grants_from, Direction};
+        use crate::groups::{Direction, grants_from};
         let state = test_state_requiring_tokens();
         state.groups.create("Blue", None, 0).unwrap();
         state
             .users
-            .mint_with_groups("device-blue", "pw", grants_from(&[], &["Blue".into()], &[]), 0)
+            .mint_with_groups(
+                "device-blue",
+                "pw",
+                grants_from(&[], &["Blue".into()], &[]),
+                0,
+            )
             .unwrap();
         let check = Arc::clone(&state);
         let base_url = spawn_server(state).await;
 
-        assert_eq!(post_csr_basic(&base_url, "device-blue", "pw", "device-blue").await.status(), 200);
         assert_eq!(
-            check.groups.active_groups(Some("device-blue"), Direction::In),
+            post_csr_basic(&base_url, "device-blue", "pw", "device-blue")
+                .await
+                .status(),
+            200
+        );
+        assert_eq!(
+            check
+                .groups
+                .active_groups(Some("device-blue"), Direction::In),
             ["Blue".to_string()].into()
         );
     }
@@ -1365,7 +1506,10 @@ mod tests {
     async fn basic_auth_can_re_enroll_its_own_existing_identity() {
         let state = test_state_requiring_tokens();
         state.users.mint("device-rotating", "hunter2", 0).unwrap();
-        state.registry.enroll("device-rotating", "old-cert-pem", 0).unwrap();
+        state
+            .registry
+            .enroll("device-rotating", "old-cert-pem", 0)
+            .unwrap();
         let check = Arc::clone(&state);
         let base_url = spawn_server(state).await;
 
@@ -1379,7 +1523,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
-        assert_ne!(check.registry.find("device-rotating").unwrap().cert_pem, "old-cert-pem");
+        assert_ne!(
+            check.registry.find("device-rotating").unwrap().cert_pem,
+            "old-cert-pem"
+        );
     }
 
     /// Even a valid password account can't obtain the admin identity.
@@ -1436,7 +1583,10 @@ mod tests {
     #[tokio::test]
     async fn tc_limit_08_repeated_failed_basic_auth_is_rate_limited() {
         let state = test_state();
-        state.users.mint("device-with-password", "hunter2", 0).unwrap();
+        state
+            .users
+            .mint("device-with-password", "hunter2", 0)
+            .unwrap();
         let base_url = spawn_server(state).await;
         let client = test_client();
 
@@ -1528,7 +1678,10 @@ mod tests {
     #[tokio::test]
     async fn basic_auth_rejects_csr_cn_not_matching_authenticated_username() {
         let state = test_state();
-        state.users.mint("alice", "correct horse battery staple", 0).unwrap();
+        state
+            .users
+            .mint("alice", "correct horse battery staple", 0)
+            .unwrap();
         let registry_check = Arc::clone(&state);
         let base_url = spawn_server(state).await;
 

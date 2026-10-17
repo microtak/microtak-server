@@ -30,7 +30,7 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -92,13 +92,12 @@ impl<E: Serialize + DeserializeOwned> EventLog<E> {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let event: E = serde_json::from_str(&line).map_err(|source| {
-                    EventLogError::Corrupt {
+                let event: E =
+                    serde_json::from_str(&line).map_err(|source| EventLogError::Corrupt {
                         path: path.clone(),
                         line: i + 1,
                         source,
-                    }
-                })?;
+                    })?;
                 apply(state, &event);
             }
         }
@@ -229,7 +228,10 @@ mod tests {
 
         let mut state = 0i64;
         let result = EventLog::<TestEvent>::open_and_replay(&path, &mut state, apply);
-        assert!(matches!(result, Err(EventLogError::Corrupt { line: 2, .. })));
+        assert!(matches!(
+            result,
+            Err(EventLogError::Corrupt { line: 2, .. })
+        ));
 
         std::fs::remove_file(&path).ok();
     }
@@ -261,7 +263,10 @@ mod tests {
 
         let mut state = 0i64;
         let _log = EventLog::open_and_replay(&path, &mut state, apply).unwrap();
-        assert_eq!(state, 7, "a fresh replay should reconstruct the appended state");
+        assert_eq!(
+            state, 7,
+            "a fresh replay should reconstruct the appended state"
+        );
 
         std::fs::remove_file(&path).ok();
     }

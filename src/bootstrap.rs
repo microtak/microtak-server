@@ -230,7 +230,11 @@ mod tests {
         let first = std::fs::read_to_string(&path).unwrap();
         let reloaded = BootstrapToken::load_or_create(&path, false).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
-        assert!(reloaded.consume_with(first.trim(), || Ok::<_, ()>(())).is_ok());
+        assert!(
+            reloaded
+                .consume_with(first.trim(), || Ok::<_, ()>(()))
+                .is_ok()
+        );
     }
 
     #[test]

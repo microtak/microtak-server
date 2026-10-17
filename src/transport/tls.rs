@@ -25,16 +25,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
-use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, split};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
-use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
 
+use super::admission::Admission;
 use super::codec::{DecodedItem, StreamDecoder};
 use super::connections::{ClientEndpoint, ConnectedClients, Transport, UnregisterOnDrop};
-use super::admission::Admission;
 use super::hub::{Outbound, RelayHub};
 use super::identity::{self, Verdict};
 use crate::groups::{Direction, GroupStore};
@@ -144,7 +144,10 @@ impl TlsRelay {
     }
 
     /// Route `<marti><dest mission=…>` content through `missions`.
-    pub fn with_missions(mut self, missions: Arc<dyn crate::transport::hub::StreamingMissions>) -> Self {
+    pub fn with_missions(
+        mut self,
+        missions: Arc<dyn crate::transport::hub::StreamingMissions>,
+    ) -> Self {
         self.missions = Some(missions);
         self
     }
@@ -188,18 +191,22 @@ impl TlsRelay {
                 let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
                     return;
                 };
-                let mut tls_stream =
-                    match tokio::time::timeout(admission.handshake_timeout(), acceptor.accept(stream)).await {
-                        Ok(Ok(stream)) => stream,
-                        Ok(Err(error)) => {
-                            warn!(%peer, %error, "TLS handshake failed, rejecting client");
-                            return;
-                        }
-                        Err(_) => {
-                            warn!(%peer, "TLS handshake timed out, dropping client");
-                            return;
-                        }
-                    };
+                let mut tls_stream = match tokio::time::timeout(
+                    admission.handshake_timeout(),
+                    acceptor.accept(stream),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        warn!(%peer, %error, "TLS handshake failed, rejecting client");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(%peer, "TLS handshake timed out, dropping client");
+                        return;
+                    }
+                };
 
                 let peer_cert = peer_cert_der(&tls_stream);
                 let Some(cn) = peer_common_name(&tls_stream) else {
@@ -220,7 +227,10 @@ impl TlsRelay {
                 }
 
                 info!(%peer, cn, "mTLS client connected");
-                handle_client(tls_stream, peer, cn, peer_cert, tx, rx, registry, clients, groups, missions).await;
+                handle_client(
+                    tls_stream, peer, cn, peer_cert, tx, rx, registry, clients, groups, missions,
+                )
+                .await;
             });
         }
     }
@@ -268,12 +278,19 @@ async fn handle_client(
     }
     impl Drop for LeaveMissions<'_> {
         fn drop(&mut self) {
-            if let (Some(missions), Some(uid)) = (self.missions, self.registry.find(self.cn).and_then(|d| d.uid)) {
+            if let (Some(missions), Some(uid)) = (
+                self.missions,
+                self.registry.find(self.cn).and_then(|d| d.uid),
+            ) {
                 missions.client_disconnected(&uid);
             }
         }
     }
-    let _leave = LeaveMissions { missions: &missions, registry: &registry, cn: &cn };
+    let _leave = LeaveMissions {
+        missions: &missions,
+        registry: &registry,
+        cn: &cn,
+    };
     clients.register(ClientEndpoint {
         remote_addr: peer,
         transport: Transport::Tls,
@@ -431,13 +448,13 @@ async fn handle_client(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pki::{build_csr, CertificateAuthority};
+    use crate::pki::{CertificateAuthority, build_csr};
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
     use std::time::Duration as StdDuration;
     use time::Duration;
     use tokio::time::timeout;
-    use tokio_rustls::rustls::pki_types::ServerName;
     use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::pki_types::ServerName;
 
     /// A device's own position report (SA) -- `<contact>` with callsign and
     /// endpoint, the kind of event that binds a uid (see `super::identity`).
@@ -487,7 +504,11 @@ mod tests {
         let ca = CertificateAuthority::generate("MicroTAK Test CA").unwrap();
         let (server_csr, server_key) = build_server_csr("microtak-server", "microtak-server");
         let signed = ca
-            .sign_server_csr(&server_csr, &["microtak-server".to_string()], Duration::days(365))
+            .sign_server_csr(
+                &server_csr,
+                &["microtak-server".to_string()],
+                Duration::days(365),
+            )
             .unwrap();
         let server_cert_der = pem_to_der(&signed.cert_pem);
         let ca_cert_der = pem_to_der(&ca.ca_cert_pem());
@@ -546,7 +567,9 @@ mod tests {
         connector
             .connect(ServerName::try_from("microtak-server").unwrap(), tcp)
             .await
-            .unwrap_or_else(|e| panic!("handshake for {cn} should succeed against the trusted CA: {e}"))
+            .unwrap_or_else(|e| {
+                panic!("handshake for {cn} should succeed against the trusted CA: {e}")
+            })
     }
 
     fn untrusted_client_tls_connector(fixture: &Fixture) -> TlsConnector {
@@ -594,7 +617,10 @@ mod tests {
         let read = timeout(StdDuration::from_secs(2), stalled.read(&mut buf))
             .await
             .expect("server must close a stalled handshake, not wait forever");
-        assert!(matches!(read, Ok(0) | Err(_)), "expected EOF/reset, got {read:?}");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "expected EOF/reset, got {read:?}"
+        );
         tokio::time::sleep(StdDuration::from_millis(50)).await;
         assert_eq!(admission.open_connections(), 0, "the slot is released");
     }
@@ -628,7 +654,10 @@ mod tests {
         let read = timeout(StdDuration::from_secs(2), second.read(&mut buf))
             .await
             .expect("the over-limit connection must be closed promptly");
-        assert!(matches!(read, Ok(0) | Err(_)), "expected EOF/reset, got {read:?}");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "expected EOF/reset, got {read:?}"
+        );
     }
 
     /// Connect through a "proxy" on loopback: write `header` first, then
@@ -690,14 +719,24 @@ mod tests {
         let alice: SocketAddr = "203.0.113.7:50000".parse().unwrap();
         let bob: SocketAddr = "198.51.100.9:50001".parse().unwrap();
 
-        let _a = connect_with_header(addr, &fixture, "device-a", &crate::transport::proxy_protocol::encode_v2(alice, server))
-            .await
-            .unwrap();
+        let _a = connect_with_header(
+            addr,
+            &fixture,
+            "device-a",
+            &crate::transport::proxy_protocol::encode_v2(alice, server),
+        )
+        .await
+        .unwrap();
         // Same proxy socket address, different client: the per-IP limit of 1
         // applies to the client, so this one is admitted too.
-        let _b = connect_with_header(addr, &fixture, "device-b", &crate::transport::proxy_protocol::encode_v2(bob, server))
-            .await
-            .unwrap();
+        let _b = connect_with_header(
+            addr,
+            &fixture,
+            "device-b",
+            &crate::transport::proxy_protocol::encode_v2(bob, server),
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(StdDuration::from_millis(100)).await;
         let mut seen: Vec<SocketAddr> = clients.list().into_iter().map(|c| c.remote_addr).collect();
         seen.sort();
@@ -790,16 +829,25 @@ mod tests {
             .expect("timed out waiting for the pong")
             .unwrap();
         let pong = String::from_utf8_lossy(&buf[..n]);
-        assert!(pong.contains(r#"uid="takPong" type="t-x-c-t-r""#), "got: {pong}");
+        assert!(
+            pong.contains(r#"uid="takPong" type="t-x-c-t-r""#),
+            "got: {pong}"
+        );
 
-        tls_a.write_all(event_xml("AFTER-PING").as_bytes()).await.unwrap();
+        tls_a
+            .write_all(event_xml("AFTER-PING").as_bytes())
+            .await
+            .unwrap();
         let n = timeout(StdDuration::from_secs(2), tls_b.read(&mut buf))
             .await
             .expect("timed out waiting for the relayed event")
             .unwrap();
         let received = String::from_utf8_lossy(&buf[..n]);
         assert!(received.contains("AFTER-PING"), "got: {received}");
-        assert!(!received.contains("t-x-c-t"), "the ping was relayed: {received}");
+        assert!(
+            !received.contains("t-x-c-t"),
+            "the ping was relayed: {received}"
+        );
     }
 
     /// node-cot's `CoT.ping()`, as CloudTAK (node-tak) sends it every 5 s.
@@ -837,12 +885,13 @@ mod tests {
             Ok(stream) => stream,
         };
 
-        let write_result = stream.write_all(event_xml("SHOULD-BE-REJECTED").as_bytes()).await;
+        let write_result = stream
+            .write_all(event_xml("SHOULD-BE-REJECTED").as_bytes())
+            .await;
         let mut buf = [0u8; 16];
         let read_result = timeout(StdDuration::from_secs(2), stream.read(&mut buf)).await;
 
-        let rejected = write_result.is_err()
-            || matches!(read_result, Ok(Ok(0)) | Ok(Err(_)));
+        let rejected = write_result.is_err() || matches!(read_result, Ok(Ok(0)) | Ok(Err(_)));
         assert!(
             rejected,
             "server must reject an untrusted client cert (write error, read error, or EOF expected); got write={write_result:?} read={read_result:?}"
@@ -1021,9 +1070,18 @@ mod tests {
 
         // Each device binds its own uid via an ordinary self-report first,
         // the same way a real device establishes identity before chatting.
-        tls_a.write_all(event_xml("UID-A").as_bytes()).await.unwrap();
-        tls_b.write_all(event_xml("UID-B").as_bytes()).await.unwrap();
-        tls_c.write_all(event_xml("UID-C").as_bytes()).await.unwrap();
+        tls_a
+            .write_all(event_xml("UID-A").as_bytes())
+            .await
+            .unwrap();
+        tls_b
+            .write_all(event_xml("UID-B").as_bytes())
+            .await
+            .unwrap();
+        tls_c
+            .write_all(event_xml("UID-C").as_bytes())
+            .await
+            .unwrap();
         tokio::time::sleep(StdDuration::from_millis(100)).await;
         drain_all_available(&mut tls_a).await;
         drain_all_available(&mut tls_b).await;
@@ -1073,10 +1131,22 @@ mod tests {
         let mut tls_d = connect_client(addr, &fixture, "device-d").await; // outsider
         tokio::time::sleep(StdDuration::from_millis(50)).await;
 
-        tls_a.write_all(event_xml("UID-A").as_bytes()).await.unwrap();
-        tls_b.write_all(event_xml("UID-B").as_bytes()).await.unwrap();
-        tls_c.write_all(event_xml("UID-C").as_bytes()).await.unwrap();
-        tls_d.write_all(event_xml("UID-D").as_bytes()).await.unwrap();
+        tls_a
+            .write_all(event_xml("UID-A").as_bytes())
+            .await
+            .unwrap();
+        tls_b
+            .write_all(event_xml("UID-B").as_bytes())
+            .await
+            .unwrap();
+        tls_c
+            .write_all(event_xml("UID-C").as_bytes())
+            .await
+            .unwrap();
+        tls_d
+            .write_all(event_xml("UID-D").as_bytes())
+            .await
+            .unwrap();
         tokio::time::sleep(StdDuration::from_millis(100)).await;
         drain_all_available(&mut tls_a).await;
         drain_all_available(&mut tls_b).await;

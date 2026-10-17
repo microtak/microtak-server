@@ -51,8 +51,14 @@ impl ConnectedClients {
     }
 
     pub fn register(&self, endpoint: ClientEndpoint) {
-        let number = self.next_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        self.numbers.write().unwrap().insert(endpoint.remote_addr, number);
+        let number = self
+            .next_number
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.numbers
+            .write()
+            .unwrap()
+            .insert(endpoint.remote_addr, number);
         self.clients
             .write()
             .unwrap()
@@ -66,7 +72,13 @@ impl ConnectedClients {
 
     /// The official subscription uid of a connection: `tls:<n>` / `tcp:<n>`.
     pub fn subscription_uid(&self, endpoint: &ClientEndpoint) -> String {
-        let number = self.numbers.read().unwrap().get(&endpoint.remote_addr).copied().unwrap_or(0);
+        let number = self
+            .numbers
+            .read()
+            .unwrap()
+            .get(&endpoint.remote_addr)
+            .copied()
+            .unwrap_or(0);
         let protocol = match endpoint.transport {
             Transport::Tls => "tls",
             Transport::Tcp => "tcp",

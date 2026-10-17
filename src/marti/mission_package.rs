@@ -18,11 +18,16 @@ use std::io::{Cursor, Read};
 use crate::missions::{Content, MissionRecord};
 
 fn escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn attr(name: &str, value: Option<&str>) -> String {
-    value.map(|v| format!(r#" {name}="{}""#, escape(v))).unwrap_or_default()
+    value
+        .map(|v| format!(r#" {name}="{}""#, escape(v)))
+        .unwrap_or_default()
 }
 
 /// Java's `Double.toString` for the values a position takes.
@@ -44,10 +49,21 @@ pub struct ArchiveFile {
 }
 
 /// The manifest, as JAXB formats it (4-space indent).
-pub fn manifest_xml(parameters: &[(&str, Option<String>)], files: &[ArchiveFile], groups: &[String], role: Option<(&str, Vec<String>)>) -> String {
-    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<MissionPackageManifest version=\"2\">\n    <Configuration>\n");
+pub fn manifest_xml(
+    parameters: &[(&str, Option<String>)],
+    files: &[ArchiveFile],
+    groups: &[String],
+    role: Option<(&str, Vec<String>)>,
+) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<MissionPackageManifest version=\"2\">\n    <Configuration>\n",
+    );
     for (name, value) in parameters {
-        xml.push_str(&format!("        <Parameter{}{}/>\n", attr("name", Some(name)), attr("value", value.as_deref())));
+        xml.push_str(&format!(
+            "        <Parameter{}{}/>\n",
+            attr("name", Some(name)),
+            attr("value", value.as_deref())
+        ));
     }
     xml.push_str("    </Configuration>\n    <Contents>\n");
     for file in files {
@@ -83,7 +99,10 @@ pub fn manifest_xml(parameters: &[(&str, Option<String>)], files: &[ArchiveFile]
 }
 
 /// The official `archiveMission` parameters, in order.
-pub fn archive_parameters(mission: &MissionRecord, server_name: &str) -> Vec<(&'static str, Option<String>)> {
+pub fn archive_parameters(
+    mission: &MissionRecord,
+    server_name: &str,
+) -> Vec<(&'static str, Option<String>)> {
     vec![
         ("uid", Some(super::envelope::random_uuid())),
         ("name", Some(mission.name.clone())),
@@ -99,7 +118,10 @@ pub fn archive_parameters(mission: &MissionRecord, server_name: &str) -> Vec<(&'
         ("onReceiveDelete", Some("false".into())),
         ("mission_name", Some(mission.name.clone())),
         ("mission_label", Some(mission.name.clone())),
-        ("mission_uid", Some(format!("{server_name}-8443-ssl-{}", mission.name))),
+        (
+            "mission_uid",
+            Some(format!("{server_name}-8443-ssl-{}", mission.name)),
+        ),
         ("mission_server", Some(format!("{server_name}:8443:ssl"))),
     ]
 }
@@ -112,7 +134,11 @@ pub fn content_attributes(resource: &serde_json::Value) -> Vec<(&'static str, St
     let keywords: Vec<String> = resource
         .get("keywords")
         .and_then(|k| k.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     out.push(("keywords", keywords.join(",")));
     for (name, value) in [
@@ -121,7 +147,13 @@ pub fn content_attributes(resource: &serde_json::Value) -> Vec<(&'static str, St
         ("submitter", s("submitter")),
         ("uid", s("uid")),
         ("creatorUid", s("creatorUid")),
-        ("size", resource.get("size").and_then(|v| v.as_u64()).map(|v| v.to_string())),
+        (
+            "size",
+            resource
+                .get("size")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.to_string()),
+        ),
         ("tool", s("tool")),
         ("latitude", f("latitude")),
         ("longitude", f("longitude")),
@@ -139,7 +171,10 @@ pub fn content_attributes(resource: &serde_json::Value) -> Vec<(&'static str, St
 /// The zip: `cot/`, `contents/`, the files, `MANIFEST/`, the manifest
 /// (`MissionPackage.save`, entries written in that order).
 pub fn build_archive(manifest: &str, files: &[ArchiveFile]) -> Vec<u8> {
-    let mut entries: Vec<(String, Vec<u8>)> = vec![("cot/".into(), Vec::new()), ("contents/".into(), Vec::new())];
+    let mut entries: Vec<(String, Vec<u8>)> = vec![
+        ("cot/".into(), Vec::new()),
+        ("contents/".into(), Vec::new()),
+    ];
     entries.extend(files.iter().map(|f| (f.zip_entry.clone(), f.bytes.clone())));
     entries.push(("MANIFEST/".into(), Vec::new()));
     entries.push(("MANIFEST/manifest.xml".into(), manifest.as_bytes().to_vec()));
@@ -172,7 +207,9 @@ pub fn trim_bom(s: &str) -> &str {
 pub fn cot_uid(xml: &str) -> Option<String> {
     let xml = trim_bom(xml);
     let start = xml.find("<event")?;
-    crate::cot::Event::from_xml(&xml[start..]).ok().map(|e| e.uid)
+    crate::cot::Event::from_xml(&xml[start..])
+        .ok()
+        .map(|e| e.uid)
 }
 
 /// What an import adds: hashes come from Enterprise Sync, uids from CoT.
@@ -200,7 +237,10 @@ mod tests {
             &[("uid", Some("u".into())), ("password_hash", None)],
             &files,
             &["__ANON__".to_string()],
-            Some(("MISSION_SUBSCRIBER", vec!["MISSION_READ".into(), "MISSION_WRITE".into()])),
+            Some((
+                "MISSION_SUBSCRIBER",
+                vec!["MISSION_READ".into(), "MISSION_WRITE".into()],
+            )),
         );
         assert_eq!(
             xml,
@@ -210,10 +250,22 @@ mod tests {
 
     #[test]
     fn an_archive_round_trips_through_extract() {
-        let zip = build_archive("<m/>", &[ArchiveFile { zip_entry: "contents/0_a.txt".into(), bytes: b"a".to_vec(), attributes: vec![], uid_parameter: None }]);
+        let zip = build_archive(
+            "<m/>",
+            &[ArchiveFile {
+                zip_entry: "contents/0_a.txt".into(),
+                bytes: b"a".to_vec(),
+                attributes: vec![],
+                uid_parameter: None,
+            }],
+        );
         let files = extract(&zip).unwrap();
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["contents/0_a.txt", "MANIFEST/manifest.xml"], "directories are skipped");
+        assert_eq!(
+            names,
+            ["contents/0_a.txt", "MANIFEST/manifest.xml"],
+            "directories are skipped"
+        );
     }
 
     #[test]

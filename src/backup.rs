@@ -204,7 +204,10 @@ mod tests {
 
     fn temp_dir(label: &str) -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("microtak-backup-{label}-{}-{n}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "microtak-backup-{label}-{}-{n}",
+            std::process::id()
+        ))
     }
 
     #[test]

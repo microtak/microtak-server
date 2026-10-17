@@ -29,7 +29,10 @@ use tracing::{info, warn};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertSource {
     Internal,
-    Files { cert_file: PathBuf, key_file: PathBuf },
+    Files {
+        cert_file: PathBuf,
+        key_file: PathBuf,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -139,14 +142,15 @@ pub async fn watch_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pki::{build_csr, CertificateAuthority};
+    use crate::pki::{CertificateAuthority, build_csr};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_dir() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("microtak-certsource-{}-{n}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("microtak-certsource-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -210,7 +214,9 @@ mod tests {
         let (cert_a, key_a) = pem_pair("a.example.com");
         std::fs::write(&cert_path, &cert_a).unwrap();
         std::fs::write(&key_path, &key_a).unwrap();
-        let target = Arc::new(SwappableCert::new(load_files(&cert_path, &key_path).unwrap()));
+        let target = Arc::new(SwappableCert::new(
+            load_files(&cert_path, &key_path).unwrap(),
+        ));
         let first = leaf(&target.current());
 
         tokio::spawn(watch_files(
@@ -239,6 +245,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         std::fs::write(&cert_path, "not a certificate").unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(leaf(&target.current()), second, "a broken pair must not replace a working one");
+        assert_eq!(
+            leaf(&target.current()),
+            second,
+            "a broken pair must not replace a working one"
+        );
     }
 }

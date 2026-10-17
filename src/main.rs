@@ -25,7 +25,10 @@ async fn main() -> std::io::Result<()> {
     let config = Config::load_or_default(&config_path)
         .and_then(|c| c.to_app_config())
         .unwrap_or_else(|error| {
-            panic!("failed to load config from {}: {error}", config_path.display())
+            panic!(
+                "failed to load config from {}: {error}",
+                config_path.display()
+            )
         });
 
     let backup_enabled = config.backup.enabled;

@@ -249,7 +249,10 @@ mod tests {
         let read = timeout(Duration::from_secs(2), second.read(&mut buf))
             .await
             .expect("the over-limit connection must be closed promptly");
-        assert!(matches!(read, Ok(0) | Err(_)), "expected EOF/reset, got {read:?}");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "expected EOF/reset, got {read:?}"
+        );
     }
 
     /// TC-ROUTE-01: a real socket-level test — two actual TCP clients
@@ -262,8 +265,8 @@ mod tests {
             RelayHub::new(),
             ConnectedClients::new(),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let addr = relay.local_addr().unwrap();
         tokio::spawn(relay.run());
 
@@ -300,9 +303,13 @@ mod tests {
     /// Plain TCP answers pings the same way and never relays them.
     #[tokio::test]
     async fn pings_get_a_pong_and_are_not_relayed() {
-        let relay = TcpRelay::bind("127.0.0.1:0".parse().unwrap(), RelayHub::new(), ConnectedClients::new())
-            .await
-            .unwrap();
+        let relay = TcpRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            RelayHub::new(),
+            ConnectedClients::new(),
+        )
+        .await
+        .unwrap();
         let addr = relay.local_addr().unwrap();
         tokio::spawn(relay.run());
 
@@ -320,16 +327,25 @@ mod tests {
             .expect("timed out waiting for the pong")
             .unwrap();
         let pong = String::from_utf8_lossy(&buf[..n]);
-        assert!(pong.contains(r#"uid="takPong" type="t-x-c-t-r""#), "got: {pong}");
+        assert!(
+            pong.contains(r#"uid="takPong" type="t-x-c-t-r""#),
+            "got: {pong}"
+        );
 
-        client_a.write_all(event_xml("AFTER-PING").as_bytes()).await.unwrap();
+        client_a
+            .write_all(event_xml("AFTER-PING").as_bytes())
+            .await
+            .unwrap();
         let n = timeout(Duration::from_secs(2), client_b.read(&mut buf))
             .await
             .expect("timed out waiting for the relayed event")
             .unwrap();
         let received = String::from_utf8_lossy(&buf[..n]);
         assert!(received.contains("AFTER-PING"), "got: {received}");
-        assert!(!received.contains("t-x-c-t"), "the ping was relayed: {received}");
+        assert!(
+            !received.contains("t-x-c-t"),
+            "the ping was relayed: {received}"
+        );
     }
 
     /// TC-STREAM-04: a stream-level syntax error disconnects the client.
@@ -340,8 +356,8 @@ mod tests {
             RelayHub::new(),
             ConnectedClients::new(),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let addr = relay.local_addr().unwrap();
         tokio::spawn(relay.run());
 
@@ -368,8 +384,8 @@ mod tests {
             RelayHub::new(),
             ConnectedClients::new(),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let addr = relay.local_addr().unwrap();
         tokio::spawn(relay.run());
 

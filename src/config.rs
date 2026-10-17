@@ -13,8 +13,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use time::Duration;
 use thiserror::Error;
+use time::Duration;
 
 use crate::app::{AppConfig, BackupConfig, EnrollmentMode};
 use crate::certsource::CertSource;
@@ -157,13 +157,13 @@ impl Config {
         let contents = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default())
+                return Ok(Self::default());
             }
             Err(source) => {
                 return Err(ConfigError::Read {
                     path: path.to_path_buf(),
                     source,
-                })
+                });
             }
         };
         toml::from_str(&contents).map_err(|source| ConfigError::Parse {
@@ -218,8 +218,12 @@ impl Config {
             admin_common_name: self.admin_common_name.clone(),
             enrollment_mode: self.enrollment_mode,
             admission: crate::transport::admission::AdmissionLimits {
-                handshake_timeout: std::time::Duration::from_secs(self.handshake_timeout_seconds.max(1)),
-                http_header_timeout: std::time::Duration::from_secs(self.http_header_timeout_seconds.max(1)),
+                handshake_timeout: std::time::Duration::from_secs(
+                    self.handshake_timeout_seconds.max(1),
+                ),
+                http_header_timeout: std::time::Duration::from_secs(
+                    self.http_header_timeout_seconds.max(1),
+                ),
                 max_connections: self.max_connections.max(1),
                 max_connections_per_ip: self.max_connections_per_ip.max(1),
             },
@@ -252,7 +256,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("microtak.toml");
-        std::fs::write(&path, "data_dir = \"/var/lib/microtak\"\nmtls_port = 9999\n").unwrap();
+        std::fs::write(
+            &path,
+            "data_dir = \"/var/lib/microtak\"\nmtls_port = 9999\n",
+        )
+        .unwrap();
 
         let config = Config::load_or_default(&path).unwrap();
         assert_eq!(config.data_dir, PathBuf::from("/var/lib/microtak"));
@@ -326,7 +334,10 @@ mod tests {
     #[test]
     fn connection_limits_parse_and_default() {
         let defaults = Config::default().to_app_config().unwrap().admission;
-        assert_eq!(defaults, crate::transport::admission::AdmissionLimits::default());
+        assert_eq!(
+            defaults,
+            crate::transport::admission::AdmissionLimits::default()
+        );
 
         let config: Config = toml::from_str(
             "max_connections = 200\nmax_connections_per_ip = 5\nhandshake_timeout_seconds = 3\nhttp_header_timeout_seconds = 4\n",
@@ -336,25 +347,46 @@ mod tests {
         assert_eq!(limits.max_connections, 200);
         assert_eq!(limits.max_connections_per_ip, 5);
         assert_eq!(limits.handshake_timeout, std::time::Duration::from_secs(3));
-        assert_eq!(limits.http_header_timeout, std::time::Duration::from_secs(4));
+        assert_eq!(
+            limits.http_header_timeout,
+            std::time::Duration::from_secs(4)
+        );
     }
 
     #[test]
     fn proxy_protocol_sources_parse_and_reject_garbage() {
-        assert!(Config::default().to_app_config().unwrap().proxy_protocol_from.is_empty());
+        assert!(
+            Config::default()
+                .to_app_config()
+                .unwrap()
+                .proxy_protocol_from
+                .is_empty()
+        );
         let config: Config = toml::from_str("proxy_protocol_from = [\"10.42.0.0/16\"]\n").unwrap();
         let app = config.to_app_config().unwrap();
-        assert!(app.proxy_protocol_from.contains("10.42.1.5".parse().unwrap()));
-        assert!(!app.proxy_protocol_from.contains("203.0.113.1".parse().unwrap()));
+        assert!(
+            app.proxy_protocol_from
+                .contains("10.42.1.5".parse().unwrap())
+        );
+        assert!(
+            !app.proxy_protocol_from
+                .contains("203.0.113.1".parse().unwrap())
+        );
         let bad: Config = toml::from_str("proxy_protocol_from = [\"not-an-ip\"]\n").unwrap();
         assert!(bad.to_app_config().is_err());
     }
 
     #[test]
     fn upload_limit_defaults_to_100_mb_and_is_configurable() {
-        assert_eq!(Config::default().to_app_config().unwrap().max_upload_bytes, 100 * 1024 * 1024);
+        assert_eq!(
+            Config::default().to_app_config().unwrap().max_upload_bytes,
+            100 * 1024 * 1024
+        );
         let config: Config = toml::from_str("max_upload_mb = 250\n").unwrap();
-        assert_eq!(config.to_app_config().unwrap().max_upload_bytes, 250 * 1024 * 1024);
+        assert_eq!(
+            config.to_app_config().unwrap().max_upload_bytes,
+            250 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -388,7 +420,10 @@ mod tests {
         let config = Config::load_or_default(&path).unwrap();
         let app_config = config.to_app_config().unwrap();
         assert!(app_config.backup.enabled);
-        assert_eq!(app_config.backup.interval, std::time::Duration::from_secs(900));
+        assert_eq!(
+            app_config.backup.interval,
+            std::time::Duration::from_secs(900)
+        );
         assert_eq!(
             app_config.backup.backup_dir,
             PathBuf::from("/var/backups/microtak")
@@ -435,7 +470,10 @@ mod tests {
         )
         .unwrap();
         let app_config = both.to_app_config().unwrap();
-        assert_eq!(app_config.server_names, vec!["192.168.1.10", "tak.example.com"]);
+        assert_eq!(
+            app_config.server_names,
+            vec!["192.168.1.10", "tak.example.com"]
+        );
         assert_eq!(
             app_config.enrollment_cert,
             CertSource::Files {

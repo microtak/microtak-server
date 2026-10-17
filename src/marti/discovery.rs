@@ -40,7 +40,10 @@ pub fn router() -> Router {
 }
 
 async fn version() -> impl IntoResponse {
-    ([(axum::http::header::CONTENT_TYPE, "text/plain")], VERSION_STRING)
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain")],
+        VERSION_STRING,
+    )
 }
 
 async fn version_config() -> impl IntoResponse {
@@ -69,7 +72,10 @@ mod tests {
         let response = get(router(), "/Marti/api/version").await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = String::from_utf8(
-            axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec(),
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
         )
         .unwrap();
         assert!(body.starts_with("MicroTAK "));
@@ -86,7 +92,9 @@ mod tests {
         let response = get(router(), "/files/api/config").await;
         assert_eq!(response.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_slice(
-            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert!(body["uploadSizeLimit"].as_u64().unwrap() > 0);

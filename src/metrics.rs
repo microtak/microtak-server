@@ -74,7 +74,9 @@ pub struct Sources {
 }
 
 pub fn router(sources: Sources) -> Router {
-    Router::new().route("/metrics", get(metrics)).with_state(sources)
+    Router::new()
+        .route("/metrics", get(metrics))
+        .with_state(sources)
 }
 
 async fn metrics(State(sources): State<Sources>) -> impl IntoResponse {
@@ -82,7 +84,13 @@ async fn metrics(State(sources): State<Sources>) -> impl IntoResponse {
     let body = tokio::task::spawn_blocking(move || render(&sources))
         .await
         .unwrap_or_default();
-    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], body)
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
 }
 
 /// Serve [`router`] on `listener` forever.
@@ -106,7 +114,12 @@ impl Exposition {
     }
 
     fn counter(&mut self, name: &str, help: &str, value: &AtomicU64) {
-        self.metric(name, "counter", help, &[("", value.load(Ordering::Relaxed) as f64)]);
+        self.metric(
+            name,
+            "counter",
+            help,
+            &[("", value.load(Ordering::Relaxed) as f64)],
+        );
     }
 }
 
@@ -118,11 +131,18 @@ pub fn render(sources: &Sources) -> String {
         "microtak_build_info",
         "gauge",
         "Server version.",
-        &[(&format!("{{version=\"{}\"}}", env!("CARGO_PKG_VERSION")), 1.0)],
+        &[(
+            &format!("{{version=\"{}\"}}", env!("CARGO_PKG_VERSION")),
+            1.0,
+        )],
     );
 
     let devices = sources.registry.all();
-    out.gauge("microtak_devices", "Enrolled device identities.", devices.len() as f64);
+    out.gauge(
+        "microtak_devices",
+        "Enrolled device identities.",
+        devices.len() as f64,
+    );
     out.gauge(
         "microtak_devices_blocked",
         "Blocked identities.",
@@ -150,11 +170,20 @@ pub fn render(sources: &Sources) -> String {
             .filter(|t| !t.used && !t.revoked && t.expires_at_unix.is_none_or(|at| at > now))
             .count() as f64,
     );
-    out.gauge("microtak_missions", "Missions (Data Sync).", sources.missions.list().len() as f64);
-    out.gauge("microtak_groups", "Groups (channels).", sources.groups.list().len() as f64);
+    out.gauge(
+        "microtak_missions",
+        "Missions (Data Sync).",
+        sources.missions.list().len() as f64,
+    );
+    out.gauge(
+        "microtak_groups",
+        "Groups (channels).",
+        sources.groups.list().len() as f64,
+    );
 
     let clients = sources.clients.list();
-    let count = |transport: Transport| clients.iter().filter(|c| c.transport == transport).count() as f64;
+    let count =
+        |transport: Transport| clients.iter().filter(|c| c.transport == transport).count() as f64;
     out.metric(
         "microtak_connected_clients",
         "gauge",
@@ -175,8 +204,14 @@ pub fn render(sources: &Sources) -> String {
         "counter",
         "CoT events received from clients and relayed.",
         &[
-            ("{transport=\"tls\"}", COUNTERS.cot_events_tls.load(Ordering::Relaxed) as f64),
-            ("{transport=\"tcp\"}", COUNTERS.cot_events_tcp.load(Ordering::Relaxed) as f64),
+            (
+                "{transport=\"tls\"}",
+                COUNTERS.cot_events_tls.load(Ordering::Relaxed) as f64,
+            ),
+            (
+                "{transport=\"tcp\"}",
+                COUNTERS.cot_events_tcp.load(Ordering::Relaxed) as f64,
+            ),
         ],
     );
     out.counter(
@@ -184,7 +219,11 @@ pub fn render(sources: &Sources) -> String {
         "CoT events dropped for impersonating another device.",
         &COUNTERS.cot_events_dropped,
     );
-    out.counter("microtak_enrollments_total", "Certificates issued.", &COUNTERS.enrollments);
+    out.counter(
+        "microtak_enrollments_total",
+        "Certificates issued.",
+        &COUNTERS.enrollments,
+    );
     out.counter(
         "microtak_connections_refused_total",
         "Connections refused by the connection limits.",
@@ -196,9 +235,16 @@ pub fn render(sources: &Sources) -> String {
         "microtak_content_files",
         "gauge",
         "Files stored via Data Sync (pictures recognized by their content).",
-        &[("{kind=\"image\"}", content.images as f64), ("{kind=\"other\"}", content.others as f64)],
+        &[
+            ("{kind=\"image\"}", content.images as f64),
+            ("{kind=\"other\"}", content.others as f64),
+        ],
     );
-    out.gauge("microtak_content_bytes", "Bytes stored via Data Sync.", content.bytes as f64);
+    out.gauge(
+        "microtak_content_bytes",
+        "Bytes stored via Data Sync.",
+        content.bytes as f64,
+    );
     out.gauge(
         "microtak_data_dir_bytes",
         "Bytes in the data directory (state, content, logs).",
@@ -206,8 +252,16 @@ pub fn render(sources: &Sources) -> String {
     );
 
     if let Some(process) = process_stats() {
-        out.counter_value("process_cpu_seconds_total", "CPU time used by the server.", process.cpu_seconds);
-        out.gauge("process_resident_memory_bytes", "Resident memory of the server.", process.resident_bytes);
+        out.counter_value(
+            "process_cpu_seconds_total",
+            "CPU time used by the server.",
+            process.cpu_seconds,
+        );
+        out.gauge(
+            "process_resident_memory_bytes",
+            "Resident memory of the server.",
+            process.resident_bytes,
+        );
     }
     out.0
 }
@@ -219,7 +273,9 @@ impl Exposition {
 }
 
 fn dir_size(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else { return 0 };
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
     entries
         .flatten()
         .map(|entry| match entry.metadata() {
@@ -270,7 +326,10 @@ mod tests {
     fn exposition_has_help_type_and_labelled_samples() {
         let mut out = Exposition(String::new());
         out.metric("x_total", "counter", "Things.", &[("{a=\"b\"}", 3.0)]);
-        assert_eq!(out.0, "# HELP x_total Things.\n# TYPE x_total counter\nx_total{a=\"b\"} 3\n");
+        assert_eq!(
+            out.0,
+            "# HELP x_total Things.\n# TYPE x_total counter\nx_total{a=\"b\"} 3\n"
+        );
     }
 
     #[test]

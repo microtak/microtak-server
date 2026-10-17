@@ -8,7 +8,11 @@ fn crc32(data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= byte as u32;
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -69,11 +73,13 @@ mod tests {
 
     #[test]
     fn archive_has_signatures_and_both_files() {
-        let zip = stored(&[("a.pem".into(), b"AAA".to_vec()), ("b.pem".into(), b"BB".to_vec())]);
+        let zip = stored(&[
+            ("a.pem".into(), b"AAA".to_vec()),
+            ("b.pem".into(), b"BB".to_vec()),
+        ]);
         assert!(zip.starts_with(b"PK\x03\x04"));
         assert!(zip.windows(4).any(|w| w == b"PK\x01\x02"));
         assert!(zip.windows(4).any(|w| w == b"PK\x05\x06"));
         assert!(zip.windows(5).any(|w| w == b"a.pem") && zip.windows(5).any(|w| w == b"b.pem"));
     }
 }
-

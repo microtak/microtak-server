@@ -29,17 +29,18 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use super::PeerIdentity;
 use super::envelope::{api_response, cot_date_millis, random_uuid};
 use super::mission_notify::{Announcement, ChangeKind, MissionNotifier};
 use super::mission_token::{MissionTokenSigner, TokenType};
-use super::PeerIdentity;
 use crate::groups::GroupStore;
 use crate::latest_cot::LatestCot;
 use crate::missions::{
-    ChangeRecord, Content, InvitationRecord, LayerRecord, LayerTree, LayerType, InvitationType, LogEntryRecord, MissionError, MissionFields,
-    MissionRecord, MissionStore, NewMission, Permission, Role, SubscriptionRecord, Window,
+    ChangeRecord, Content, InvitationRecord, InvitationType, LayerRecord, LayerTree, LayerType,
+    LogEntryRecord, MissionError, MissionFields, MissionRecord, MissionStore, NewMission,
+    Permission, Role, SubscriptionRecord, Window,
 };
 use crate::sync::ResourceStore;
 use crate::transport::connections::ConnectedClients;
@@ -87,8 +88,11 @@ impl MissionsState {
             notifier,
             clients: ConnectedClients::new(),
             content: Arc::new(
-                crate::content_store::ContentStore::open(std::env::temp_dir().join(format!("microtak-mission-content-{}", random_uuid())))
-                    .expect("temp content store"),
+                crate::content_store::ContentStore::open(
+                    std::env::temp_dir()
+                        .join(format!("microtak-mission-content-{}", random_uuid())),
+                )
+                .expect("temp content store"),
             ),
         }
     }
@@ -96,65 +100,189 @@ impl MissionsState {
 
 pub fn router_with(state: MissionsState) -> Router {
     Router::new()
-        .route("/Marti/api/missions", get(list_missions).delete(delete_mission_by_guid))
-        .route("/Marti/api/missions/all/subscriptions", get(all_subscriptions))
-        .route("/Marti/api/missions/all/subscriptions/guid", get(all_subscriptions_with_guid))
-        .route("/Marti/api/missions/all/invitations", get(all_invitation_names))
+        .route(
+            "/Marti/api/missions",
+            get(list_missions).delete(delete_mission_by_guid),
+        )
+        .route(
+            "/Marti/api/missions/all/subscriptions",
+            get(all_subscriptions),
+        )
+        .route(
+            "/Marti/api/missions/all/subscriptions/guid",
+            get(all_subscriptions_with_guid),
+        )
+        .route(
+            "/Marti/api/missions/all/invitations",
+            get(all_invitation_names),
+        )
         .route("/Marti/api/missions/invitations", get(my_invitations))
         .route("/Marti/api/missions/all/logs", get(all_logs))
-        .route("/Marti/api/missions/logs/entries", post(post_log_entry).put(put_log_entry))
-        .route("/Marti/api/missions/logs/entries/:id", get(get_log_entry).delete(delete_log_entry))
+        .route(
+            "/Marti/api/missions/logs/entries",
+            post(post_log_entry).put(put_log_entry),
+        )
+        .route(
+            "/Marti/api/missions/logs/entries/:id",
+            get(get_log_entry).delete(delete_log_entry),
+        )
         .route(
             "/Marti/api/missions/:name",
-            get(get_mission_by_name).put(create_mission_put).post(create_mission_post).delete(delete_mission_by_name),
+            get(get_mission_by_name)
+                .put(create_mission_put)
+                .post(create_mission_post)
+                .delete(delete_mission_by_name),
         )
         .route("/Marti/api/missions/guid/:guid", get(get_mission_by_guid))
-        .route("/Marti/api/missions/:name/contents", put(add_contents_by_name).delete(remove_content_by_name))
-        .route("/Marti/api/missions/guid/:guid/contents", put(add_contents_by_guid).delete(remove_content_by_guid))
+        .route(
+            "/Marti/api/missions/:name/contents",
+            put(add_contents_by_name).delete(remove_content_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/contents",
+            put(add_contents_by_guid).delete(remove_content_by_guid),
+        )
         .route("/Marti/api/missions/:name/changes", get(changes_by_name))
-        .route("/Marti/api/missions/guid/:guid/changes", get(changes_by_guid))
-        .route("/Marti/api/missions/:name/keywords", put(set_keywords).delete(clear_keywords))
-        .route("/Marti/api/missions/:name/keywords/:keyword", delete(remove_keyword))
-        .route("/Marti/api/missions/:name/uid/:uid/keywords", put(set_uid_keywords).delete(clear_uid_keywords))
-        .route("/Marti/api/missions/:name/content/:hash/keywords", put(set_hash_keywords).delete(clear_hash_keywords))
+        .route(
+            "/Marti/api/missions/guid/:guid/changes",
+            get(changes_by_guid),
+        )
+        .route(
+            "/Marti/api/missions/:name/keywords",
+            put(set_keywords).delete(clear_keywords),
+        )
+        .route(
+            "/Marti/api/missions/:name/keywords/:keyword",
+            delete(remove_keyword),
+        )
+        .route(
+            "/Marti/api/missions/:name/uid/:uid/keywords",
+            put(set_uid_keywords).delete(clear_uid_keywords),
+        )
+        .route(
+            "/Marti/api/missions/:name/content/:hash/keywords",
+            put(set_hash_keywords).delete(clear_hash_keywords),
+        )
         .route("/Marti/api/missions/:name/token", get(access_token))
         .route(
             "/Marti/api/missions/:name/subscription",
-            get(subscription_by_name).put(subscribe_by_name).post(set_subscription_roles_by_name).delete(unsubscribe_by_name),
+            get(subscription_by_name)
+                .put(subscribe_by_name)
+                .post(set_subscription_roles_by_name)
+                .delete(unsubscribe_by_name),
         )
         .route(
             "/Marti/api/missions/guid/:guid/subscription",
-            get(subscription_by_guid).put(subscribe_by_guid).post(set_subscription_roles_by_guid).delete(unsubscribe_by_guid),
+            get(subscription_by_guid)
+                .put(subscribe_by_guid)
+                .post(set_subscription_roles_by_guid)
+                .delete(unsubscribe_by_guid),
         )
-        .route("/Marti/api/missions/:name/subscriptions", get(subscribers_by_name))
-        .route("/Marti/api/missions/guid/:guid/subscriptions", get(subscribers_by_guid))
-        .route("/Marti/api/missions/:name/subscriptions/roles", get(subscription_roles_by_name))
-        .route("/Marti/api/missions/guid/:guid/subscriptions/roles", get(subscription_roles_by_guid))
-        .route("/Marti/api/missions/:name/role", get(role_by_name).put(set_role_by_name))
-        .route("/Marti/api/missions/guid/:guid/role", get(role_by_guid).put(set_role_by_guid))
-        .route("/Marti/api/missions/:name/invitations", get(invitations_by_name))
-        .route("/Marti/api/missions/guid/:guid/invitations", get(invitations_by_guid))
-        .route("/Marti/api/missions/:name/invite/:kind/:invitee", put(invite_by_name).delete(uninvite_by_name))
-        .route("/Marti/api/missions/guid/:guid/invite/:kind/:invitee", put(invite_by_guid).delete(uninvite_by_guid))
+        .route(
+            "/Marti/api/missions/:name/subscriptions",
+            get(subscribers_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/subscriptions",
+            get(subscribers_by_guid),
+        )
+        .route(
+            "/Marti/api/missions/:name/subscriptions/roles",
+            get(subscription_roles_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/subscriptions/roles",
+            get(subscription_roles_by_guid),
+        )
+        .route(
+            "/Marti/api/missions/:name/role",
+            get(role_by_name).put(set_role_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/role",
+            get(role_by_guid).put(set_role_by_guid),
+        )
+        .route(
+            "/Marti/api/missions/:name/invitations",
+            get(invitations_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/invitations",
+            get(invitations_by_guid),
+        )
+        .route(
+            "/Marti/api/missions/:name/invite/:kind/:invitee",
+            put(invite_by_name).delete(uninvite_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/invite/:kind/:invitee",
+            put(invite_by_guid).delete(uninvite_by_guid),
+        )
         .route("/Marti/api/missions/:name/log", get(logs_for_mission))
         .route("/Marti/api/missions/:name/cot", get(cot_by_name))
         .route("/Marti/api/missions/guid/:guid/cot", get(cot_by_guid))
-        .route("/Marti/api/missions/:name/layers", get(layers_by_name).put(create_layer_by_name).delete(delete_layers_by_name))
-        .route("/Marti/api/missions/guid/:guid/layers", get(layers_by_guid).put(create_layer_by_guid).delete(delete_layers_by_guid))
-        .route("/Marti/api/missions/:name/layers/parent", put(set_layer_parent_by_name))
-        .route("/Marti/api/missions/guid/:guid/layers/parent", put(set_layer_parent_by_guid))
-        .route("/Marti/api/missions/:name/layers/:layer", get(layer_by_name))
-        .route("/Marti/api/missions/guid/:guid/layers/:layer", get(layer_by_guid))
-        .route("/Marti/api/missions/:name/layers/:layer/name", put(rename_layer_by_name))
-        .route("/Marti/api/missions/guid/:guid/layers/:layer/name", put(rename_layer_by_guid))
+        .route(
+            "/Marti/api/missions/:name/layers",
+            get(layers_by_name)
+                .put(create_layer_by_name)
+                .delete(delete_layers_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/layers",
+            get(layers_by_guid)
+                .put(create_layer_by_guid)
+                .delete(delete_layers_by_guid),
+        )
+        .route(
+            "/Marti/api/missions/:name/layers/parent",
+            put(set_layer_parent_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/layers/parent",
+            put(set_layer_parent_by_guid),
+        )
+        .route(
+            "/Marti/api/missions/:name/layers/:layer",
+            get(layer_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/layers/:layer",
+            get(layer_by_guid),
+        )
+        .route(
+            "/Marti/api/missions/:name/layers/:layer/name",
+            put(rename_layer_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/layers/:layer/name",
+            put(rename_layer_by_guid),
+        )
         .route("/Marti/api/missions/:name/archive", get(archive_mission))
         .route("/Marti/api/missions/:name/contacts", get(contacts_by_name))
-        .route("/Marti/api/missions/guid/:guid/contacts", get(contacts_by_guid))
-        .route("/Marti/api/missions/:name/contents/missionpackage", put(add_mission_package))
-        .route("/Marti/api/missions/:name/password", put(set_password_by_name).delete(remove_password_by_name))
-        .route("/Marti/api/missions/guid/:guid/password", put(set_password_by_guid).delete(remove_password_by_guid))
-        .route("/Marti/api/missions/:name/expiration", put(set_expiration_by_name))
-        .route("/Marti/api/missions/guid/:guid/expiration", put(set_expiration_by_guid))
+        .route(
+            "/Marti/api/missions/guid/:guid/contacts",
+            get(contacts_by_guid),
+        )
+        .route(
+            "/Marti/api/missions/:name/contents/missionpackage",
+            put(add_mission_package),
+        )
+        .route(
+            "/Marti/api/missions/:name/password",
+            put(set_password_by_name).delete(remove_password_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/password",
+            put(set_password_by_guid).delete(remove_password_by_guid),
+        )
+        .route(
+            "/Marti/api/missions/:name/expiration",
+            put(set_expiration_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/expiration",
+            put(set_expiration_by_guid),
+        )
         .with_state(state)
 }
 
@@ -191,15 +319,40 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = |status: StatusCode, name: &str, code: u32, message: String| {
-            (status, Json(json!({ "status": name, "code": code, "message": message }))).into_response()
+            (
+                status,
+                Json(json!({ "status": name, "code": code, "message": message })),
+            )
+                .into_response()
         };
-        let suffix = |m: &str| if m.is_empty() { String::new() } else { format!(": {m}") };
+        let suffix = |m: &str| {
+            if m.is_empty() {
+                String::new()
+            } else {
+                format!(": {m}")
+            }
+        };
         match self {
-            ApiError::NotFound(m) => body(StatusCode::NOT_FOUND, "NOT_FOUND", 1, format!("Not Found{}", suffix(&m))),
-            ApiError::BadRequest(m) => body(StatusCode::BAD_REQUEST, "BAD_REQUEST", 2, format!("Invalid Request{}", suffix(&m))),
+            ApiError::NotFound(m) => body(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                1,
+                format!("Not Found{}", suffix(&m)),
+            ),
+            ApiError::BadRequest(m) => body(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                2,
+                format!("Invalid Request{}", suffix(&m)),
+            ),
             ApiError::Forbidden(m) => body(StatusCode::FORBIDDEN, "FORBIDDEN", 10, suffix(&m)),
             ApiError::Gone(m) => body(StatusCode::GONE, "GONE", 8, suffix(&m)),
-            ApiError::Internal => body(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_SERVER_ERROR", 6, String::new()),
+            ApiError::Internal => body(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_SERVER_ERROR",
+                6,
+                String::new(),
+            ),
             ApiError::NoMission => StatusCode::NOT_FOUND.into_response(),
             ApiError::MissionGone => StatusCode::GONE.into_response(),
             ApiError::AccessDenied => StatusCode::FORBIDDEN.into_response(),
@@ -210,7 +363,9 @@ impl IntoResponse for ApiError {
 impl From<MissionError> for ApiError {
     fn from(error: MissionError) -> Self {
         match error {
-            MissionError::NotFound(guid) => ApiError::NotFound(format!("Mission guid '{guid}' not found - not deleted")),
+            MissionError::NotFound(guid) => {
+                ApiError::NotFound(format!("Mission guid '{guid}' not found - not deleted"))
+            }
             MissionError::EventLog(e) => {
                 tracing::error!(error = %e, "mission store write failed");
                 ApiError::Internal
@@ -235,7 +390,10 @@ impl Params {
     }
 
     fn get(&self, name: &str) -> Option<&str> {
-        self.0.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+        self.0
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
     }
 
     fn string(&self, name: &str) -> String {
@@ -243,7 +401,11 @@ impl Params {
     }
 
     fn all(&self, name: &str) -> Vec<String> {
-        self.0.iter().filter(|(k, _)| k == name).map(|(_, v)| v.clone()).collect()
+        self.0
+            .iter()
+            .filter(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .collect()
     }
 
     /// Spring's boolean conversion (`true/false/on/off/yes/no/1/0`).
@@ -254,7 +416,9 @@ impl Params {
             Some(v) => match v.as_str() {
                 "true" | "on" | "yes" | "1" => Ok(true),
                 "false" | "off" | "no" | "0" => Ok(false),
-                _ => Err(ApiError::BadRequest(format!("invalid boolean for '{name}'"))),
+                _ => Err(ApiError::BadRequest(format!(
+                    "invalid boolean for '{name}'"
+                ))),
             },
         }
     }
@@ -262,14 +426,20 @@ impl Params {
     fn long(&self, name: &str) -> Result<Option<i64>, ApiError> {
         match self.get(name).filter(|v| !v.is_empty()) {
             None => Ok(None),
-            Some(v) => v.trim().parse().map(Some).map_err(|_| ApiError::BadRequest(format!("invalid number for '{name}'"))),
+            Some(v) => v
+                .trim()
+                .parse()
+                .map(Some)
+                .map_err(|_| ApiError::BadRequest(format!("invalid number for '{name}'"))),
         }
     }
 
     fn role(&self, name: &str) -> Result<Option<Role>, ApiError> {
         match self.get(name).filter(|v| !v.is_empty()) {
             None => Ok(None),
-            Some(v) => Role::parse(v).map(Some).ok_or_else(|| ApiError::BadRequest(format!("invalid role '{v}'"))),
+            Some(v) => Role::parse(v)
+                .map(Some)
+                .ok_or_else(|| ApiError::BadRequest(format!("invalid role '{v}'"))),
         }
     }
 
@@ -278,9 +448,11 @@ impl Params {
         let parse_date = |name: &str| -> Result<Option<i64>, ApiError> {
             match self.get(name).filter(|v| !v.is_empty()) {
                 None => Ok(None),
-                Some(v) => time::OffsetDateTime::parse(v, &time::format_description::well_known::Rfc3339)
-                    .map(|t| Some((t.unix_timestamp_nanos() / 1_000_000) as i64))
-                    .map_err(|_| ApiError::BadRequest(format!("invalid date for '{name}'"))),
+                Some(v) => {
+                    time::OffsetDateTime::parse(v, &time::format_description::well_known::Rfc3339)
+                        .map(|t| Some((t.unix_timestamp_nanos() / 1_000_000) as i64))
+                        .map_err(|_| ApiError::BadRequest(format!("invalid date for '{name}'")))
+                }
             }
         };
         let mut start = parse_date("start")?;
@@ -288,7 +460,10 @@ impl Params {
         if let Some(secago) = self.long("secago")?.filter(|s| *s > 0) {
             start = Some(now_ms() - secago * 1000);
         }
-        let window = Window { start_ms: start.unwrap_or(i64::MIN), end_ms: end.unwrap_or(i64::MAX) };
+        let window = Window {
+            start_ms: start.unwrap_or(i64::MIN),
+            end_ms: end.unwrap_or(i64::MAX),
+        };
         if window.start_ms >= window.end_ms {
             return Err(ApiError::BadRequest("invalid time range".into()));
         }
@@ -317,7 +492,9 @@ fn caller(state: &MissionsState, identity: &PeerIdentity, headers: &HeaderMap) -
         groups: state.groups.all_group_names(&identity.0),
         token,
         // `getApiVersionNumberFromRequest`: absent or unparsable → 2.
-        api_version: header("API_VERSION").and_then(|v| v.trim().parse().ok()).unwrap_or(2),
+        api_version: header("API_VERSION")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2),
     }
 }
 
@@ -332,7 +509,12 @@ enum Key<'a> {
 
 /// The request filter's lookup: `Ok(None)` only when `create` and nothing
 /// of that name exists for the caller.
-fn lookup(state: &MissionsState, caller: &Caller, key: Key<'_>, create: bool) -> Result<Option<MissionRecord>, ApiError> {
+fn lookup(
+    state: &MissionsState,
+    caller: &Caller,
+    key: Key<'_>,
+    create: bool,
+) -> Result<Option<MissionRecord>, ApiError> {
     match key {
         Key::Name(name) => {
             let name = name.trim();
@@ -359,26 +541,42 @@ fn lookup(state: &MissionsState, caller: &Caller, key: Key<'_>, create: bool) ->
     }
 }
 
-fn existing(state: &MissionsState, caller: &Caller, key: Key<'_>) -> Result<MissionRecord, ApiError> {
+fn existing(
+    state: &MissionsState,
+    caller: &Caller,
+    key: Key<'_>,
+) -> Result<MissionRecord, ApiError> {
     lookup(state, caller, key, false).map(|m| m.expect("not a create"))
 }
 
 fn uuid_parse(s: &str) -> Option<()> {
     let parts: Vec<&str> = s.split('-').collect();
     let lens = [8, 4, 4, 4, 12];
-    (parts.len() == 5 && parts.iter().zip(lens).all(|(p, l)| p.len() == l && p.chars().all(|c| c.is_ascii_hexdigit())))
-        .then_some(())
+    (parts.len() == 5
+        && parts
+            .iter()
+            .zip(lens)
+            .all(|(p, l)| p.len() == l && p.chars().all(|c| c.is_ascii_hexdigit())))
+    .then_some(())
 }
 
 /// `getRoleFromToken` for the given token types.
-fn role_from_token(state: &MissionsState, mission: &MissionRecord, caller: &Caller, types: &[TokenType]) -> Option<Role> {
+fn role_from_token(
+    state: &MissionsState,
+    mission: &MissionRecord,
+    caller: &Caller,
+    types: &[TokenType],
+) -> Option<Role> {
     let token = caller.token.as_deref()?;
     let claims = state.tokens.decode(token)?;
     if !types.contains(&claims.token_type) || claims.mission_name != mission.name {
         return None;
     }
     match claims.token_type {
-        TokenType::Subscription => state.store.subscription_by_id(&mission.guid, &claims.id).map(|s| s.role),
+        TokenType::Subscription => state
+            .store
+            .subscription_by_id(&mission.guid, &claims.id)
+            .map(|s| s.role),
         TokenType::Invitation => state
             .store
             .invitation_by_token(token)
@@ -390,7 +588,12 @@ fn role_from_token(state: &MissionsState, mission: &MissionRecord, caller: &Call
 
 /// `getRoleForRequest`.
 fn role_for(state: &MissionsState, mission: &MissionRecord, caller: &Caller) -> Option<Role> {
-    if let Some(role) = role_from_token(state, mission, caller, &[TokenType::Access, TokenType::Subscription]) {
+    if let Some(role) = role_from_token(
+        state,
+        mission,
+        caller,
+        &[TokenType::Access, TokenType::Subscription],
+    ) {
         return Some(role);
     }
     if caller.admin {
@@ -412,7 +615,8 @@ fn require(role: Option<Role>, permission: Permission) -> Result<(), ApiError> {
 /// `validateRoleAssignment`.
 fn may_assign(mission: &MissionRecord, current: Option<Role>, assign: Role) -> bool {
     let Some(current) = current else { return false };
-    current.has_all(assign) && (mission.password_protected() || assign.has_all(mission.effective_default_role()))
+    current.has_all(assign)
+        && (mission.password_protected() || assign.has_all(mission.effective_default_role()))
 }
 
 fn hash_password(password: &str) -> Result<String, ApiError> {
@@ -420,7 +624,10 @@ fn hash_password(password: &str) -> Result<String, ApiError> {
 }
 
 fn password_matches(mission: &MissionRecord, password: &str) -> bool {
-    mission.password_hash.as_deref().is_some_and(|hash| crate::users::verify_password(password, hash))
+    mission
+        .password_hash
+        .as_deref()
+        .is_some_and(|hash| crate::users::verify_password(password, hash))
 }
 
 // --- JSON -------------------------------------------------------------------
@@ -435,7 +642,12 @@ fn role_json(role: Role) -> Value {
 }
 
 fn resource_json(state: &MissionsState, hash: &str) -> Option<Value> {
-    state.resources.by_hash(hash, None).into_iter().next().map(|r| r.resource_json())
+    state
+        .resources
+        .by_hash(hash, None)
+        .into_iter()
+        .next()
+        .map(|r| r.resource_json())
 }
 
 #[derive(Default)]
@@ -451,7 +663,12 @@ struct MissionExtras {
     details: bool,
 }
 
-fn mission_json(state: &MissionsState, m: &MissionRecord, groups: &BTreeSet<String>, extras: MissionExtras) -> Value {
+fn mission_json(
+    state: &MissionsState,
+    m: &MissionRecord,
+    groups: &BTreeSet<String>,
+    extras: MissionExtras,
+) -> Value {
     let f = &m.fields;
     let mut uids = Vec::new();
     let mut contents = Vec::new();
@@ -475,9 +692,10 @@ fn mission_json(state: &MissionsState, m: &MissionRecord, groups: &BTreeSet<Stri
                     entry.insert("keywords".into(), json!(keywords));
                 }
                 if let Content::Uid(uid) = &add.content
-                    && let Some(details) = state.latest_cot.uid_details(uid) {
-                        entry.insert("details".into(), details);
-                    }
+                    && let Some(details) = state.latest_cot.uid_details(uid)
+                {
+                    entry.insert("details".into(), details);
+                }
             }
             match add.content {
                 Content::Uid(_) => uids.push(Value::Object(entry)),
@@ -524,7 +742,10 @@ fn mission_json(state: &MissionsState, m: &MissionRecord, groups: &BTreeSet<Stri
         put("token", token.into());
     }
     if let Some(changes) = extras.changes {
-        put("missionChanges", changes.iter().map(|c| change_json(state, c)).collect());
+        put(
+            "missionChanges",
+            changes.iter().map(|c| change_json(state, c)).collect(),
+        );
     }
     if let Some(logs) = extras.logs {
         put("logs", logs.iter().map(log_json).collect());
@@ -538,13 +759,20 @@ fn groups_seen(caller: &Caller, mission: &MissionRecord) -> BTreeSet<String> {
     if caller.admin {
         mission.groups.clone()
     } else {
-        mission.groups.intersection(&caller.groups).cloned().collect()
+        mission
+            .groups
+            .intersection(&caller.groups)
+            .cloned()
+            .collect()
     }
 }
 
 fn change_json(state: &MissionsState, c: &ChangeRecord) -> Value {
     let mut out = serde_json::Map::new();
-    out.insert("type".into(), serde_json::to_value(c.change_type).expect("enum"));
+    out.insert(
+        "type".into(),
+        serde_json::to_value(c.change_type).expect("enum"),
+    );
     out.insert("missionName".into(), c.mission_name.clone().into());
     out.insert("missionGuid".into(), c.mission_guid.clone().into());
     out.insert("timestamp".into(), pad_millis(c.timestamp_ms).into());
@@ -568,7 +796,12 @@ fn change_json(state: &MissionsState, c: &ChangeRecord) -> Value {
     Value::Object(out)
 }
 
-fn subscription_json(state: &MissionsState, s: &SubscriptionRecord, mission: Option<Value>, with_token: bool) -> Value {
+fn subscription_json(
+    state: &MissionsState,
+    s: &SubscriptionRecord,
+    mission: Option<Value>,
+    with_token: bool,
+) -> Value {
     let _ = state;
     let mut out = serde_json::Map::new();
     if with_token {
@@ -579,7 +812,10 @@ fn subscription_json(state: &MissionsState, s: &SubscriptionRecord, mission: Opt
     }
     out.insert("clientUid".into(), s.client_uid.clone().into());
     out.insert("username".into(), s.username.clone().into());
-    out.insert("createTime".into(), cot_date_millis(s.create_time_ms).into());
+    out.insert(
+        "createTime".into(),
+        cot_date_millis(s.create_time_ms).into(),
+    );
     out.insert("role".into(), role_json(s.role));
     Value::Object(out)
 }
@@ -636,7 +872,11 @@ async fn list_missions(
     let params = Params::parse(query)?;
     let include_protected = params.bool("passwordProtected", false)?;
     let include_roles = params.bool("defaultRole", false)?;
-    let tool = params.get("tool").filter(|t| !t.is_empty()).unwrap_or("public").to_string();
+    let tool = params
+        .get("tool")
+        .filter(|t| !t.is_empty())
+        .unwrap_or("public")
+        .to_string();
     // `getAllMissionsByToolNoGroupCheck`, newest first, then a set ordered
     // (and de-duplicated) by lowercase name.
     let mut candidates: Vec<MissionRecord> = state
@@ -651,7 +891,8 @@ async fn list_missions(
         })
         .collect();
     candidates.sort_by_key(|m| std::cmp::Reverse(m.create_time_ms));
-    let mut by_name: std::collections::BTreeMap<String, MissionRecord> = std::collections::BTreeMap::new();
+    let mut by_name: std::collections::BTreeMap<String, MissionRecord> =
+        std::collections::BTreeMap::new();
     for m in candidates {
         by_name.entry(m.name.to_lowercase()).or_insert(m);
     }
@@ -659,30 +900,51 @@ async fn list_missions(
         .values()
         .filter(|m| visible(&caller, m))
         .map(|m| {
-            let extras = MissionExtras { cleared: m.password_protected(), ..Default::default() };
+            let extras = MissionExtras {
+                cleared: m.password_protected(),
+                ..Default::default()
+            };
             mission_json(&state, m, &groups_seen(&caller, m), extras)
         })
         .collect();
     ok("Mission", missions.into())
 }
 
-async fn get_mission_impl(state: MissionsState, caller: Caller, key: Key<'_>, params: Params) -> ApiResult {
+async fn get_mission_impl(
+    state: MissionsState,
+    caller: Caller,
+    key: Key<'_>,
+    params: Params,
+) -> ApiResult {
     let mission = existing(&state, &caller, key)?;
     let window = params.window()?;
     let password = params.string("password");
-    let mut extras = MissionExtras { details: true, ..Default::default() };
+    let mut extras = MissionExtras {
+        details: true,
+        ..Default::default()
+    };
     let readable = if !password.is_empty() {
         if !password_matches(&mission, &password) {
-            return Err(ApiError::Forbidden("Illegal attempt to access mission! Password did not match.".into()));
+            return Err(ApiError::Forbidden(
+                "Illegal attempt to access mission! Password did not match.".into(),
+            ));
         }
-        extras.token = Some(state.tokens.create(&random_uuid(), TokenType::Access, &mission.name, &mission.guid, now_ms() / 1000));
+        extras.token = Some(state.tokens.create(
+            &random_uuid(),
+            TokenType::Access,
+            &mission.name,
+            &mission.guid,
+            now_ms() / 1000,
+        ));
         true
     } else {
         role_for(&state, &mission, &caller).is_some_and(|r| r.has(Permission::MissionRead))
     };
     if !readable {
         if caller.api_version <= 2 {
-            return Err(ApiError::Forbidden("Illegal attempt to access mission! Request did not have read access.".into()));
+            return Err(ApiError::Forbidden(
+                "Illegal attempt to access mission! Request did not have read access.".into(),
+            ));
         }
         extras.cleared = true;
     } else {
@@ -734,7 +996,11 @@ struct CreateRequest {
     invite_only: bool,
 }
 
-fn parse_create(params: &Params, headers: &HeaderMap, body: &Bytes) -> Result<CreateRequest, ApiError> {
+fn parse_create(
+    params: &Params,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<CreateRequest, ApiError> {
     let mut groups = params.all("group");
     if groups.is_empty() {
         groups.push(crate::groups::ANON_GROUP.to_string());
@@ -748,12 +1014,21 @@ fn parse_create(params: &Params, headers: &HeaderMap, body: &Bytes) -> Result<Cr
             chat_room: params.string("chatRoom"),
             base_layer: params.string("baseLayer"),
             bbox: params.string("bbox"),
-            bounding_polygon: params.all("boundingPolygon").into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(","),
+            bounding_polygon: params
+                .all("boundingPolygon")
+                .into_iter()
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+                .join(","),
             path: params.string("path"),
             classification: params.string("classification"),
             expiration: expiration.unwrap_or(-1),
         },
-        tool: params.get("tool").filter(|t| !t.is_empty()).unwrap_or("public").to_string(),
+        tool: params
+            .get("tool")
+            .filter(|t| !t.is_empty())
+            .unwrap_or("public")
+            .to_string(),
         password: params.get("password").map(String::from),
         default_role: params.role("defaultRole")?,
         expiration_given: expiration.is_some(),
@@ -764,27 +1039,53 @@ fn parse_create(params: &Params, headers: &HeaderMap, body: &Bytes) -> Result<Cr
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.to_ascii_lowercase().contains("application/json"));
     if is_json && !body.is_empty() {
-        let mission: Value =
-            serde_json::from_slice(body).map_err(|_| ApiError::BadRequest("exception parsing mission json!".into()))?;
+        let mission: Value = serde_json::from_slice(body)
+            .map_err(|_| ApiError::BadRequest("exception parsing mission json!".into()))?;
         let s = |k: &str| mission.get(k).and_then(|v| v.as_str()).map(String::from);
         let f = &mut request.fields;
-        if let Some(v) = s("description") { f.description = v; }
-        if let Some(v) = s("chatRoom") { f.chat_room = v; }
-        if let Some(v) = s("baseLayer") { f.base_layer = v; }
-        if let Some(v) = s("bbox") { f.bbox = v; }
-        if let Some(v) = s("boundingPolygon") { f.bounding_polygon = v; }
-        if let Some(v) = s("path") { f.path = v; }
-        if let Some(v) = s("classification") { f.classification = v; }
-        if let Some(v) = s("tool") { request.tool = v; }
-        if let Some(v) = mission.get("defaultRole").and_then(|r| r.get("type")).and_then(|t| t.as_str()) {
-            request.default_role = Some(Role::parse(v).ok_or_else(|| ApiError::BadRequest("exception parsing mission json!".into()))?);
+        if let Some(v) = s("description") {
+            f.description = v;
+        }
+        if let Some(v) = s("chatRoom") {
+            f.chat_room = v;
+        }
+        if let Some(v) = s("baseLayer") {
+            f.base_layer = v;
+        }
+        if let Some(v) = s("bbox") {
+            f.bbox = v;
+        }
+        if let Some(v) = s("boundingPolygon") {
+            f.bounding_polygon = v;
+        }
+        if let Some(v) = s("path") {
+            f.path = v;
+        }
+        if let Some(v) = s("classification") {
+            f.classification = v;
+        }
+        if let Some(v) = s("tool") {
+            request.tool = v;
+        }
+        if let Some(v) = mission
+            .get("defaultRole")
+            .and_then(|r| r.get("type"))
+            .and_then(|t| t.as_str())
+        {
+            request.default_role =
+                Some(Role::parse(v).ok_or_else(|| {
+                    ApiError::BadRequest("exception parsing mission json!".into())
+                })?);
         }
         if let Some(v) = mission.get("expiration").and_then(|v| v.as_i64()) {
             f.expiration = v;
             request.expiration_given = true;
         }
         if let Some(groups) = mission.get("groups").and_then(|g| g.as_array()) {
-            request.groups = groups.iter().filter_map(|g| g.as_str().map(String::from)).collect();
+            request.groups = groups
+                .iter()
+                .filter_map(|g| g.as_str().map(String::from))
+                .collect();
         }
         if let Some(v) = mission.get("inviteOnly").and_then(|v| v.as_bool()) {
             request.invite_only = v;
@@ -795,11 +1096,18 @@ fn parse_create(params: &Params, headers: &HeaderMap, body: &Bytes) -> Result<Cr
 
 /// The mission's groups for a request: `__ANON__` alone means the caller's
 /// own; otherwise they must exist and be a subset of the caller's.
-fn mission_groups(state: &MissionsState, caller: &Caller, requested: &[String]) -> Result<BTreeSet<String>, ApiError> {
+fn mission_groups(
+    state: &MissionsState,
+    caller: &Caller,
+    requested: &[String],
+) -> Result<BTreeSet<String>, ApiError> {
     if caller.groups.is_empty() && !caller.admin {
         return Err(ApiError::Forbidden("Missing groups for user!".into()));
     }
-    if requested.len() == 1 && requested[0] == crate::groups::ANON_GROUP && !caller.groups.contains(crate::groups::ANON_GROUP) {
+    if requested.len() == 1
+        && requested[0] == crate::groups::ANON_GROUP
+        && !caller.groups.contains(crate::groups::ANON_GROUP)
+    {
         return Ok(caller.groups.clone());
     }
     let requested: BTreeSet<String> = requested
@@ -811,7 +1119,9 @@ fn mission_groups(state: &MissionsState, caller: &Caller, requested: &[String]) 
         return Err(ApiError::Forbidden("Missing groups for mission!".into()));
     }
     if !caller.admin && !requested.is_subset(&caller.groups) {
-        return Err(ApiError::Forbidden("Illegal attempt to set groupVector for Mission!".into()));
+        return Err(ApiError::Forbidden(
+            "Illegal attempt to set groupVector for Mission!".into(),
+        ));
     }
     Ok(requested)
 }
@@ -840,9 +1150,15 @@ async fn create_impl(
     let existing = lookup(&state, &caller, Key::Name(&name), true)?;
     let now = now_ms();
     match existing {
-        Some(mission) if !(dupe.allow && dupe.in_different_groups) => {
-            update_existing(&state, &caller, mission, request, groups, params.bool("allowGroupChange", false)?, now)
-        }
+        Some(mission) if !(dupe.allow && dupe.in_different_groups) => update_existing(
+            &state,
+            &caller,
+            mission,
+            request,
+            groups,
+            params.bool("allowGroupChange", false)?,
+            now,
+        ),
         _ => {
             let password_hash = match request.password.as_deref().filter(|p| !p.is_empty()) {
                 Some(p) => Some(hash_password(p)?),
@@ -864,14 +1180,26 @@ async fn create_impl(
             )?;
             let tokens = Arc::clone(&state.tokens);
             let (mname, mguid) = (mission.name.clone(), mission.guid.clone());
-            let owner = state.store.subscribe(&mission.guid, &request.creator_uid, &caller.username, Role::Owner, now, |id| {
-                tokens.create(id, TokenType::Subscription, &mname, &mguid, now / 1000)
-            })?;
-            let extras = MissionExtras { token: Some(owner.token), owner_role: Some(Role::Owner), details: true, ..Default::default() };
+            let owner = state.store.subscribe(
+                &mission.guid,
+                &request.creator_uid,
+                &caller.username,
+                Role::Owner,
+                now,
+                |id| tokens.create(id, TokenType::Subscription, &mname, &mguid, now / 1000),
+            )?;
+            let extras = MissionExtras {
+                token: Some(owner.token),
+                owner_role: Some(Role::Owner),
+                details: true,
+                ..Default::default()
+            };
             let json = mission_json(&state, &mission, &groups_seen(&caller, &mission), extras);
             // `missionSubscribe` also makes the creator a live subscriber.
             state.notifier.connect(&mission.guid, &request.creator_uid);
-            state.notifier.broadcast(&mission, Announcement::Create, &request.creator_uid);
+            state
+                .notifier
+                .broadcast(&mission, Announcement::Create, &request.creator_uid);
             created("Mission", json!([json]))
         }
     }
@@ -890,11 +1218,15 @@ fn update_existing(
     if groups != mission.groups {
         let may = caller.admin || role == Some(Role::Owner);
         if !(may && allow_group_change) {
-            return Err(ApiError::Forbidden("Illegal attempt to change Mission groups!".into()));
+            return Err(ApiError::Forbidden(
+                "Illegal attempt to change Mission groups!".into(),
+            ));
         }
     }
     if !role.is_some_and(|r| r.has(Permission::MissionWrite)) {
-        return Err(ApiError::Forbidden("Illegal attempt to update mission!".into()));
+        return Err(ApiError::Forbidden(
+            "Illegal attempt to update mission!".into(),
+        ));
     }
     let mut fields = request.fields.clone();
     if !request.expiration_given {
@@ -905,40 +1237,67 @@ fn update_existing(
     }
     if let Some(password) = request.password.as_deref().filter(|p| !p.is_empty()) {
         if !role.is_some_and(|r| r.has(Permission::MissionSetPassword)) {
-            return Err(ApiError::Forbidden("Illegal attempt to update mission password!".into()));
+            return Err(ApiError::Forbidden(
+                "Illegal attempt to update mission password!".into(),
+            ));
         }
-        state.store.set_password(&mission.guid, Some(hash_password(password)?), now)?;
+        state
+            .store
+            .set_password(&mission.guid, Some(hash_password(password)?), now)?;
     }
     if let Some(default_role) = request.default_role
-        && mission.default_role != Some(default_role) {
-            let token_role = if caller.admin {
-                Some(Role::Owner)
-            } else {
-                role_from_token(state, &mission, caller, &[TokenType::Subscription])
-            };
-            let Some(token_role) = token_role else {
-                return Err(ApiError::Forbidden("Could not extract role from token to set mission default role!".into()));
-            };
-            if !token_role.has(Permission::MissionSetRole) {
-                return Err(ApiError::Forbidden("Illegal attempt to update default mission role with insufficient permissions!".into()));
-            }
-            if !token_role.has_all(default_role) {
-                return Err(ApiError::Forbidden("Illegal attempt to update default mission role beyond current permissions!".into()));
-            }
-            state.store.set_default_role(&mission.guid, Some(default_role), now)?;
+        && mission.default_role != Some(default_role)
+    {
+        let token_role = if caller.admin {
+            Some(Role::Owner)
+        } else {
+            role_from_token(state, &mission, caller, &[TokenType::Subscription])
+        };
+        let Some(token_role) = token_role else {
+            return Err(ApiError::Forbidden(
+                "Could not extract role from token to set mission default role!".into(),
+            ));
+        };
+        if !token_role.has(Permission::MissionSetRole) {
+            return Err(ApiError::Forbidden(
+                "Illegal attempt to update default mission role with insufficient permissions!"
+                    .into(),
+            ));
         }
+        if !token_role.has_all(default_role) {
+            return Err(ApiError::Forbidden(
+                "Illegal attempt to update default mission role beyond current permissions!".into(),
+            ));
+        }
+        state
+            .store
+            .set_default_role(&mission.guid, Some(default_role), now)?;
+    }
     if groups != mission.groups && role.is_some_and(|r| r.has(Permission::MissionUpdateGroups)) {
         state.store.set_groups(&mission.guid, groups, now)?;
     }
-    let updated = state.store.by_guid(&mission.guid).ok_or(ApiError::Internal)?;
+    let updated = state
+        .store
+        .by_guid(&mission.guid)
+        .ok_or(ApiError::Internal)?;
     if updated.fields != mission.fields
         || updated.password_hash != mission.password_hash
         || updated.default_role != mission.default_role
         || updated.groups != mission.groups
     {
-        state.notifier.broadcast(&updated, Announcement::Metadata, &request.creator_uid);
+        state
+            .notifier
+            .broadcast(&updated, Announcement::Metadata, &request.creator_uid);
     }
-    let json = mission_json(state, &updated, &updated.groups, MissionExtras { details: true, ..Default::default() });
+    let json = mission_json(
+        state,
+        &updated,
+        &updated.groups,
+        MissionExtras {
+            details: true,
+            ..Default::default()
+        },
+    );
     ok("Mission", json!([json]))
 }
 
@@ -951,7 +1310,19 @@ async fn create_mission_put(
     body: Bytes,
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
-    create_impl(state, caller, name, Params::parse(query)?, headers, body, Dupe { allow: false, in_different_groups: false }).await
+    create_impl(
+        state,
+        caller,
+        name,
+        Params::parse(query)?,
+        headers,
+        body,
+        Dupe {
+            allow: false,
+            in_different_groups: false,
+        },
+    )
+    .await
 }
 
 async fn create_mission_post(
@@ -965,22 +1336,49 @@ async fn create_mission_post(
     let caller = caller(&state, &identity, &headers);
     let params = Params::parse(query)?;
     let allow_dupe = params.bool("allowDupe", false)?;
-    create_impl(state, caller, name, params, headers, body, Dupe { allow: allow_dupe, in_different_groups: true }).await
+    create_impl(
+        state,
+        caller,
+        name,
+        params,
+        headers,
+        body,
+        Dupe {
+            allow: allow_dupe,
+            in_different_groups: true,
+        },
+    )
+    .await
 }
 
-fn delete_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+fn delete_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+) -> ApiResult {
     let role = role_for(state, &mission, caller);
     require(role, Permission::MissionWrite)?;
-    if params.bool("deepDelete", false)? && !role.is_some_and(|r| r.has(Permission::MissionDelete)) {
+    if params.bool("deepDelete", false)? && !role.is_some_and(|r| r.has(Permission::MissionDelete))
+    {
         return Err(ApiError::Forbidden(format!(
             "Attempt to deepDelete mission: {}, by unauthorized user: {}",
             mission.name,
             params.string("creatorUid")
         )));
     }
-    let deleted = state.store.delete(&mission.guid, &params.string("creatorUid"), now_ms())?;
-    state.notifier.broadcast(&deleted, Announcement::Delete, &params.string("creatorUid"));
-    let json = mission_json(state, &deleted, &groups_seen(caller, &deleted), MissionExtras::default());
+    let deleted = state
+        .store
+        .delete(&mission.guid, &params.string("creatorUid"), now_ms())?;
+    state
+        .notifier
+        .broadcast(&deleted, Announcement::Delete, &params.string("creatorUid"));
+    let json = mission_json(
+        state,
+        &deleted,
+        &groups_seen(caller, &deleted),
+        MissionExtras::default(),
+    );
     ok("Mission", json!([json]))
 }
 
@@ -1014,16 +1412,36 @@ async fn delete_mission_by_guid(
 
 // --- contents -----------------------------------------------------------------------
 
-fn add_contents_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params, body: &Bytes) -> ApiResult {
+fn add_contents_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+    body: &Bytes,
+) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionWrite)?;
-    let content: Value = serde_json::from_slice(body).map_err(|_| ApiError::BadRequest(String::new()))?;
+    let content: Value =
+        serde_json::from_slice(body).map_err(|_| ApiError::BadRequest(String::new()))?;
     let list = |k: &str| -> Vec<String> {
-        content.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
+        content
+            .get(k)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
     };
     let (hashes, uids) = (list("hashes"), list("uids"));
-    let has_paths = content.get("paths").and_then(|p| p.as_object()).is_some_and(|p| !p.is_empty());
+    let has_paths = content
+        .get("paths")
+        .and_then(|p| p.as_object())
+        .is_some_and(|p| !p.is_empty());
     if hashes.is_empty() && uids.is_empty() && !has_paths {
-        return Err(ApiError::BadRequest("at least one hash or uid must be provided in request".into()));
+        return Err(ApiError::BadRequest(
+            "at least one hash or uid must be provided in request".into(),
+        ));
     }
     let creator = params.string("creatorUid");
     let now = now_ms();
@@ -1031,12 +1449,16 @@ fn add_contents_impl(state: &MissionsState, caller: &Caller, mission: MissionRec
     for hash in hashes {
         // `getCachedResourcesByHash`: unknown hashes are skipped.
         if !state.resources.by_hash(&hash, None).is_empty() {
-            state.store.add_content(&mission.guid, Content::Hash(hash), &creator, now)?;
+            state
+                .store
+                .add_content(&mission.guid, Content::Hash(hash), &creator, now)?;
             added += 1;
         }
     }
     for uid in uids {
-        state.store.add_content(&mission.guid, Content::Uid(uid), &creator, now)?;
+        state
+            .store
+            .add_content(&mission.guid, Content::Uid(uid), &creator, now)?;
         added += 1;
     }
     announce_latest_changes(state, &mission, added, &creator)?;
@@ -1046,7 +1468,14 @@ fn add_contents_impl(state: &MissionsState, caller: &Caller, mission: MissionRec
         for (path, contents) in paths {
             for item in contents.as_array().into_iter().flatten() {
                 let list = |k: &str| -> Vec<String> {
-                    item.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
+                    item.get(k)
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default()
                 };
                 let mut after = item.get("after").and_then(|a| a.as_str()).map(String::from);
                 let mut filed = Vec::new();
@@ -1057,18 +1486,32 @@ fn add_contents_impl(state: &MissionsState, caller: &Caller, mission: MissionRec
                 }
                 filed.extend(list("uids").into_iter().map(Content::Uid));
                 for content in filed {
-                    state.store.add_content(&mission.guid, content.clone(), &creator, now)?;
+                    state
+                        .store
+                        .add_content(&mission.guid, content.clone(), &creator, now)?;
                     announce_latest_changes(state, &mission, 1, &creator)?;
                     let uid = match &content {
                         Content::Hash(h) | Content::Uid(h) => h.clone(),
                     };
-                    add_layer(state, &mission, Some(uid.clone()), None, LayerType::Item, Some(path.clone()), after.clone(), &creator)?;
+                    add_layer(
+                        state,
+                        &mission,
+                        Some(uid.clone()),
+                        None,
+                        LayerType::Item,
+                        Some(path.clone()),
+                        after.clone(),
+                        &creator,
+                    )?;
                     after = Some(uid);
                 }
             }
         }
     }
-    let updated = state.store.by_guid(&mission.guid).ok_or(ApiError::Internal)?;
+    let updated = state
+        .store
+        .by_guid(&mission.guid)
+        .ok_or(ApiError::Internal)?;
     // The official response copies the mission and clears its groups.
     let json = mission_json(state, &updated, &BTreeSet::new(), MissionExtras::default());
     ok("Mission", json!([json]))
@@ -1100,22 +1543,42 @@ async fn add_contents_by_guid(
     add_contents_impl(&state, &caller, mission, &Params::parse(query)?, &body)
 }
 
-fn remove_content_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+fn remove_content_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionWrite)?;
     let creator = params.string("creatorUid");
     let now = now_ms();
     let mut removed = 0;
     if let Some(hash) = params.get("hash").filter(|h| !h.is_empty()) {
-        state.store.remove_content(&mission.guid, Content::Hash(hash.to_string()), &creator, now)?;
+        state.store.remove_content(
+            &mission.guid,
+            Content::Hash(hash.to_string()),
+            &creator,
+            now,
+        )?;
         removed += 1;
     }
     if let Some(uid) = params.get("uid").filter(|u| !u.is_empty()) {
-        state.store.remove_content(&mission.guid, Content::Uid(uid.to_string()), &creator, now)?;
+        state
+            .store
+            .remove_content(&mission.guid, Content::Uid(uid.to_string()), &creator, now)?;
         removed += 1;
     }
-    let updated = state.store.by_guid(&mission.guid).ok_or(ApiError::Internal)?;
+    let updated = state
+        .store
+        .by_guid(&mission.guid)
+        .ok_or(ApiError::Internal)?;
     announce_latest_changes(state, &updated, removed, &creator)?;
-    let json = mission_json(state, &updated, &groups_seen(caller, &updated), MissionExtras::default());
+    let json = mission_json(
+        state,
+        &updated,
+        &groups_seen(caller, &updated),
+        MissionExtras::default(),
+    );
     ok("Mission", json!([json]))
 }
 
@@ -1144,11 +1607,21 @@ async fn remove_content_by_guid(
 }
 
 /// Announces the mission's `count` newest changes, oldest first.
-fn announce_latest_changes(state: &MissionsState, mission: &MissionRecord, count: usize, creator: &str) -> Result<(), ApiError> {
+fn announce_latest_changes(
+    state: &MissionsState,
+    mission: &MissionRecord,
+    count: usize,
+    creator: &str,
+) -> Result<(), ApiError> {
     if count == 0 {
         return Ok(());
     }
-    let mut latest: Vec<ChangeRecord> = state.store.changes(&mission.guid, Window::ALL, false)?.into_iter().take(count).collect();
+    let mut latest: Vec<ChangeRecord> = state
+        .store
+        .changes(&mission.guid, Window::ALL, false)?
+        .into_iter()
+        .take(count)
+        .collect();
     latest.reverse();
     state.notifier.announce_content(mission, &latest, creator);
     Ok(())
@@ -1156,10 +1629,22 @@ fn announce_latest_changes(state: &MissionsState, mission: &MissionRecord, count
 
 // --- changes ------------------------------------------------------------------------
 
-fn changes_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+fn changes_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionRead)?;
-    let changes = state.store.changes(&mission.guid, params.window()?, params.bool("squashed", true)?)?;
-    ok("MissionChange", changes.iter().map(|c| change_json(state, c)).collect())
+    let changes = state.store.changes(
+        &mission.guid,
+        params.window()?,
+        params.bool("squashed", true)?,
+    )?;
+    ok(
+        "MissionChange",
+        changes.iter().map(|c| change_json(state, c)).collect(),
+    )
 }
 
 async fn changes_by_name(
@@ -1192,10 +1677,16 @@ fn keyword_list(body: &Bytes) -> Result<Vec<String>, ApiError> {
     if body.is_empty() {
         return Ok(Vec::new());
     }
-    serde_json::from_slice::<Vec<String>>(body).map_err(|_| ApiError::BadRequest("Invalid Request Body".into()))
+    serde_json::from_slice::<Vec<String>>(body)
+        .map_err(|_| ApiError::BadRequest("Invalid Request Body".into()))
 }
 
-fn writable_by_name(state: &MissionsState, identity: &PeerIdentity, headers: &HeaderMap, name: &str) -> Result<(Caller, MissionRecord), ApiError> {
+fn writable_by_name(
+    state: &MissionsState,
+    identity: &PeerIdentity,
+    headers: &HeaderMap,
+    name: &str,
+) -> Result<(Caller, MissionRecord), ApiError> {
     let caller = caller(state, identity, headers);
     let mission = existing(state, &caller, Key::Name(name))?;
     require(role_for(state, &mission, &caller), Permission::MissionWrite)?;
@@ -1204,7 +1695,12 @@ fn writable_by_name(state: &MissionsState, identity: &PeerIdentity, headers: &He
 
 fn mission_response(state: &MissionsState, caller: &Caller, guid: &str) -> ApiResult {
     let m = state.store.by_guid(guid).ok_or(ApiError::Internal)?;
-    let json = mission_json(state, &m, &groups_seen(caller, &m), MissionExtras::default());
+    let json = mission_json(
+        state,
+        &m,
+        &groups_seen(caller, &m),
+        MissionExtras::default(),
+    );
     ok("Mission", json!([json]))
 }
 
@@ -1217,8 +1713,16 @@ async fn set_keywords(
     body: Bytes,
 ) -> ApiResult {
     let (caller, mission) = writable_by_name(&state, &identity, &headers, &name)?;
-    state.store.set_keywords(&mission.guid, keyword_list(&body)?.into_iter().collect(), now_ms())?;
-    state.notifier.broadcast(&mission, Announcement::Keyword, &Params::parse(query)?.string("creatorUid"));
+    state.store.set_keywords(
+        &mission.guid,
+        keyword_list(&body)?.into_iter().collect(),
+        now_ms(),
+    )?;
+    state.notifier.broadcast(
+        &mission,
+        Announcement::Keyword,
+        &Params::parse(query)?.string("creatorUid"),
+    );
     mission_response(&state, &caller, &mission.guid)
 }
 
@@ -1230,8 +1734,14 @@ async fn clear_keywords(
     RawQuery(query): RawQuery,
 ) -> ApiResult {
     let (caller, mission) = writable_by_name(&state, &identity, &headers, &name)?;
-    state.store.set_keywords(&mission.guid, BTreeSet::new(), now_ms())?;
-    state.notifier.broadcast(&mission, Announcement::Keyword, &Params::parse(query)?.string("creatorUid"));
+    state
+        .store
+        .set_keywords(&mission.guid, BTreeSet::new(), now_ms())?;
+    state.notifier.broadcast(
+        &mission,
+        Announcement::Keyword,
+        &Params::parse(query)?.string("creatorUid"),
+    );
     mission_response(&state, &caller, &mission.guid)
 }
 
@@ -1245,28 +1755,44 @@ async fn remove_keyword(
     let (caller, mission) = writable_by_name(&state, &identity, &headers, &name)?;
     let mut keywords = mission.keywords.clone();
     if !keywords.remove(&keyword) {
-        return Err(ApiError::BadRequest(format!("mission '{name}' did not contain keyword {keyword}")));
+        return Err(ApiError::BadRequest(format!(
+            "mission '{name}' did not contain keyword {keyword}"
+        )));
     }
-    state.store.set_keywords(&mission.guid, keywords, now_ms())?;
-    state.notifier.broadcast(&mission, Announcement::Keyword, &Params::parse(query)?.string("creatorUid"));
+    state
+        .store
+        .set_keywords(&mission.guid, keywords, now_ms())?;
+    state.notifier.broadcast(
+        &mission,
+        Announcement::Keyword,
+        &Params::parse(query)?.string("creatorUid"),
+    );
     mission_response(&state, &caller, &mission.guid)
 }
 
 /// The change XML of `addUidKeyword` / `addContentKeyword` (as dom4j
 /// re-serializes it into the notification); `None` keywords = cleared.
 fn content_keywords_xml(content: &Content, keywords: Option<&[String]>) -> String {
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('"', "&quot;");
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('"', "&quot;")
+    };
     match (content, keywords) {
         (Content::Uid(uid), Some(k)) => format!(
             r#"<uidKeywords uid="{}">{}</uidKeywords>"#,
             esc(uid),
-            k.iter().map(|k| format!(r#"<uidKeyword keyword="{}"/>"#, esc(k))).collect::<String>()
+            k.iter()
+                .map(|k| format!(r#"<uidKeyword keyword="{}"/>"#, esc(k)))
+                .collect::<String>()
         ),
         (Content::Uid(uid), None) => format!(r#"<uidKeywords uid="{}"/>"#, esc(uid)),
         (Content::Hash(hash), Some(k)) => format!(
             r#"<contentKeywords hash="{}">{}</contentKeywords>"#,
             esc(hash),
-            k.iter().map(|k| format!(r#"<contentKeyword keyword="{}"/>"#, esc(k))).collect::<String>()
+            k.iter()
+                .map(|k| format!(r#"<contentKeyword keyword="{}"/>"#, esc(k)))
+                .collect::<String>()
         ),
         (Content::Hash(_), None) => "<contentKeywords/>".to_string(),
     }
@@ -1279,23 +1805,52 @@ fn content_keyword_kind(content: &Content) -> ChangeKind {
     }
 }
 
-async fn set_content_keywords_impl(state: MissionsState, identity: PeerIdentity, headers: HeaderMap, name: String, content: Content, query: Option<String>, body: Bytes) -> ApiResult {
+async fn set_content_keywords_impl(
+    state: MissionsState,
+    identity: PeerIdentity,
+    headers: HeaderMap,
+    name: String,
+    content: Content,
+    query: Option<String>,
+    body: Bytes,
+) -> ApiResult {
     let (_, mission) = writable_by_name(&state, &identity, &headers, &name)?;
     let keywords = keyword_list(&body)?;
     if keywords.is_empty() {
         return Err(ApiError::BadRequest("empty keywords array".into()));
     }
-    state.store.set_content_keywords(&mission.guid, content.clone(), keywords.clone())?;
+    state
+        .store
+        .set_content_keywords(&mission.guid, content.clone(), keywords.clone())?;
     let xml = content_keywords_xml(&content, Some(&keywords));
-    state.notifier.announce(&mission, content_keyword_kind(&content), &Params::parse(query)?.string("creatorUid"), Some(&xml));
+    state.notifier.announce(
+        &mission,
+        content_keyword_kind(&content),
+        &Params::parse(query)?.string("creatorUid"),
+        Some(&xml),
+    );
     Ok(StatusCode::OK.into_response())
 }
 
-async fn clear_content_keywords_impl(state: MissionsState, identity: PeerIdentity, headers: HeaderMap, name: String, content: Content, query: Option<String>) -> ApiResult {
+async fn clear_content_keywords_impl(
+    state: MissionsState,
+    identity: PeerIdentity,
+    headers: HeaderMap,
+    name: String,
+    content: Content,
+    query: Option<String>,
+) -> ApiResult {
     let (_, mission) = writable_by_name(&state, &identity, &headers, &name)?;
-    state.store.set_content_keywords(&mission.guid, content.clone(), Vec::new())?;
+    state
+        .store
+        .set_content_keywords(&mission.guid, content.clone(), Vec::new())?;
     let xml = content_keywords_xml(&content, None);
-    state.notifier.announce(&mission, content_keyword_kind(&content), &Params::parse(query)?.string("creatorUid"), Some(&xml));
+    state.notifier.announce(
+        &mission,
+        content_keyword_kind(&content),
+        &Params::parse(query)?.string("creatorUid"),
+        Some(&xml),
+    );
     Ok(StatusCode::OK.into_response())
 }
 
@@ -1307,7 +1862,16 @@ async fn set_uid_keywords(
     RawQuery(query): RawQuery,
     body: Bytes,
 ) -> ApiResult {
-    set_content_keywords_impl(state, identity, headers, name, Content::Uid(uid), query, body).await
+    set_content_keywords_impl(
+        state,
+        identity,
+        headers,
+        name,
+        Content::Uid(uid),
+        query,
+        body,
+    )
+    .await
 }
 
 async fn set_hash_keywords(
@@ -1318,7 +1882,16 @@ async fn set_hash_keywords(
     RawQuery(query): RawQuery,
     body: Bytes,
 ) -> ApiResult {
-    set_content_keywords_impl(state, identity, headers, name, Content::Hash(hash), query, body).await
+    set_content_keywords_impl(
+        state,
+        identity,
+        headers,
+        name,
+        Content::Hash(hash),
+        query,
+        body,
+    )
+    .await
 }
 
 async fn clear_uid_keywords(
@@ -1357,32 +1930,71 @@ fn add_layer(
     creator: &str,
 ) -> Result<Value, ApiError> {
     if let Some(uid) = &uid
-        && let Some(existing) = state.store.layer(&mission.guid, uid) {
-            move_layer(state, mission, uid, parent.as_deref(), after.as_deref(), creator)?;
-            return Ok(layer_json(&existing, state.store.layer(&mission.guid, existing.parent.as_deref().unwrap_or("")).map(|p| p.uid)));
-        }
-    let layer = LayerRecord { uid: uid.unwrap_or_else(random_uuid), name, layer_type, parent: parent.clone(), after };
+        && let Some(existing) = state.store.layer(&mission.guid, uid)
+    {
+        move_layer(
+            state,
+            mission,
+            uid,
+            parent.as_deref(),
+            after.as_deref(),
+            creator,
+        )?;
+        return Ok(layer_json(
+            &existing,
+            state
+                .store
+                .layer(&mission.guid, existing.parent.as_deref().unwrap_or(""))
+                .map(|p| p.uid),
+        ));
+    }
+    let layer = LayerRecord {
+        uid: uid.unwrap_or_else(random_uuid),
+        name,
+        layer_type,
+        parent: parent.clone(),
+        after,
+    };
     state.store.add_layer(&mission.guid, layer.clone())?;
     // The announced object's parent is the parent *found* (null if none).
-    let found_parent = parent.as_deref().and_then(|p| state.store.layer(&mission.guid, p)).map(|p| p.uid);
+    let found_parent = parent
+        .as_deref()
+        .and_then(|p| state.store.layer(&mission.guid, p))
+        .map(|p| p.uid);
     let xml = MissionNotifier::layer_xml(&layer, found_parent.as_deref());
-    state.notifier.announce(mission, ChangeKind::MissionLayer, creator, Some(&xml));
+    state
+        .notifier
+        .announce(mission, ChangeKind::MissionLayer, creator, Some(&xml));
     Ok(layer_json(&layer, found_parent))
 }
 
 /// `setLayerParent`: 404 if the layer, or a given parent, doesn't exist.
-fn move_layer(state: &MissionsState, mission: &MissionRecord, uid: &str, parent: Option<&str>, after: Option<&str>, creator: &str) -> Result<(), ApiError> {
+fn move_layer(
+    state: &MissionsState,
+    mission: &MissionRecord,
+    uid: &str,
+    parent: Option<&str>,
+    after: Option<&str>,
+    creator: &str,
+) -> Result<(), ApiError> {
     let Some(layer) = state.store.layer(&mission.guid, uid) else {
         return Err(ApiError::NotFound(String::new()));
     };
     if let Some(parent) = parent
-        && state.store.layer(&mission.guid, parent).is_none() {
-            return Err(ApiError::NotFound(String::new()));
-        }
+        && state.store.layer(&mission.guid, parent).is_none()
+    {
+        return Err(ApiError::NotFound(String::new()));
+    }
     state.store.move_layer(&mission.guid, uid, parent, after)?;
-    let updated = LayerRecord { parent: parent.map(String::from), after: after.map(String::from), ..layer };
+    let updated = LayerRecord {
+        parent: parent.map(String::from),
+        after: after.map(String::from),
+        ..layer
+    };
     let xml = MissionNotifier::layer_xml(&updated, parent);
-    state.notifier.announce(mission, ChangeKind::MissionLayer, creator, Some(&xml));
+    state
+        .notifier
+        .announce(mission, ChangeKind::MissionLayer, creator, Some(&xml));
     Ok(())
 }
 
@@ -1403,8 +2015,21 @@ fn layer_json(layer: &LayerRecord, parent_uid: Option<String>) -> Value {
 /// `hydrateMissionLayers`: each level as `MissionLayer` JSON; ITEM children
 /// are folded into their UID / CONTENTS parent's `uids` / `contents` (and
 /// dropped from `mission_layers`) wherever they have a parent.
-fn hydrated_layers(state: &MissionsState, mission: &MissionRecord, trees: &[LayerTree], parent: Option<&LayerTree>) -> Vec<Value> {
-    let adds = mission_json(state, mission, &BTreeSet::new(), MissionExtras { details: true, ..Default::default() });
+fn hydrated_layers(
+    state: &MissionsState,
+    mission: &MissionRecord,
+    trees: &[LayerTree],
+    parent: Option<&LayerTree>,
+) -> Vec<Value> {
+    let adds = mission_json(
+        state,
+        mission,
+        &BTreeSet::new(),
+        MissionExtras {
+            details: true,
+            ..Default::default()
+        },
+    );
     hydrate_level(&adds, trees, parent)
 }
 
@@ -1413,13 +2038,26 @@ fn hydrate_level(adds: &Value, trees: &[LayerTree], parent: Option<&LayerTree>) 
         .iter()
         .filter(|t| parent.is_none() || t.layer.layer_type != LayerType::Item)
         .map(|tree| {
-            let mut json = layer_json(&tree.layer, tree.layer.parent.clone().filter(|_| parent.is_some()));
+            let mut json = layer_json(
+                &tree.layer,
+                tree.layer.parent.clone().filter(|_| parent.is_some()),
+            );
             let map = json.as_object_mut().expect("object");
-            let items: Vec<&LayerTree> = tree.children.iter().filter(|c| c.layer.layer_type == LayerType::Item).collect();
+            let items: Vec<&LayerTree> = tree
+                .children
+                .iter()
+                .filter(|c| c.layer.layer_type == LayerType::Item)
+                .collect();
             let pick = |key: &str, id: &dyn Fn(&Value) -> Option<String>| -> Vec<Value> {
                 items
                     .iter()
-                    .filter_map(|item| adds[key].as_array()?.iter().find(|a| id(a).as_deref() == Some(item.layer.uid.as_str())).cloned())
+                    .filter_map(|item| {
+                        adds[key]
+                            .as_array()?
+                            .iter()
+                            .find(|a| id(a).as_deref() == Some(item.layer.uid.as_str()))
+                            .cloned()
+                    })
                     .collect()
             };
             match tree.layer.layer_type {
@@ -1430,7 +2068,9 @@ fn hydrate_level(adds: &Value, trees: &[LayerTree], parent: Option<&LayerTree>) 
                     }
                 }
                 LayerType::Contents => {
-                    let contents = pick("contents", &|a| a["data"]["hash"].as_str().map(String::from));
+                    let contents = pick("contents", &|a| {
+                        a["data"]["hash"].as_str().map(String::from)
+                    });
                     if !contents.is_empty() {
                         map.insert("contents".into(), contents.into());
                     }
@@ -1449,12 +2089,23 @@ fn hydrate_level(adds: &Value, trees: &[LayerTree], parent: Option<&LayerTree>) 
 fn layers_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionRead)?;
     let trees = state.store.layer_trees(&mission.guid);
-    ok("MissionLayer", hydrated_layers(state, &mission, &trees, None).into())
+    ok(
+        "MissionLayer",
+        hydrated_layers(state, &mission, &trees, None).into(),
+    )
 }
 
-fn layer_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, uid: &str) -> ApiResult {
+fn layer_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    uid: &str,
+) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionRead)?;
-    let tree = state.store.layer_tree(&mission.guid, uid).ok_or_else(|| ApiError::NotFound(String::new()))?;
+    let tree = state
+        .store
+        .layer_tree(&mission.guid, uid)
+        .ok_or_else(|| ApiError::NotFound(String::new()))?;
     let mut hydrated = hydrated_layers(state, &mission, std::slice::from_ref(&tree), None);
     let mut layer = hydrated.remove(0);
     if let Some(parent) = &tree.layer.parent {
@@ -1464,44 +2115,101 @@ fn layer_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, ui
 }
 
 fn required<'a>(params: &'a Params, name: &str) -> Result<&'a str, ApiError> {
-    params.get(name).ok_or_else(|| ApiError::BadRequest(format!("Required request parameter '{name}' is not present")))
+    params.get(name).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "Required request parameter '{name}' is not present"
+        ))
+    })
 }
 
-fn create_layer_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+fn create_layer_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionWrite)?;
     let name = required(params, "name")?.to_string();
     let layer_type = required(params, "type")?;
-    let layer_type = LayerType::parse(layer_type).ok_or_else(|| ApiError::BadRequest(format!("invalid layer type '{layer_type}'")))?;
+    let layer_type = LayerType::parse(layer_type)
+        .ok_or_else(|| ApiError::BadRequest(format!("invalid layer type '{layer_type}'")))?;
     let creator = required(params, "creatorUid")?.to_string();
     let opt = |k: &str| params.get(k).filter(|v| !v.is_empty()).map(String::from);
-    let json = add_layer(state, &mission, opt("uid"), Some(name), layer_type, opt("parentUid"), opt("afterUid"), &creator)?;
+    let json = add_layer(
+        state,
+        &mission,
+        opt("uid"),
+        Some(name),
+        layer_type,
+        opt("parentUid"),
+        opt("afterUid"),
+        &creator,
+    )?;
     ok("MissionLayer", json)
 }
 
-fn rename_layer_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, uid: &str, params: &Params) -> ApiResult {
+fn rename_layer_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    uid: &str,
+    params: &Params,
+) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionWrite)?;
     let name = required(params, "name")?.to_string();
     let creator = required(params, "creatorUid")?.to_string();
-    let layer = state.store.layer(&mission.guid, uid).ok_or_else(|| ApiError::NotFound(String::new()))?;
+    let layer = state
+        .store
+        .layer(&mission.guid, uid)
+        .ok_or_else(|| ApiError::NotFound(String::new()))?;
     state.store.rename_layer(&mission.guid, uid, &name)?;
-    let updated = LayerRecord { name: Some(name), ..layer };
-    let parent = updated.parent.as_deref().and_then(|p| state.store.layer(&mission.guid, p)).map(|p| p.uid);
+    let updated = LayerRecord {
+        name: Some(name),
+        ..layer
+    };
+    let parent = updated
+        .parent
+        .as_deref()
+        .and_then(|p| state.store.layer(&mission.guid, p))
+        .map(|p| p.uid);
     let xml = MissionNotifier::layer_xml(&updated, parent.as_deref());
-    state.notifier.announce(&mission, ChangeKind::MissionLayer, &creator, Some(&xml));
+    state
+        .notifier
+        .announce(&mission, ChangeKind::MissionLayer, &creator, Some(&xml));
     Ok(StatusCode::OK.into_response())
 }
 
-fn set_layer_parent_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+fn set_layer_parent_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionWrite)?;
     let creator = required(params, "creatorUid")?.to_string();
     let layers = params.all("layerUid");
     if layers.is_empty() {
-        return Err(ApiError::BadRequest("Required request parameter 'layerUid' is not present".into()));
+        return Err(ApiError::BadRequest(
+            "Required request parameter 'layerUid' is not present".into(),
+        ));
     }
-    let parent = params.get("parentUid").filter(|p| !p.is_empty()).map(String::from);
-    let mut after = params.get("afterUid").filter(|a| !a.is_empty()).map(String::from);
+    let parent = params
+        .get("parentUid")
+        .filter(|p| !p.is_empty())
+        .map(String::from);
+    let mut after = params
+        .get("afterUid")
+        .filter(|a| !a.is_empty())
+        .map(String::from);
     for uid in layers {
-        move_layer(state, &mission, &uid, parent.as_deref(), after.as_deref(), &creator)?;
+        move_layer(
+            state,
+            &mission,
+            &uid,
+            parent.as_deref(),
+            after.as_deref(),
+            &creator,
+        )?;
         after = Some(uid);
     }
     Ok(StatusCode::OK.into_response())
@@ -1509,27 +2217,46 @@ fn set_layer_parent_impl(state: &MissionsState, caller: &Caller, mission: Missio
 
 /// `removeMissionLayer`: the layer, its descendants, and the content filed
 /// in it (removed from the mission); an unknown layer is ignored.
-fn delete_layers_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+fn delete_layers_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionWrite)?;
     let creator = required(params, "creatorUid")?.to_string();
     let uids = params.all("uid");
     if uids.is_empty() {
-        return Err(ApiError::BadRequest("Required request parameter 'uid' is not present".into()));
+        return Err(ApiError::BadRequest(
+            "Required request parameter 'uid' is not present".into(),
+        ));
     }
     for uid in uids {
-        let Some(tree) = state.store.layer_tree(&mission.guid, &uid) else { continue };
+        let Some(tree) = state.store.layer_tree(&mission.guid, &uid) else {
+            continue;
+        };
         remove_layer_tree(state, &mission, &tree, &creator)?;
         let xml = MissionNotifier::layer_xml(&tree.layer, tree.layer.parent.as_deref());
-        state.notifier.announce(&mission, ChangeKind::MissionLayer, &creator, Some(&xml));
+        state
+            .notifier
+            .announce(&mission, ChangeKind::MissionLayer, &creator, Some(&xml));
     }
     Ok(StatusCode::OK.into_response())
 }
 
-fn remove_layer_tree(state: &MissionsState, mission: &MissionRecord, tree: &LayerTree, creator: &str) -> Result<(), ApiError> {
+fn remove_layer_tree(
+    state: &MissionsState,
+    mission: &MissionRecord,
+    tree: &LayerTree,
+    creator: &str,
+) -> Result<(), ApiError> {
     for child in &tree.children {
         remove_layer_tree(state, mission, child, creator)?;
     }
-    let current = state.store.by_guid(&mission.guid).ok_or(ApiError::Internal)?;
+    let current = state
+        .store
+        .by_guid(&mission.guid)
+        .ok_or(ApiError::Internal)?;
     let filed: Vec<Content> = tree
         .children
         .iter()
@@ -1542,7 +2269,9 @@ fn remove_layer_tree(state: &MissionsState, mission: &MissionRecord, tree: &Laye
         .filter(|c| current.has(c))
         .collect();
     for content in filed {
-        state.store.remove_content(&mission.guid, content, creator, now_ms())?;
+        state
+            .store
+            .remove_content(&mission.guid, content, creator, now_ms())?;
         announce_latest_changes(state, mission, 1, creator)?;
     }
     state.store.delete_layer(&mission.guid, &tree.layer.uid)?;
@@ -1577,14 +2306,31 @@ macro_rules! layer_handlers {
     };
 }
 
-fn layers_list_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, _params: &Params) -> ApiResult {
+fn layers_list_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    _params: &Params,
+) -> ApiResult {
     layers_impl(state, caller, mission)
 }
 
 layer_handlers!(layers_by_name, layers_by_guid, layers_list_impl);
-layer_handlers!(create_layer_by_name, create_layer_by_guid, create_layer_impl);
-layer_handlers!(delete_layers_by_name, delete_layers_by_guid, delete_layers_impl);
-layer_handlers!(set_layer_parent_by_name, set_layer_parent_by_guid, set_layer_parent_impl);
+layer_handlers!(
+    create_layer_by_name,
+    create_layer_by_guid,
+    create_layer_impl
+);
+layer_handlers!(
+    delete_layers_by_name,
+    delete_layers_by_guid,
+    delete_layers_impl
+);
+layer_handlers!(
+    set_layer_parent_by_name,
+    set_layer_parent_by_guid,
+    set_layer_parent_impl
+);
 
 async fn layer_by_name(
     State(state): State<MissionsState>,
@@ -1636,10 +2382,19 @@ async fn rename_layer_by_guid(
 
 /// `getMissionContacts`: the connected clients the mission's groups reach,
 /// as a bare `RemoteSubscription` list (no envelope).
-fn contacts_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, _params: &Params) -> ApiResult {
+fn contacts_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    _params: &Params,
+) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionRead)?;
-    let reachable = super::contacts::reachable(&state.clients, &state.groups, Some(&mission.groups));
-    let list: Vec<Value> = reachable.iter().map(|c| super::contacts::remote_subscription(c, &state.latest_cot)).collect();
+    let reachable =
+        super::contacts::reachable(&state.clients, &state.groups, Some(&mission.groups));
+    let list: Vec<Value> = reachable
+        .iter()
+        .map(|c| super::contacts::remote_subscription(c, &state.latest_cot))
+        .collect();
     Ok(Json(list).into_response())
 }
 
@@ -1663,7 +2418,12 @@ async fn archive_mission(
     let server_name = headers
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok())
-        .map(|h| h.rsplit_once(':').map(|(host, _)| host).unwrap_or(h).to_string())
+        .map(|h| {
+            h.rsplit_once(':')
+                .map(|(host, _)| host)
+                .unwrap_or(h)
+                .to_string()
+        })
         .unwrap_or_default();
     let mut files = Vec::new();
     for add in mission.uids() {
@@ -1681,9 +2441,15 @@ async fn archive_mission(
     }
     let mut ndx = 0;
     for add in mission.hashes() {
-        let Content::Hash(hash) = &add.content else { continue };
-        let Some(record) = state.resources.by_hash(hash, None).into_iter().next() else { continue };
-        let Ok(Some(bytes)) = state.content.get(hash) else { continue };
+        let Content::Hash(hash) = &add.content else {
+            continue;
+        };
+        let Some(record) = state.resources.by_hash(hash, None).into_iter().next() else {
+            continue;
+        };
+        let Ok(Some(bytes)) = state.content.get(hash) else {
+            continue;
+        };
         let resource = record.resource_json();
         let filename = match resource.get("name").and_then(|n| n.as_str()) {
             Some(name) => {
@@ -1693,21 +2459,46 @@ async fn archive_mission(
             }
             None => hash.clone(),
         };
-        files.push(mp::ArchiveFile { zip_entry: format!("contents/{filename}"), bytes, attributes: mp::content_attributes(&resource), uid_parameter: None });
+        files.push(mp::ArchiveFile {
+            zip_entry: format!("contents/{filename}"),
+            bytes,
+            attributes: mp::content_attributes(&resource),
+            uid_parameter: None,
+        });
     }
     let groups: Vec<String> = mission.groups.iter().cloned().collect();
     let role = mission.default_role.map(|r| {
-        let permissions = r.permissions().iter().map(|p| serde_json::to_value(p).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()).collect();
+        let permissions = r
+            .permissions()
+            .iter()
+            .map(|p| {
+                serde_json::to_value(p)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default()
+            })
+            .collect();
         (r.name(), permissions)
     });
-    let manifest = mp::manifest_xml(&mp::archive_parameters(&mission, &server_name), &files, &groups, role);
+    let manifest = mp::manifest_xml(
+        &mp::archive_parameters(&mission, &server_name),
+        &files,
+        &groups,
+        role,
+    );
     let zip = mp::build_archive(&manifest, &files);
     let encoded: String = url_encode_form(&name);
     Ok((
         [
-            (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream".to_string(),
+            ),
             // As the official handler writes it: the quote before `.zip`.
-            (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{encoded}\".zip")),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{encoded}\".zip"),
+            ),
         ],
         zip,
     )
@@ -1716,7 +2507,9 @@ async fn archive_mission(
 
 /// `URLEncoder` (form encoding, as ESAPI's `URLEncoder.DEFAULT.encode`).
 fn url_encode_form(s: &str) -> String {
-    serde_urlencoded::to_string([("", s)]).map(|e| e.trim_start_matches('=').to_string()).unwrap_or_default()
+    serde_urlencoded::to_string([("", s)])
+        .map(|e| e.trim_start_matches('=').to_string())
+        .unwrap_or_default()
 }
 
 /// `addMissionPackage` without `changes.json`: CoT files become uid
@@ -1733,14 +2526,25 @@ async fn add_mission_package(
     use super::mission_package as mp;
     let caller = caller(&state, &identity, &headers);
     let mission = existing(&state, &caller, Key::Name(&name))?;
-    require(role_for(&state, &mission, &caller), Permission::MissionWrite)?;
+    require(
+        role_for(&state, &mission, &caller),
+        Permission::MissionWrite,
+    )?;
     let creator = required(&Params::parse(query)?, "creatorUid")?.to_string();
     let Ok(files) = mp::extract(&body) else {
-        return Ok((StatusCode::INTERNAL_SERVER_ERROR, api_response("MissionChange", json!([]))).into_response());
+        return Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            api_response("MissionChange", json!([])),
+        )
+            .into_response());
     };
     if files.iter().any(|(n, _)| n == "changes.json") {
         tracing::warn!(mission = %mission.name, "mission package with offline changes (changes.json) not supported yet");
-        return Ok((StatusCode::INTERNAL_SERVER_ERROR, api_response("MissionChange", json!([]))).into_response());
+        return Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            api_response("MissionChange", json!([])),
+        )
+            .into_response());
     }
     for (filename, bytes) in files {
         if filename.to_lowercase().contains("manifest.xml") {
@@ -1749,19 +2553,33 @@ async fn add_mission_package(
         let now = now_ms();
         if filename.ends_with(".cot") {
             let xml = String::from_utf8_lossy(&bytes).to_string();
-            let Some(uid) = mp::cot_uid(&xml) else { continue };
+            let Some(uid) = mp::cot_uid(&xml) else {
+                continue;
+            };
             let xml = mp::trim_bom(&xml).to_string();
             state.latest_cot.record(&uid, &xml, now);
-            state.store.add_content(&mission.guid, Content::Uid(uid), &creator, now)?;
+            state
+                .store
+                .add_content(&mission.guid, Content::Uid(uid), &creator, now)?;
             announce_latest_changes(&state, &mission, 1, &creator)?;
             let start = xml.find("<event").unwrap_or(0);
-            let subscribers: Vec<String> = state.notifier.live_subscribers(&mission.guid).into_iter().filter(|u| u != &creator).collect();
+            let subscribers: Vec<String> = state
+                .notifier
+                .live_subscribers(&mission.guid)
+                .into_iter()
+                .filter(|u| u != &creator)
+                .collect();
             if !subscribers.is_empty() {
-                state.notifier.send_event(subscribers, xml[start..].to_string());
+                state
+                    .notifier
+                    .send_event(subscribers, xml[start..].to_string());
             }
         } else {
             let filename = filename.rsplit('/').next().unwrap_or(&filename).to_string();
-            let hash = state.content.put(&bytes, None).map_err(|_| ApiError::Internal)?;
+            let hash = state
+                .content
+                .put(&bytes, None)
+                .map_err(|_| ApiError::Internal)?;
             state
                 .resources
                 .insert(
@@ -1779,7 +2597,9 @@ async fn add_mission_package(
                     now,
                 )
                 .map_err(|_| ApiError::Internal)?;
-            state.store.add_content(&mission.guid, Content::Hash(hash), &creator, now)?;
+            state
+                .store
+                .add_content(&mission.guid, Content::Hash(hash), &creator, now)?;
             announce_latest_changes(&state, &mission, 1, &creator)?;
         }
     }
@@ -1800,21 +2620,42 @@ async fn access_token(
     let params = Params::parse(query)?;
     // `validatePassword`: only checked when the mission has one.
     if mission.password_protected() && !password_matches(&mission, &params.string("password")) {
-        return Err(ApiError::Forbidden("Illegal attempt to access mission! Password did not match.".into()));
+        return Err(ApiError::Forbidden(
+            "Illegal attempt to access mission! Password did not match.".into(),
+        ));
     }
-    let token = state.tokens.create(&random_uuid(), TokenType::Access, &mission.name, &mission.guid, now_ms() / 1000);
+    let token = state.tokens.create(
+        &random_uuid(),
+        TokenType::Access,
+        &mission.name,
+        &mission.guid,
+        now_ms() / 1000,
+    );
     created("java.lang.String", token.into())
 }
 
-fn set_password_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, password: Option<&str>, params: &Params) -> ApiResult {
-    require(role_for(state, &mission, caller), Permission::MissionSetPassword)?;
+fn set_password_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    password: Option<&str>,
+    params: &Params,
+) -> ApiResult {
+    require(
+        role_for(state, &mission, caller),
+        Permission::MissionSetPassword,
+    )?;
     let hash = match password {
         // The official PUT hashes whatever it gets, the empty default too.
         Some(p) => Some(hash_password(p)?),
         None => None,
     };
     state.store.set_password(&mission.guid, hash, now_ms())?;
-    state.notifier.broadcast(&mission, Announcement::Metadata, &params.string("creatorUid"));
+    state.notifier.broadcast(
+        &mission,
+        Announcement::Metadata,
+        &params.string("creatorUid"),
+    );
     Ok(StatusCode::OK.into_response())
 }
 
@@ -1870,7 +2711,11 @@ async fn remove_password_by_guid(
     set_password_impl(&state, &caller, mission, None, &Params::parse(query)?)
 }
 
-fn set_expiration_impl(state: &MissionsState, mission: MissionRecord, params: &Params) -> ApiResult {
+fn set_expiration_impl(
+    state: &MissionsState,
+    mission: MissionRecord,
+    params: &Params,
+) -> ApiResult {
     // No `@PreAuthorize` on the official endpoint.
     let mut fields = mission.fields.clone();
     fields.expiration = params.long("expiration")?.unwrap_or(-1);
@@ -1904,12 +2749,20 @@ async fn set_expiration_by_guid(
 
 // --- subscriptions ----------------------------------------------------------------------
 
-fn subscription_get_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+fn subscription_get_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+) -> ApiResult {
     let sub = state
         .store
         .find_subscription(&mission.guid, &params.string("uid"), &caller.username)
         .ok_or_else(|| ApiError::NotFound("Mission subscription not found".into()))?;
-    ok("com.bbn.marti.sync.model.MissionSubscription", subscription_json(state, &sub, None, true))
+    ok(
+        "com.bbn.marti.sync.model.MissionSubscription",
+        subscription_json(state, &sub, None, true),
+    )
 }
 
 async fn subscription_by_name(
@@ -1937,20 +2790,40 @@ async fn subscription_by_guid(
 }
 
 /// `createMissionSubscription`.
-fn subscribe_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+fn subscribe_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+) -> ApiResult {
     let window = params.window()?;
     let password = params.string("password");
-    let mut sub_role = role_from_token(state, &mission, caller, &[TokenType::Invitation, TokenType::Subscription, TokenType::Access]);
+    let mut sub_role = role_from_token(
+        state,
+        &mission,
+        caller,
+        &[
+            TokenType::Invitation,
+            TokenType::Subscription,
+            TokenType::Access,
+        ],
+    );
     if mission.password_protected() {
         if !password.is_empty() {
             if !password_matches(&mission, &password) {
-                return Err(ApiError::Forbidden("Illegal attempt to subscribe to mission! Password did not match.".into()));
+                return Err(ApiError::Forbidden(
+                    "Illegal attempt to subscribe to mission! Password did not match.".into(),
+                ));
             }
         } else if sub_role.is_none() {
-            return Err(ApiError::Forbidden("Illegal attempt to subscribe to mission! No token role provided.".into()));
+            return Err(ApiError::Forbidden(
+                "Illegal attempt to subscribe to mission! No token role provided.".into(),
+            ));
         }
     } else if !password.is_empty() {
-        return Err(ApiError::Forbidden("Illegal attempt to subscribe to mission! No password provided.".into()));
+        return Err(ApiError::Forbidden(
+            "Illegal attempt to subscribe to mission! No password provided.".into(),
+        ));
     } else if mission.invite_only && sub_role.is_none() {
         sub_role = state
             .store
@@ -1959,24 +2832,39 @@ fn subscribe_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord
             .find(|i| i.mission_guid == mission.guid)
             .map(|i| i.role);
         if sub_role.is_none() {
-            return Err(ApiError::Forbidden("Illegal attempt to subscribe to invite only mission!".into()));
+            return Err(ApiError::Forbidden(
+                "Illegal attempt to subscribe to invite only mission!".into(),
+            ));
         }
     }
     let role = sub_role.unwrap_or_else(|| mission.effective_default_role());
     let (uid, topic) = (params.string("uid"), params.string("topic"));
     if uid.is_empty() && topic.is_empty() {
-        return Err(ApiError::BadRequest("either 'uid' or 'topic' parameter must be specified".into()));
+        return Err(ApiError::BadRequest(
+            "either 'uid' or 'topic' parameter must be specified".into(),
+        ));
     }
-    let client_uid = if topic.is_empty() { uid.clone() } else { format!("topic:{topic}") };
+    let client_uid = if topic.is_empty() {
+        uid.clone()
+    } else {
+        format!("topic:{topic}")
+    };
     let now = now_ms();
     let tokens = Arc::clone(&state.tokens);
     let (name, guid) = (mission.name.clone(), mission.guid.clone());
-    let sub = state.store.subscribe(&mission.guid, &client_uid, &caller.username, role, now, |id| {
-        tokens.create(id, TokenType::Subscription, &name, &guid, now / 1000)
-    })?;
+    let sub = state.store.subscribe(
+        &mission.guid,
+        &client_uid,
+        &caller.username,
+        role,
+        now,
+        |id| tokens.create(id, TokenType::Subscription, &name, &guid, now / 1000),
+    )?;
     state.notifier.connect(&mission.guid, &client_uid);
     // Subscribing consumes the client's clientUid invitation.
-    state.store.uninvite(&mission.guid, &uid, InvitationType::ClientUid)?;
+    state
+        .store
+        .uninvite(&mission.guid, &uid, InvitationType::ClientUid)?;
     let mission_value = (caller.api_version >= 3).then(|| {
         let extras = MissionExtras {
             changes: state.store.changes(&mission.guid, window, false).ok(),
@@ -1986,7 +2874,10 @@ fn subscribe_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord
         };
         mission_json(state, &mission, &groups_seen(caller, &mission), extras)
     });
-    created("com.bbn.marti.sync.model.MissionSubscription", subscription_json(state, &sub, mission_value, true))
+    created(
+        "com.bbn.marti.sync.model.MissionSubscription",
+        subscription_json(state, &sub, mission_value, true),
+    )
 }
 
 async fn subscribe_by_name(
@@ -2015,13 +2906,24 @@ async fn subscribe_by_guid(
 
 /// `deleteMissionSubscription`: with `disconnectOnly` (default true) the
 /// stored subscription stays; only the live routing ends.
-fn unsubscribe_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+fn unsubscribe_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionRead)?;
     let (uid, topic) = (params.string("uid"), params.string("topic"));
-    let client_uid = if topic.is_empty() { uid } else { format!("topic:{topic}") };
+    let client_uid = if topic.is_empty() {
+        uid
+    } else {
+        format!("topic:{topic}")
+    };
     state.notifier.disconnect(&mission.guid, &client_uid);
     if !params.bool("disconnectOnly", true)? {
-        state.store.unsubscribe(&mission.guid, &client_uid, Some(&caller.username))?;
+        state
+            .store
+            .unsubscribe(&mission.guid, &client_uid, Some(&caller.username))?;
     }
     Ok(StatusCode::OK.into_response())
 }
@@ -2051,33 +2953,62 @@ async fn unsubscribe_by_guid(
 }
 
 /// `setSubscriptionRole` → `inviteOrUpdate`.
-fn set_subscription_roles_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params, body: &Bytes) -> ApiResult {
+fn set_subscription_roles_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+    body: &Bytes,
+) -> ApiResult {
     let role = role_for(state, &mission, caller);
     require(role, Permission::MissionSetRole)?;
-    let creator = params.get("creatorUid").ok_or_else(|| ApiError::BadRequest("missing creatorUid".into()))?.to_string();
-    let subs: Vec<Value> = serde_json::from_slice(body).map_err(|_| ApiError::BadRequest("Invalid Request Body".into()))?;
+    let creator = params
+        .get("creatorUid")
+        .ok_or_else(|| ApiError::BadRequest("missing creatorUid".into()))?
+        .to_string();
+    let subs: Vec<Value> = serde_json::from_slice(body)
+        .map_err(|_| ApiError::BadRequest("Invalid Request Body".into()))?;
     let mut parsed = Vec::new();
     for s in &subs {
         let client_uid = s.get("clientUid").and_then(|v| v.as_str());
-        let new_role = s.get("role").and_then(|r| r.get("type")).and_then(|t| t.as_str()).and_then(Role::parse);
+        let new_role = s
+            .get("role")
+            .and_then(|r| r.get("type"))
+            .and_then(|t| t.as_str())
+            .and_then(Role::parse);
         let (Some(client_uid), Some(new_role)) = (client_uid, new_role) else {
             return Err(ApiError::BadRequest("missing clientUid or role".into()));
         };
         if !may_assign(&mission, role, new_role) {
-            return Err(ApiError::Forbidden(format!("validateRoleAssignment failed! Illegal attempt to assign role {}", new_role.name())));
+            return Err(ApiError::Forbidden(format!(
+                "validateRoleAssignment failed! Illegal attempt to assign role {}",
+                new_role.name()
+            )));
         }
-        let username = s.get("username").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let username = s
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         parsed.push((client_uid.to_string(), username, new_role));
     }
     let now = now_ms();
     for (client_uid, username, new_role) in parsed {
         let exists = state.store.subscriptions(&mission.guid).iter().any(|s| {
-            if !username.is_empty() { s.username == username } else { s.client_uid == client_uid }
+            if !username.is_empty() {
+                s.username == username
+            } else {
+                s.client_uid == client_uid
+            }
         });
         if exists {
             set_role(state, &mission, &client_uid, &username, Some(new_role))?;
         } else {
-            let (invitee, kind) = if !username.is_empty() { (username, InvitationType::UserName) } else { (client_uid, InvitationType::ClientUid) };
+            let (invitee, kind) = if !username.is_empty() {
+                (username, InvitationType::UserName)
+            } else {
+                (client_uid, InvitationType::ClientUid)
+            };
             invite_record(state, &mission, &invitee, kind, new_role, &creator, now)?;
         }
     }
@@ -2112,7 +3043,12 @@ async fn set_subscription_roles_by_guid(
 
 fn subscribers_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionRead)?;
-    let uids: Vec<Value> = state.store.subscriptions(&mission.guid).into_iter().map(|s| s.client_uid.into()).collect();
+    let uids: Vec<Value> = state
+        .store
+        .subscriptions(&mission.guid)
+        .into_iter()
+        .map(|s| s.client_uid.into())
+        .collect();
     ok("MissionSubscription", uids.into())
 }
 
@@ -2138,9 +3074,18 @@ async fn subscribers_by_guid(
     subscribers_impl(&state, &caller, mission)
 }
 
-fn subscription_roles_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord) -> ApiResult {
+fn subscription_roles_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionRead)?;
-    let subs: Vec<Value> = state.store.subscriptions(&mission.guid).iter().map(|s| subscription_json(state, s, None, false)).collect();
+    let subs: Vec<Value> = state
+        .store
+        .subscriptions(&mission.guid)
+        .iter()
+        .map(|s| subscription_json(state, s, None, false))
+        .collect();
     ok("MissionSubscription", subs.into())
 }
 
@@ -2166,16 +3111,29 @@ async fn subscription_roles_by_guid(
     subscription_roles_impl(&state, &caller, mission)
 }
 
-async fn all_subscriptions(State(state): State<MissionsState>, Extension(identity): Extension<PeerIdentity>, headers: HeaderMap) -> ApiResult {
+async fn all_subscriptions(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+) -> ApiResult {
     if !caller(&state, &identity, &headers).admin {
         return Err(ApiError::AccessDenied);
     }
     // `List<Map.Entry<String, String>>` → `{"<mission name>": "<client uid>"}` each.
-    let entries: Vec<Value> = state.store.all_subscriptions().into_iter().map(|(_, name, uid)| json!({ name: uid })).collect();
+    let entries: Vec<Value> = state
+        .store
+        .all_subscriptions()
+        .into_iter()
+        .map(|(_, name, uid)| json!({ name: uid }))
+        .collect();
     ok("MissionSubscription", entries.into())
 }
 
-async fn all_subscriptions_with_guid(State(state): State<MissionsState>, Extension(identity): Extension<PeerIdentity>, headers: HeaderMap) -> ApiResult {
+async fn all_subscriptions_with_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+) -> ApiResult {
     if !caller(&state, &identity, &headers).admin {
         return Err(ApiError::AccessDenied);
     }
@@ -2194,7 +3152,10 @@ async fn all_subscriptions_with_guid(State(state): State<MissionsState>, Extensi
 fn role_get_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord) -> ApiResult {
     let role = role_for(state, &mission, caller);
     require(role, Permission::MissionRead)?;
-    ok("com.bbn.marti.sync.model.MissionRole", role.map(role_json).unwrap_or(Value::Null))
+    ok(
+        "com.bbn.marti.sync.model.MissionRole",
+        role.map(role_json).unwrap_or(Value::Null),
+    )
 }
 
 async fn role_by_name(
@@ -2221,7 +3182,12 @@ async fn role_by_guid(
 
 /// `setMissionRole`: needs `MISSION_SET_ROLE` and a mission with a
 /// default role; no `role` unsubscribes them.
-fn role_set_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+fn role_set_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+) -> ApiResult {
     let role = role_for(state, &mission, caller);
     require(role, Permission::MissionSetRole)?;
     if mission.default_role.is_none() {
@@ -2232,7 +3198,10 @@ fn role_set_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord,
     if let Some(new_role) = new_role
         && !may_assign(&mission, role, new_role)
     {
-        return Err(ApiError::Forbidden(format!("validateRoleAssignment failed! Illegal attempt to assign role {}", new_role.name())));
+        return Err(ApiError::Forbidden(format!(
+            "validateRoleAssignment failed! Illegal attempt to assign role {}",
+            new_role.name()
+        )));
     }
     set_role(state, &mission, &client_uid, &username, new_role)?;
     Ok(StatusCode::OK.into_response())
@@ -2240,21 +3209,37 @@ fn role_set_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord,
 
 /// `MissionService.setRole`: change the stored role (none = unsubscribe),
 /// then tell the client (`t-x-m-r`) -- for a username, its live connection.
-fn set_role(state: &MissionsState, mission: &MissionRecord, client_uid: &str, username: &str, role: Option<Role>) -> Result<(), ApiError> {
+fn set_role(
+    state: &MissionsState,
+    mission: &MissionRecord,
+    client_uid: &str,
+    username: &str,
+    role: Option<Role>,
+) -> Result<(), ApiError> {
     match role {
         Some(role) => {
-            state.store.set_subscription_role(&mission.guid, client_uid, username, role)?;
+            state
+                .store
+                .set_subscription_role(&mission.guid, client_uid, username, role)?;
         }
         None => {
             state.notifier.disconnect(&mission.guid, client_uid);
-            state.store.unsubscribe(&mission.guid, client_uid, Some(username))?;
+            state
+                .store
+                .unsubscribe(&mission.guid, client_uid, Some(username))?;
         }
     }
     let mut target = client_uid.to_string();
     if !username.is_empty()
-        && let Some(uid) = state.clients.list().into_iter().find(|c| c.common_name.as_deref() == Some(username)).and_then(|c| c.uid) {
-            target = uid;
-        }
+        && let Some(uid) = state
+            .clients
+            .list()
+            .into_iter()
+            .find(|c| c.common_name.as_deref() == Some(username))
+            .and_then(|c| c.uid)
+    {
+        target = uid;
+    }
     if !target.is_empty() {
         state.notifier.role_change(mission, &target, "", role);
     }
@@ -2298,7 +3283,13 @@ fn invite_record(
     creator: &str,
     now: i64,
 ) -> Result<bool, ApiError> {
-    let token = state.tokens.create(&random_uuid(), TokenType::Invitation, &mission.name, &mission.guid, now / 1000);
+    let token = state.tokens.create(
+        &random_uuid(),
+        TokenType::Invitation,
+        &mission.name,
+        &mission.guid,
+        now / 1000,
+    );
     let stored = state.store.invite(InvitationRecord {
         mission_guid: mission.guid.clone(),
         mission_name: mission.name.clone(),
@@ -2310,7 +3301,12 @@ fn invite_record(
         role,
     })?;
     if stored {
-        let connected: Vec<(Option<String>, Option<String>)> = state.clients.list().into_iter().map(|c| (c.common_name, c.uid)).collect();
+        let connected: Vec<(Option<String>, Option<String>)> = state
+            .clients
+            .list()
+            .into_iter()
+            .map(|c| (c.common_name, c.uid))
+            .collect();
         let uids = state.notifier.invitees(kind, invitee, &connected);
         state.notifier.invite(mission, uids, creator, &token, role);
     }
@@ -2319,14 +3315,28 @@ fn invite_record(
 
 /// Invitations for the caller: by client uid, by username (and, in the
 /// official server, by the live callsign of that client uid).
-fn invitations_for_caller(state: &MissionsState, caller: &Caller, client_uid: &str) -> Vec<InvitationRecord> {
-    let mut found = state.store.invitations_for(client_uid, InvitationType::ClientUid);
-    for i in state.store.invitations_for(&caller.username, InvitationType::UserName) {
+fn invitations_for_caller(
+    state: &MissionsState,
+    caller: &Caller,
+    client_uid: &str,
+) -> Vec<InvitationRecord> {
+    let mut found = state
+        .store
+        .invitations_for(client_uid, InvitationType::ClientUid);
+    for i in state
+        .store
+        .invitations_for(&caller.username, InvitationType::UserName)
+    {
         if !found.contains(&i) {
             found.push(i);
         }
     }
-    found.retain(|i| state.store.by_guid(&i.mission_guid).is_some_and(|m| visible(caller, &m)));
+    found.retain(|i| {
+        state
+            .store
+            .by_guid(&i.mission_guid)
+            .is_some_and(|m| visible(caller, &m))
+    });
     found
 }
 
@@ -2338,8 +3348,13 @@ async fn my_invitations(
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
     let params = Params::parse(query)?;
-    let client_uid = params.get("clientUid").ok_or_else(|| ApiError::BadRequest("Required parameter 'clientUid' is not present.".into()))?;
-    let found: Vec<Value> = invitations_for_caller(&state, &caller, client_uid).iter().map(invitation_json).collect();
+    let client_uid = params.get("clientUid").ok_or_else(|| {
+        ApiError::BadRequest("Required parameter 'clientUid' is not present.".into())
+    })?;
+    let found: Vec<Value> = invitations_for_caller(&state, &caller, client_uid)
+        .iter()
+        .map(invitation_json)
+        .collect();
     ok("MissionInvitation", found.into())
 }
 
@@ -2351,13 +3366,22 @@ async fn all_invitation_names(
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
     let params = Params::parse(query)?;
-    let names: BTreeSet<String> = invitations_for_caller(&state, &caller, &params.string("clientUid")).into_iter().map(|i| i.mission_name).collect();
+    let names: BTreeSet<String> =
+        invitations_for_caller(&state, &caller, &params.string("clientUid"))
+            .into_iter()
+            .map(|i| i.mission_name)
+            .collect();
     ok("MissionInvitation", json!(names))
 }
 
 fn invitations_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionRead)?;
-    let found: Vec<Value> = state.store.invitations(&mission.guid).iter().map(invitation_json).collect();
+    let found: Vec<Value> = state
+        .store
+        .invitations(&mission.guid)
+        .iter()
+        .map(invitation_json)
+        .collect();
     ok("MissionInvitation", found.into())
 }
 
@@ -2383,14 +3407,37 @@ async fn invitations_by_guid(
     invitations_impl(&state, &caller, mission)
 }
 
-fn invite_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, kind: &str, invitee: &str, params: &Params) -> ApiResult {
-    let kind = InvitationType::parse(kind).ok_or_else(|| ApiError::BadRequest(format!("invalid invitation type '{kind}'")))?;
-    let creator = params.get("creatorUid").ok_or_else(|| ApiError::BadRequest("Required parameter 'creatorUid' is not present.".into()))?;
-    let invite_role = params.role("role")?.unwrap_or_else(|| mission.effective_default_role());
+fn invite_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    kind: &str,
+    invitee: &str,
+    params: &Params,
+) -> ApiResult {
+    let kind = InvitationType::parse(kind)
+        .ok_or_else(|| ApiError::BadRequest(format!("invalid invitation type '{kind}'")))?;
+    let creator = params.get("creatorUid").ok_or_else(|| {
+        ApiError::BadRequest("Required parameter 'creatorUid' is not present.".into())
+    })?;
+    let invite_role = params
+        .role("role")?
+        .unwrap_or_else(|| mission.effective_default_role());
     if !may_assign(&mission, role_for(state, &mission, caller), invite_role) {
-        return Err(ApiError::Forbidden(format!("validateRoleAssignment failed! Illegal attempt to assign role {}", invite_role.name())));
+        return Err(ApiError::Forbidden(format!(
+            "validateRoleAssignment failed! Illegal attempt to assign role {}",
+            invite_role.name()
+        )));
     }
-    if !invite_record(state, &mission, invitee, kind, invite_role, creator, now_ms())? {
+    if !invite_record(
+        state,
+        &mission,
+        invitee,
+        kind,
+        invite_role,
+        creator,
+        now_ms(),
+    )? {
         // A duplicate: the official `missionInvite` returns false → 500.
         return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
@@ -2406,7 +3453,14 @@ async fn invite_by_name(
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
     let mission = existing(&state, &caller, Key::Name(&name))?;
-    invite_impl(&state, &caller, mission, &kind, &invitee, &Params::parse(query)?)
+    invite_impl(
+        &state,
+        &caller,
+        mission,
+        &kind,
+        &invitee,
+        &Params::parse(query)?,
+    )
 }
 
 async fn invite_by_guid(
@@ -2418,13 +3472,35 @@ async fn invite_by_guid(
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
     let mission = existing(&state, &caller, Key::Guid(&guid))?;
-    invite_impl(&state, &caller, mission, &kind, &invitee, &Params::parse(query)?)
+    invite_impl(
+        &state,
+        &caller,
+        mission,
+        &kind,
+        &invitee,
+        &Params::parse(query)?,
+    )
 }
 
-fn uninvite_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, kind: &str, invitee: &str, params: &Params) -> ApiResult {
-    let kind = InvitationType::parse(kind).ok_or_else(|| ApiError::BadRequest(format!("invalid invitation type '{kind}'")))?;
-    params.get("creatorUid").ok_or_else(|| ApiError::BadRequest("Required parameter 'creatorUid' is not present.".into()))?;
-    let token_role = role_from_token(state, &mission, caller, &[TokenType::Invitation, TokenType::Subscription]);
+fn uninvite_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    kind: &str,
+    invitee: &str,
+    params: &Params,
+) -> ApiResult {
+    let kind = InvitationType::parse(kind)
+        .ok_or_else(|| ApiError::BadRequest(format!("invalid invitation type '{kind}'")))?;
+    params.get("creatorUid").ok_or_else(|| {
+        ApiError::BadRequest("Required parameter 'creatorUid' is not present.".into())
+    })?;
+    let token_role = role_from_token(
+        state,
+        &mission,
+        caller,
+        &[TokenType::Invitation, TokenType::Subscription],
+    );
     if mission.password_protected() && token_role.is_none() {
         // The official handler catches its own exceptions and answers 500.
         return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
@@ -2442,7 +3518,14 @@ async fn uninvite_by_name(
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
     let mission = existing(&state, &caller, Key::Name(&name))?;
-    uninvite_impl(&state, &caller, mission, &kind, &invitee, &Params::parse(query)?)
+    uninvite_impl(
+        &state,
+        &caller,
+        mission,
+        &kind,
+        &invitee,
+        &Params::parse(query)?,
+    )
 }
 
 async fn uninvite_by_guid(
@@ -2454,7 +3537,14 @@ async fn uninvite_by_guid(
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
     let mission = existing(&state, &caller, Key::Guid(&guid))?;
-    uninvite_impl(&state, &caller, mission, &kind, &invitee, &Params::parse(query)?)
+    uninvite_impl(
+        &state,
+        &caller,
+        mission,
+        &kind,
+        &invitee,
+        &Params::parse(query)?,
+    )
 }
 
 // --- log entries ------------------------------------------------------------------------------
@@ -2473,22 +3563,41 @@ fn json_date(v: Option<&Value>) -> Result<Option<i64>, ApiError> {
 }
 
 fn strings(v: Option<&Value>) -> Vec<String> {
-    v.and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect()).unwrap_or_default()
+    v.and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The role check every log endpoint makes on each named mission: a
 /// mission without a role for the caller is skipped, one with a role
 /// lacking `permission` is forbidden.
-fn check_log_missions(state: &MissionsState, caller: &Caller, names: &[String], permission: Permission) -> Result<(), ApiError> {
+fn check_log_missions(
+    state: &MissionsState,
+    caller: &Caller,
+    names: &[String],
+    permission: Permission,
+) -> Result<(), ApiError> {
     for name in names {
         let mission = state
             .store
             .by_name(name, |m| visible(caller, m))
-            .ok_or_else(|| ApiError::NotFound(format!("Mission named '{}' not found - not deleted", name.trim())))?;
+            .ok_or_else(|| {
+                ApiError::NotFound(format!(
+                    "Mission named '{}' not found - not deleted",
+                    name.trim()
+                ))
+            })?;
         if let Some(role) = role_for(state, &mission, caller)
-            && !role.has(permission) {
-                return Err(ApiError::Forbidden("Illegal attempt to access mission!".into()));
-            }
+            && !role.has(permission)
+        {
+            return Err(ApiError::Forbidden(
+                "Illegal attempt to access mission!".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -2498,7 +3607,9 @@ fn check_log_missions(state: &MissionsState, caller: &Caller, names: &[String], 
 fn announce_log(state: &MissionsState, caller: &Caller, entry: &LogEntryRecord) {
     for name in &entry.mission_names {
         if let Some(mission) = state.store.by_name(name, |m| visible(caller, m)) {
-            state.notifier.announce(&mission, ChangeKind::Log, &entry.creator_uid, None);
+            state
+                .notifier
+                .announce(&mission, ChangeKind::Log, &entry.creator_uid, None);
         }
     }
 }
@@ -2528,11 +3639,21 @@ async fn post_log_entry(
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
     let v = parse_log_entry(&body)?;
-    if v.get("id").and_then(|i| i.as_str()).is_some_and(|i| !i.is_empty()) {
-        return Err(ApiError::BadRequest("log entry id must not be included for POST".into()));
+    if v.get("id")
+        .and_then(|i| i.as_str())
+        .is_some_and(|i| !i.is_empty())
+    {
+        return Err(ApiError::BadRequest(
+            "log entry id must not be included for POST".into(),
+        ));
     }
     let entry = log_entry_from(&v, random_uuid(), now_ms())?;
-    check_log_missions(&state, &caller, &entry.mission_names, Permission::MissionWrite)?;
+    check_log_missions(
+        &state,
+        &caller,
+        &entry.mission_names,
+        Permission::MissionWrite,
+    )?;
     let saved = state.store.save_log_entry(entry)?;
     announce_log(&state, &caller, &saved);
     ok("com.bbn.marti.sync.model.LogEntry", log_json(&saved))
@@ -2546,15 +3667,26 @@ async fn put_log_entry(
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
     let v = parse_log_entry(&body)?;
-    let id = v.get("id").and_then(|i| i.as_str()).filter(|i| !i.is_empty()).map(String::from);
+    let id = v
+        .get("id")
+        .and_then(|i| i.as_str())
+        .filter(|i| !i.is_empty())
+        .map(String::from);
     let Some(id) = id else {
-        return Err(ApiError::BadRequest("log entry id must be included for PUT".into()));
+        return Err(ApiError::BadRequest(
+            "log entry id must be included for PUT".into(),
+        ));
     };
     if v.get("servertime").is_some_and(|s| !s.is_null()) {
         return Err(ApiError::BadRequest("servertime can't be modified".into()));
     }
     let entry = log_entry_from(&v, id.clone(), now_ms())?;
-    check_log_missions(&state, &caller, &entry.mission_names, Permission::MissionWrite)?;
+    check_log_missions(
+        &state,
+        &caller,
+        &entry.mission_names,
+        Permission::MissionWrite,
+    )?;
     if state.store.log_entry(&id).is_none() {
         return Err(ApiError::BadRequest(format!("Log entry {id} not found")));
     }
@@ -2570,9 +3702,20 @@ async fn get_log_entry(
     Path(id): Path<String>,
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
-    let entry = state.store.log_entry(&id).ok_or_else(|| ApiError::NotFound(format!("log entry {id} not found")))?;
-    check_log_missions(&state, &caller, &entry.mission_names, Permission::MissionRead)?;
-    ok("com.bbn.marti.sync.model.LogEntry", json!([log_json(&entry)]))
+    let entry = state
+        .store
+        .log_entry(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("log entry {id} not found")))?;
+    check_log_missions(
+        &state,
+        &caller,
+        &entry.mission_names,
+        Permission::MissionRead,
+    )?;
+    ok(
+        "com.bbn.marti.sync.model.LogEntry",
+        json!([log_json(&entry)]),
+    )
 }
 
 async fn delete_log_entry(
@@ -2582,18 +3725,33 @@ async fn delete_log_entry(
     Path(id): Path<String>,
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
-    let entry = state.store.log_entry(&id).ok_or_else(|| ApiError::NotFound(format!("log entry {id} not found")))?;
-    check_log_missions(&state, &caller, &entry.mission_names, Permission::MissionWrite)?;
+    let entry = state
+        .store
+        .log_entry(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("log entry {id} not found")))?;
+    check_log_missions(
+        &state,
+        &caller,
+        &entry.mission_names,
+        Permission::MissionWrite,
+    )?;
     state.store.delete_log_entry(&id)?;
     announce_log(&state, &caller, &entry);
     Ok(StatusCode::OK.into_response())
 }
 
-async fn all_logs(State(state): State<MissionsState>, Extension(identity): Extension<PeerIdentity>, headers: HeaderMap) -> ApiResult {
+async fn all_logs(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+) -> ApiResult {
     if !caller(&state, &identity, &headers).admin {
         return Err(ApiError::AccessDenied);
     }
-    ok("com.bbn.marti.sync.model.LogEntry", state.store.all_log_entries().iter().map(log_json).collect())
+    ok(
+        "com.bbn.marti.sync.model.LogEntry",
+        state.store.all_log_entries().iter().map(log_json).collect(),
+    )
 }
 
 async fn logs_for_mission(
@@ -2607,7 +3765,15 @@ async fn logs_for_mission(
     let mission = existing(&state, &caller, Key::Name(&name))?;
     require(role_for(&state, &mission, &caller), Permission::MissionRead)?;
     let window = Params::parse(query)?.window()?;
-    ok("com.bbn.marti.sync.model.LogEntry", state.store.log_entries_for(&mission.name, window).iter().map(log_json).collect())
+    ok(
+        "com.bbn.marti.sync.model.LogEntry",
+        state
+            .store
+            .log_entries_for(&mission.name, window)
+            .iter()
+            .map(log_json)
+            .collect(),
+    )
 }
 
 // --- CoT ------------------------------------------------------------------------------------------
@@ -2619,10 +3785,11 @@ fn cot_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord) -> A
     let mut xml = String::from("<?xml version='1.0' encoding='UTF-8' standalone='yes'?><events>");
     for add in mission.uids() {
         if let Content::Uid(uid) = &add.content
-            && let Some(event) = state.latest_cot.get(uid) {
-                xml.push_str(&event.xml);
-                xml.push('\n');
-            }
+            && let Some(event) = state.latest_cot.get(uid)
+        {
+            xml.push_str(&event.xml);
+            xml.push('\n');
+        }
     }
     xml.push_str("</events>");
     Ok(([(axum::http::header::CONTENT_TYPE, "application/xml")], xml).into_response())

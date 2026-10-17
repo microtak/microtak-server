@@ -10,7 +10,7 @@
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
-    DnType, DnValue, ExtendedKeyUsagePurpose, Issuer, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    DnType, DnValue, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
     SerialNumber,
 };
 use rustls::pki_types::CertificateDer;
@@ -52,8 +52,7 @@ impl CertificateAuthority {
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, common_name);
 
-        let mut params =
-            CertificateParams::new(Vec::<String>::new()).map_err(PkiError::Params)?;
+        let mut params = CertificateParams::new(Vec::<String>::new()).map_err(PkiError::Params)?;
         params.distinguished_name = dn;
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -283,7 +282,11 @@ pub fn cert_details(cert_pem: &str) -> Option<CertDetails> {
     let serial = parsed.tbs_certificate.raw_serial();
     let mut serial_hex: String = serial.iter().map(|b| format!("{b:02x}")).collect();
     let trimmed = serial_hex.trim_start_matches('0');
-    serial_hex = if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() };
+    serial_hex = if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    };
     Some(CertDetails {
         serial_hex,
         issuer_dn: parsed.issuer().to_string(),
@@ -427,9 +430,16 @@ mod tests {
         let fp_a2 = fingerprint_sha256_colon_hex(&signed_a.cert_pem).unwrap();
         let fp_b = fingerprint_sha256_colon_hex(&signed_b.cert_pem).unwrap();
 
-        assert_eq!(fp_a1, fp_a2, "the same cert must always fingerprint the same");
+        assert_eq!(
+            fp_a1, fp_a2,
+            "the same cert must always fingerprint the same"
+        );
         assert_ne!(fp_a1, fp_b);
-        assert_eq!(fp_a1.len(), 32 * 3 - 1, "32 hex-pair groups joined by colons");
+        assert_eq!(
+            fp_a1.len(),
+            32 * 3 - 1,
+            "32 hex-pair groups joined by colons"
+        );
         assert!(fp_a1.chars().all(|c| c.is_ascii_hexdigit() || c == ':'));
         assert_eq!(fp_a1, fp_a1.to_uppercase());
     }
@@ -439,10 +449,11 @@ mod tests {
     fn malicious_csr(common_name: &str) -> String {
         use rcgen::{ExtendedKeyUsagePurpose, SanType};
         let key = KeyPair::generate().unwrap();
-        let mut params =
-            CertificateParams::new(vec!["evil.example".to_string()]).unwrap();
+        let mut params = CertificateParams::new(vec!["evil.example".to_string()]).unwrap();
         params.distinguished_name = DistinguishedName::new();
-        params.distinguished_name.push(DnType::CommonName, common_name);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,
@@ -483,9 +494,16 @@ mod tests {
         let (_, cert) = X509Certificate::from_der(&der).unwrap();
 
         let basic_constraints = cert.basic_constraints().unwrap().map(|bc| bc.value.ca);
-        assert_ne!(basic_constraints, Some(true), "a client cert must never be a CA");
+        assert_ne!(
+            basic_constraints,
+            Some(true),
+            "a client cert must never be a CA"
+        );
 
-        let key_usage = cert.key_usage().unwrap().expect("client certs carry an explicit KeyUsage");
+        let key_usage = cert
+            .key_usage()
+            .unwrap()
+            .expect("client certs carry an explicit KeyUsage");
         assert!(key_usage.value.digital_signature());
         assert!(!key_usage.value.key_cert_sign(), "no certificate signing");
         assert!(!key_usage.value.crl_sign());
@@ -495,14 +513,22 @@ mod tests {
             .unwrap()
             .expect("client certs carry an explicit EKU");
         assert!(eku.value.client_auth);
-        assert!(!eku.value.server_auth, "a client cert must not be usable as a server cert");
+        assert!(
+            !eku.value.server_auth,
+            "a client cert must not be usable as a server cert"
+        );
         assert!(!eku.value.any);
 
-        let has_san = cert
-            .extensions()
-            .iter()
-            .any(|ext| matches!(ext.parsed_extension(), ParsedExtension::SubjectAlternativeName(_)));
-        assert!(!has_san, "client certs carry no SANs, whatever the CSR asked for");
+        let has_san = cert.extensions().iter().any(|ext| {
+            matches!(
+                ext.parsed_extension(),
+                ParsedExtension::SubjectAlternativeName(_)
+            )
+        });
+        assert!(
+            !has_san,
+            "client certs carry no SANs, whatever the CSR asked for"
+        );
     }
 
     /// Two certs issued for the same public key (e.g. a device re-enrolling
@@ -541,7 +567,10 @@ mod tests {
         let der = parse_leaf(&signed.cert_pem);
         let (_, cert) = X509Certificate::from_der(&der).unwrap();
 
-        assert_ne!(cert.basic_constraints().unwrap().map(|bc| bc.value.ca), Some(true));
+        assert_ne!(
+            cert.basic_constraints().unwrap().map(|bc| bc.value.ca),
+            Some(true)
+        );
         let eku = cert.extended_key_usage().unwrap().unwrap();
         assert!(eku.value.server_auth);
         assert!(!eku.value.client_auth);
@@ -575,7 +604,11 @@ mod tests {
         let signed = ca
             .sign_server_csr(
                 &csr,
-                &["microtak-server".to_string(), "192.168.1.10".to_string(), "fd00::1".to_string()],
+                &[
+                    "microtak-server".to_string(),
+                    "192.168.1.10".to_string(),
+                    "fd00::1".to_string(),
+                ],
                 Duration::days(1),
             )
             .unwrap();
