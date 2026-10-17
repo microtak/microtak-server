@@ -14,6 +14,7 @@
 //! | `GET /api/sync/search` | `MissionApi.searchSync` -- envelope of `Resource` |
 //! | `GET /api/resources/{hash}` | `MissionApi.getResource` (admin) |
 //! | `PUT /api/sync/metadata/{hash}/keywords\|expiration` | `MetadataApi` |
+//! | `DELETE /api/files/{hash}`, `GET /api/files/metadata/count` | `FileManagerApi` (the rest: [`super::file_manager`]) |
 //!
 //! Files are visible within their groups ([`crate::sync`]); the admin sees
 //! all, as on the official server.
@@ -47,6 +48,8 @@ pub struct SyncState {
     pub max_upload_bytes: u64,
     /// For counting a mission's files (`getResourceCountByMission`).
     pub missions: Arc<crate::missions::MissionStore>,
+    /// Callsigns for `FileManagerApi`'s `Creator` (`latestCallsign`).
+    pub latest_cot: Arc<crate::latest_cot::LatestCot>,
 }
 
 pub fn router(state: SyncState) -> Router {
@@ -64,7 +67,12 @@ pub fn router(state: SyncState) -> Router {
         )
         .route("/Marti/api/sync/search", get(search_api))
         .route("/Marti/api/resources/:hash", get(get_resource))
-        .route("/Marti/api/files/:hash", axum::routing::delete(file_manager_delete))
+        .route(
+            "/Marti/api/files/:hash",
+            get(super::file_manager::get_file).head(super::file_manager::head_file).delete(file_manager_delete),
+        )
+        .route("/Marti/api/files/:hash/metadata", put(super::file_manager::put_metadata))
+        .route("/Marti/api/files/metadata", get(super::file_manager::list))
         .route("/Marti/api/files/metadata/count", get(file_manager_count))
         .route("/Marti/api/sync/metadata/:hash/keywords", put(set_keywords))
         .route("/Marti/api/sync/metadata/:hash/expiration", put(set_expiration))
@@ -430,7 +438,7 @@ async fn content(
 
 /// `URLEncoder.encode(filename, UTF-8)` as the official servlet applies it
 /// (spaces become `+`).
-fn urlencode_filename(name: &str) -> String {
+pub(crate) fn urlencode_filename(name: &str) -> String {
     let mut out = String::new();
     for byte in name.bytes() {
         match byte {

@@ -83,6 +83,9 @@ enum SyncEvent {
     Deleted { primary_key: i64 },
     KeywordsSet { hash: String, keywords: Vec<String> },
     ExpirationSet { hash: String, expiration: Option<i64> },
+    /// `FileManagerApi.putMetadata` on the caller's rows.
+    SubmitterSet { keys: Vec<i64>, user: String },
+    ExpirationSetKeys { keys: Vec<i64>, expiration: Option<i64> },
 }
 
 #[derive(Debug, Default)]
@@ -105,6 +108,16 @@ fn apply(state: &mut SyncState, event: &SyncEvent) {
         }
         SyncEvent::ExpirationSet { hash, expiration } => {
             for r in state.resources.iter_mut().filter(|r| r.hash == *hash) {
+                r.expiration = *expiration;
+            }
+        }
+        SyncEvent::SubmitterSet { keys, user } => {
+            for r in state.resources.iter_mut().filter(|r| keys.contains(&r.primary_key)) {
+                r.submission_user = user.clone();
+            }
+        }
+        SyncEvent::ExpirationSetKeys { keys, expiration } => {
+            for r in state.resources.iter_mut().filter(|r| keys.contains(&r.primary_key)) {
                 r.expiration = *expiration;
             }
         }
@@ -246,6 +259,16 @@ impl ResourceStore {
     pub fn set_expiration(&self, hash: &str, expiration: Option<i64>) -> Result<(), SyncError> {
         let mut state = self.state.write().unwrap();
         self.record(&mut state, SyncEvent::ExpirationSet { hash: hash.to_ascii_lowercase(), expiration })
+    }
+
+    pub fn set_submission_user(&self, keys: &[i64], user: &str) -> Result<(), SyncError> {
+        let mut state = self.state.write().unwrap();
+        self.record(&mut state, SyncEvent::SubmitterSet { keys: keys.to_vec(), user: user.to_string() })
+    }
+
+    pub fn set_expiration_keys(&self, keys: &[i64], expiration: Option<i64>) -> Result<(), SyncError> {
+        let mut state = self.state.write().unwrap();
+        self.record(&mut state, SyncEvent::ExpirationSetKeys { keys: keys.to_vec(), expiration })
     }
 
     /// Whether any resource (of any visibility) still references `hash` --

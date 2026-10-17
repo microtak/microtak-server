@@ -462,6 +462,7 @@ impl App {
                 admin_common_name: config.admin_common_name.clone(),
                 max_upload_bytes: config.max_upload_bytes,
                 missions: Arc::clone(&missions),
+                latest_cot: Arc::clone(&latest_cot),
             }))
             .merge(admin::router(admin_state))
             .merge(discovery::router())

@@ -487,6 +487,100 @@ async fn e2e_file_manager_delete_and_count() {
     assert_eq!(again.status(), 200, "nothing there: still 200");
 }
 
+/// Official FileManagerApi listing, download, HEAD and metadata PUT
+/// (CloudTAK's package views call `GET /Marti/api/files/metadata`).
+/// `buildResourceEntry`: string values, `Size` in B/kB/MB/GB, `Time` as a
+/// JDBC `Timestamp`, `Keywords` joined (`none` without any), `Expiration`
+/// as an ISO instant without `Z` (`none` if never), `Groups` joined.
+#[tokio::test]
+async fn e2e_file_manager_metadata_like_the_official_server() {
+    let (client, base, _, _) = sync_client("files-meta").await;
+    let upload = |name: &'static str, body: Vec<u8>, query: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            let r = client.post(format!("{base}/Marti/sync/upload?name={name}{query}")).body(body).send().await.unwrap();
+            serde_json::from_str::<serde_json::Value>(&r.text().await.unwrap()).unwrap()["Hash"].as_str().unwrap().to_string()
+        }
+    };
+    let plain = upload("b-plain.txt", b"plain text".to_vec(), "&mimetype=text/plain").await;
+    let package = upload("a-pkg.zip", vec![7u8; 2048], "&keywords=missionpackage").await;
+    let list = |query: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            let body: serde_json::Value = client.get(format!("{base}/Marti/api/files/metadata{query}")).send().await.unwrap().json().await.unwrap();
+            assert_envelope(&body, "Files");
+            body["data"].as_array().unwrap().clone()
+        }
+    };
+    let all = list("").await;
+    let hashes: Vec<&str> = all.iter().map(|e| e["Hash"].as_str().unwrap()).collect();
+    assert_eq!(hashes, [plain.as_str(), package.as_str()], "no sort: in the order stored");
+    let entry = &all[0];
+    assert_eq!(entry["Name"], "b-plain.txt");
+    assert_eq!(entry["User"], "files-meta");
+    assert_eq!(entry["Creator"], "", "no client with the resource's uid");
+    assert_eq!(entry["Size"], "10B");
+    assert_eq!(entry["MimeType"], "text/plain");
+    assert_eq!(entry["Keywords"], "none");
+    assert_eq!(entry["Expiration"], "none");
+    assert_eq!(entry["Groups"], "__ANON__");
+    let time = entry["Time"].as_str().unwrap();
+    assert!(time.len() >= 21 && &time[10..11] == " " && &time[19..20] == ".", "Timestamp.toString: {time}");
+    assert_eq!(all[1]["Size"], "2kB");
+    assert_eq!(all[1]["Keywords"], "missionpackage");
+
+    let packages = list("?missionPackage=true").await;
+    assert_eq!(packages.len(), 1);
+    assert_eq!(packages[0]["Hash"], package.as_str());
+    assert_eq!(list("?name=plain").await.len(), 1, "name like %name%");
+    let by_name = list("?sort=name").await;
+    assert_eq!(by_name[0]["Name"], "a-pkg.zip");
+    let by_name_desc = list("?sort=name&ascending=false").await;
+    assert_eq!(by_name_desc[0]["Name"], "b-plain.txt");
+    let page = list("?sort=name&page=1&limit=1").await;
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0]["Name"], "b-plain.txt");
+
+    let created = client.put(format!("{base}/Marti/api/missions/Files?creatorUid=ANDROID-F")).send().await.unwrap();
+    assert_eq!(created.status(), 201);
+    let added = client
+        .put(format!("{base}/Marti/api/missions/Files/contents"))
+        .header("Content-Type", "application/json")
+        .body(format!(r#"{{"hashes":["{package}"]}}"#))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), 200);
+    let in_mission = list("?mission=Files").await;
+    assert_eq!(in_mission.len(), 1);
+    assert_eq!(in_mission[0]["Hash"], package.as_str());
+
+    // getFile: the bytes, the stored type, an attachment named after it.
+    let file = client.get(format!("{base}/Marti/api/files/{plain}")).send().await.unwrap();
+    assert_eq!(file.status(), 200);
+    assert_eq!(file.headers()["content-type"], "text/plain");
+    assert_eq!(file.headers()["content-disposition"], "attachment; filename=\"b-plain.txt\"");
+    assert_eq!(file.bytes().await.unwrap().as_ref(), b"plain text");
+    let missing = client.get(format!("{base}/Marti/api/files/{}", "0".repeat(64))).send().await.unwrap();
+    assert_eq!(missing.status(), 400, "ByteArrayResource(null): IllegalArgumentException");
+    let head = client.head(format!("{base}/Marti/api/files/{plain}")).send().await.unwrap();
+    assert_eq!(head.status(), 200);
+
+    // putMetadata: keywords are always replaced (empty when not given).
+    let put = client.put(format!("{base}/Marti/api/files/{plain}/metadata?keywords=a&keywords=b&expiration=1800000000")).send().await.unwrap();
+    assert_eq!(put.status(), 200);
+    let after = list("?name=plain").await;
+    assert_eq!(after[0]["Keywords"], "a,b");
+    assert_eq!(after[0]["Expiration"], "2027-01-15T08:00:00");
+    client.put(format!("{base}/Marti/api/files/{plain}/metadata?user=bob")).send().await.unwrap();
+    let after = list("?name=plain").await;
+    assert_eq!(after[0]["User"], "bob");
+    assert_eq!(after[0]["Keywords"], "none");
+    assert_eq!(after[0]["Expiration"], "2027-01-15T08:00:00");
+}
+
 /// One enrolled device used like ATAK uses it: the same certificate for
 /// its CoT stream (after a position report binds its uid) and the Marti API.
 async fn device(enrollment: &str, cn: &str, uid: &str, mtls_addr: SocketAddr, marti_api_addr: SocketAddr, ca_cert_pem: &str) -> (TlsStream<TcpStream>, reqwest::Client) {

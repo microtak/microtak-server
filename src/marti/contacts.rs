@@ -83,6 +83,11 @@ fn sa_fields(xml: &str) -> (String, String, String, String) {
     }
 }
 
+/// The `contact` callsign of a CoT event ("" without one).
+pub fn callsign(xml: &str) -> String {
+    sa_fields(xml).0
+}
+
 /// `RemoteSubscription` / `RemoteSubscriptionLite` JSON for a connection.
 pub fn remote_subscription(endpoint: &ClientEndpoint, latest_cot: &LatestCot) -> Value {
     let uid = endpoint.uid.clone().unwrap_or_default();
