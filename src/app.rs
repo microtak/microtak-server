@@ -82,6 +82,9 @@ pub struct AppConfig {
     /// listener, whose `X-Forwarded-For` is trusted for rate limiting --
     /// see `src/clientip.rs`. Empty (the default): the header is ignored.
     pub trusted_proxies: TrustedProxies,
+    /// TCP proxies / load balancers whose PROXY protocol header is believed
+    /// on every listener -- see [`crate::transport::proxy_protocol`].
+    pub proxy_protocol_from: TrustedProxies,
     /// Where the enrollment listener's TLS certificate comes from -- see
     /// [`CertSource`]. The mTLS listeners always use the internal one.
     pub enrollment_cert: CertSource,
@@ -183,6 +186,7 @@ impl Default for AppConfig {
             server_names: Vec::new(),
             server_names_from_interfaces: true,
             trusted_proxies: TrustedProxies::default(),
+            proxy_protocol_from: TrustedProxies::default(),
             enrollment_cert: CertSource::Internal,
             cert_validity: Duration::days(365),
             backup: BackupConfig::default(),
@@ -374,7 +378,8 @@ impl App {
             .merge(oauth::router(Arc::clone(&users), limiter))
             .layer(axum::Extension(Arc::new(config.trusted_proxies.clone())));
         // One instance for every listener, so the total cap is server-wide.
-        let admission = Admission::new(config.admission);
+        let admission =
+            Admission::new(config.admission).with_proxy_protocol_from(config.proxy_protocol_from.clone());
         let enrollment = TlsHttpServer::bind(
             config.enrollment_addr,
             Arc::new(tls::server_auth_only_config(enrollment_cert)),

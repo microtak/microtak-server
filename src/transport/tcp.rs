@@ -72,17 +72,16 @@ impl TcpRelay {
     /// on a fatal `accept()` error (the listener socket itself is broken).
     pub async fn run(self) -> std::io::Result<()> {
         loop {
-            let (stream, peer) = self.listener.accept().await?;
-            let Some(permit) = self.admission.admit(peer.ip()) else {
-                warn!(%peer, "connection limit reached, refusing plain-TCP connection");
-                continue;
-            };
+            let (mut stream, peer) = self.listener.accept().await?;
+            let admission = self.admission.clone();
             let tx = self.hub.sender();
             let rx = self.hub.subscribe();
             let clients = self.clients.clone();
             let groups = Arc::clone(&self.groups);
             tokio::spawn(async move {
-                let _permit = permit;
+                let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
+                    return;
+                };
                 handle_client(stream, peer, tx, rx, clients, groups).await;
             });
         }

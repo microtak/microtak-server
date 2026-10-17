@@ -160,16 +160,14 @@ impl TlsHttpServer {
     /// on a fatal `accept()` error.
     pub async fn run(self) -> std::io::Result<()> {
         loop {
-            let (stream, peer) = self.listener.accept().await?;
-            let Some(permit) = self.admission.admit(peer.ip()) else {
-                warn!(%peer, "connection limit reached, refusing enrollment connection");
-                continue;
-            };
+            let (mut stream, peer) = self.listener.accept().await?;
             let admission = self.admission.clone();
             let acceptor = self.acceptor.clone();
             let router = self.router.clone();
             tokio::spawn(async move {
-                let _permit = permit;
+                let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
+                    return;
+                };
                 let tls_stream =
                     match tokio::time::timeout(admission.handshake_timeout(), acceptor.accept(stream)).await {
                         Ok(Ok(stream)) => stream,
@@ -287,17 +285,15 @@ impl MtlsHttpServer {
     /// disconnects that one client and does not affect the listener.
     pub async fn run(self) -> std::io::Result<()> {
         loop {
-            let (stream, peer) = self.listener.accept().await?;
-            let Some(permit) = self.admission.admit(peer.ip()) else {
-                warn!(%peer, "connection limit reached, refusing Marti API connection");
-                continue;
-            };
+            let (mut stream, peer) = self.listener.accept().await?;
             let admission = self.admission.clone();
             let acceptor = self.acceptor.clone();
             let router = self.router.clone();
             let registry = self.registry.clone();
             tokio::spawn(async move {
-                let _permit = permit;
+                let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
+                    return;
+                };
                 let mut tls_stream =
                     match tokio::time::timeout(admission.handshake_timeout(), acceptor.accept(stream)).await {
                         Ok(Ok(stream)) => stream,

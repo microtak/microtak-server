@@ -167,12 +167,8 @@ impl TlsRelay {
     /// CN disconnects that one client and does not affect the listener.
     pub async fn run(self) -> std::io::Result<()> {
         loop {
-            let (stream, peer) = self.listener.accept().await?;
-            let Some(permit) = self.admission.admit(peer.ip()) else {
-                warn!(%peer, "connection limit reached, refusing CoT connection");
-                continue;
-            };
-            let handshake_timeout = self.admission.handshake_timeout();
+            let (mut stream, peer) = self.listener.accept().await?;
+            let admission = self.admission.clone();
             let acceptor = self.acceptor.clone();
             let tx = self.hub.sender();
             let rx = self.hub.subscribe();
@@ -180,9 +176,11 @@ impl TlsRelay {
             let clients = self.clients.clone();
             let groups = Arc::clone(&self.groups);
             tokio::spawn(async move {
-                let _permit = permit;
+                let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
+                    return;
+                };
                 let mut tls_stream =
-                    match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                    match tokio::time::timeout(admission.handshake_timeout(), acceptor.accept(stream)).await {
                         Ok(Ok(stream)) => stream,
                         Ok(Err(error)) => {
                             warn!(%peer, %error, "TLS handshake failed, rejecting client");
@@ -575,6 +573,97 @@ mod tests {
             .await
             .expect("the over-limit connection must be closed promptly");
         assert!(matches!(read, Ok(0) | Err(_)), "expected EOF/reset, got {read:?}");
+    }
+
+    /// Connect through a "proxy" on loopback: write `header` first, then
+    /// do the mTLS handshake on the same socket.
+    async fn connect_with_header(
+        addr: SocketAddr,
+        fixture: &Fixture,
+        cn: &str,
+        header: &[u8],
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        let connector = client_tls_connector(fixture, cn);
+        let mut tcp = TcpStream::connect(addr).await?;
+        tcp.write_all(header).await?;
+        connector
+            .connect(ServerName::try_from("microtak-server").unwrap(), tcp)
+            .await
+    }
+
+    async fn relay_with_proxy_protocol(
+        fixture: &Fixture,
+        trusted: &[&str],
+        per_ip: usize,
+    ) -> (SocketAddr, ConnectedClients) {
+        let clients = ConnectedClients::new();
+        let proxies = crate::clientip::TrustedProxies::parse(
+            &trusted.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let admission = crate::transport::admission::Admission::new(
+            crate::transport::admission::AdmissionLimits {
+                max_connections_per_ip: per_ip,
+                ..Default::default()
+            },
+        )
+        .with_proxy_protocol_from(proxies);
+        let relay = TlsRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.server_config.clone(),
+            RelayHub::new(),
+            fixture.registry.clone(),
+            clients.clone(),
+        )
+        .await
+        .unwrap()
+        .with_admission(admission);
+        let addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+        (addr, clients)
+    }
+
+    /// Behind a trusted TCP proxy (Traefik passthrough, a load balancer),
+    /// the PROXY header's address is the client's: shown in the connected
+    /// clients list, and what the per-address limit counts.
+    #[tokio::test]
+    async fn a_trusted_proxys_header_sets_the_client_address() {
+        let fixture = build_fixture();
+        let (addr, clients) = relay_with_proxy_protocol(&fixture, &["127.0.0.1"], 1).await;
+        let server: SocketAddr = "10.0.0.1:8089".parse().unwrap();
+        let alice: SocketAddr = "203.0.113.7:50000".parse().unwrap();
+        let bob: SocketAddr = "198.51.100.9:50001".parse().unwrap();
+
+        let _a = connect_with_header(addr, &fixture, "device-a", &crate::transport::proxy_protocol::encode_v2(alice, server))
+            .await
+            .unwrap();
+        // Same proxy socket address, different client: the per-IP limit of 1
+        // applies to the client, so this one is admitted too.
+        let _b = connect_with_header(addr, &fixture, "device-b", &crate::transport::proxy_protocol::encode_v2(bob, server))
+            .await
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        let mut seen: Vec<SocketAddr> = clients.list().into_iter().map(|c| c.remote_addr).collect();
+        seen.sort();
+        let mut expected = vec![alice, bob];
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
+
+    /// A header from a peer that isn't a configured proxy is not believed:
+    /// the bytes reach the TLS handshake, which fails -- no address spoofing.
+    #[tokio::test]
+    async fn a_header_from_an_untrusted_peer_is_not_honoured() {
+        let fixture = build_fixture();
+        let (addr, clients) = relay_with_proxy_protocol(&fixture, &["192.0.2.1"], 64).await;
+        let spoofed = crate::transport::proxy_protocol::encode_v2(
+            "203.0.113.66:1".parse().unwrap(),
+            "10.0.0.1:8089".parse().unwrap(),
+        );
+        let result = connect_with_header(addr, &fixture, "device-c", &spoofed).await;
+        assert!(result.is_err(), "the handshake must fail");
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        assert!(clients.list().is_empty());
     }
 
     /// TC-TLS-01: a client presenting a cert signed by the configured CA

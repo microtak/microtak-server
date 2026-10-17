@@ -166,6 +166,12 @@ on the HTTP ports, its request headers) within 10 seconds, and the server
 caps open connections at 1024 in total and 64 per client address. Tune
 with `handshake_timeout_seconds`, `http_header_timeout_seconds`,
 `max_connections` and `max_connections_per_ip` in `microtak.toml`.
+Behind a TCP proxy or load balancer (e.g. Traefik TLS passthrough to the
+mTLS ports), list it in `proxy_protocol_from` (IPs or CIDR networks) and
+have it send the PROXY protocol header (v1 or v2): limits, logs and the
+connected-clients list then see real client addresses. Headers from any
+other peer are ignored.
+
 Uploads (photos, data packages) are streamed to disk and may be up to
 100 MB; change with `max_upload_mb`.
 

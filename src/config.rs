@@ -39,6 +39,9 @@ pub struct Config {
     /// Reverse proxies whose `X-Forwarded-For` is trusted, as IPs or CIDR
     /// networks -- see `AppConfig::trusted_proxies`.
     pub trusted_proxies: Vec<String>,
+    /// TCP proxies (IPs or CIDR networks) whose PROXY protocol header is
+    /// believed -- see `AppConfig::proxy_protocol_from`.
+    pub proxy_protocol_from: Vec<String>,
     /// Optional PEM certificate chain + key for the enrollment listener
     /// (e.g. Let's Encrypt). Set both or neither; unset means a
     /// certificate from MicroTAK's own CA. See `src/certsource.rs`.
@@ -96,6 +99,7 @@ impl Default for Config {
             server_names: defaults.server_names,
             server_names_from_interfaces: defaults.server_names_from_interfaces,
             trusted_proxies: Vec::new(),
+            proxy_protocol_from: Vec::new(),
             enrollment_cert_file: None,
             enrollment_key_file: None,
             cert_validity_days: defaults.cert_validity.whole_days(),
@@ -197,6 +201,7 @@ impl Config {
             server_names: self.server_names.clone(),
             server_names_from_interfaces: self.server_names_from_interfaces,
             trusted_proxies: crate::clientip::TrustedProxies::parse(&self.trusted_proxies)?,
+            proxy_protocol_from: crate::clientip::TrustedProxies::parse(&self.proxy_protocol_from)?,
             enrollment_cert,
             cert_validity: Duration::days(self.cert_validity_days),
             data_dir: self.data_dir.clone(),
@@ -327,6 +332,17 @@ mod tests {
         assert_eq!(limits.max_connections_per_ip, 5);
         assert_eq!(limits.handshake_timeout, std::time::Duration::from_secs(3));
         assert_eq!(limits.http_header_timeout, std::time::Duration::from_secs(4));
+    }
+
+    #[test]
+    fn proxy_protocol_sources_parse_and_reject_garbage() {
+        assert!(Config::default().to_app_config().unwrap().proxy_protocol_from.is_empty());
+        let config: Config = toml::from_str("proxy_protocol_from = [\"10.42.0.0/16\"]\n").unwrap();
+        let app = config.to_app_config().unwrap();
+        assert!(app.proxy_protocol_from.contains("10.42.1.5".parse().unwrap()));
+        assert!(!app.proxy_protocol_from.contains("203.0.113.1".parse().unwrap()));
+        let bad: Config = toml::from_str("proxy_protocol_from = [\"not-an-ip\"]\n").unwrap();
+        assert!(bad.to_app_config().is_err());
     }
 
     #[test]

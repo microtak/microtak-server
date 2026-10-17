@@ -11,7 +11,7 @@
 //! releases its slot on drop.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -51,6 +51,9 @@ pub struct Admission {
 struct Inner {
     limits: AdmissionLimits,
     open: Mutex<Open>,
+    /// Peers whose PROXY protocol header is believed (see
+    /// [`crate::transport::proxy_protocol`]).
+    proxy_protocol_from: crate::clientip::TrustedProxies,
 }
 
 #[derive(Debug, Default)]
@@ -71,7 +74,50 @@ impl Admission {
             inner: Arc::new(Inner {
                 limits,
                 open: Mutex::new(Open::default()),
+                proxy_protocol_from: crate::clientip::TrustedProxies::default(),
             }),
+        }
+    }
+
+    /// Believe PROXY protocol headers from these peers (a TCP proxy or load
+    /// balancer in front of the server). Call before sharing the instance.
+    pub fn with_proxy_protocol_from(self, proxies: crate::clientip::TrustedProxies) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                limits: self.inner.limits,
+                open: Mutex::new(Open::default()),
+                proxy_protocol_from: proxies,
+            }),
+        }
+    }
+
+    /// For a freshly accepted connection: the real client address (from a
+    /// trusted proxy's PROXY header, else the peer itself) and a slot for
+    /// it. `None` means drop the connection (limit reached, or a malformed
+    /// header) -- already logged.
+    pub async fn admit_stream(
+        &self,
+        stream: &mut tokio::net::TcpStream,
+        peer: SocketAddr,
+    ) -> Option<(SocketAddr, Permit)> {
+        let client = if self.inner.proxy_protocol_from.contains(peer.ip()) {
+            match crate::transport::proxy_protocol::read_header(stream, self.handshake_timeout()).await {
+                Ok(Some(client)) => client,
+                Ok(None) => peer,
+                Err(error) => {
+                    tracing::warn!(%peer, %error, "dropping connection with a bad PROXY protocol header");
+                    return None;
+                }
+            }
+        } else {
+            peer
+        };
+        match self.admit(client.ip()) {
+            Some(permit) => Some((client, permit)),
+            None => {
+                tracing::warn!(%client, "connection limit reached, refusing connection");
+                None
+            }
         }
     }
 
