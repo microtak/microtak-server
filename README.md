@@ -333,6 +333,18 @@ cargo test --test blackbox
 its `server_names`). CI runs it against the Docker image on amd64 and
 arm64.
 
+### Coverage
+
+```sh
+cargo install cargo-llvm-cov --locked   # once; needs `rustup component add llvm-tools-preview`
+cargo llvm-cov --open             # HTML report
+cargo llvm-cov --summary-only     # per-file table
+```
+
+CI's **Code coverage** job runs the same on every push and pull request:
+the per-file table is in the run's summary, `lcov.info` is attached as the
+`coverage-lcov` artifact. On 2026-10-17: 92.6 % of lines, 90.3 % of functions, including the black-box suite (child processes are measured too).
+
 ## Contributing
 
 Contributions are welcome; please keep to the official TAK Server's
