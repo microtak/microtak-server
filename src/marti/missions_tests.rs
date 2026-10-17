@@ -595,3 +595,119 @@ async fn a_subscription_token_carries_its_own_role() {
     let reply = h.call("PUT", "/Marti/api/missions/Secret/password?password=x", "visitor", &[("MissionAuthorization", &auth)], "").await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
 }
+
+// --- notifications (`DistributedSubscriptionManager`) ------------------------------------------
+
+fn harness_with_hub() -> (Harness, tokio::sync::broadcast::Receiver<crate::transport::hub::Outbound>) {
+    let (tx, rx) = tokio::sync::broadcast::channel(64);
+    let mut state = MissionsState::with_hub(tx);
+    state.admin_common_name = Some("admin".into());
+    let app = router_with(state.clone());
+    (Harness { state, app }, rx)
+}
+
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<crate::transport::hub::Outbound>) -> Vec<crate::transport::hub::Outbound> {
+    let mut out = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        out.push(m);
+    }
+    out
+}
+
+fn cot_type(xml: &str) -> String {
+    let start = xml.find(r#"type=""#).unwrap() + 6;
+    xml[start..start + xml[start..].find('"').unwrap()].to_string()
+}
+
+/// Create and delete are announced to everyone the mission's groups reach,
+/// except the author (`broadcastMissionAnnouncement`).
+#[tokio::test]
+async fn create_and_delete_are_broadcast() {
+    let (h, mut rx) = harness_with_hub();
+    let (_, token) = h.create("Ops", "jz", "").await;
+    let sent = drain(&mut rx);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(cot_type(&sent[0].xml), "t-x-m-n");
+    assert!(sent[0].xml.contains(r#"<mission type="CREATE" tool="public" name="Ops""#), "{}", sent[0].xml);
+    assert!(sent[0].dest_uids.is_none(), "a broadcast");
+    assert_eq!(sent[0].origin, crate::transport::hub::Origin::Server { skip_uid: Some("ANDROID-jz".into()) });
+
+    h.call("DELETE", "/Marti/api/missions/Ops?creatorUid=ANDROID-jz", "jz", &[("MissionAuthorization", &bearer(&token))], "").await;
+    let sent = drain(&mut rx);
+    assert_eq!(cot_type(&sent[0].xml), "t-x-m-d");
+}
+
+/// Content changes go to live subscribers, one `t-x-m-c` per change, with
+/// the change as `<MissionChanges>`; unsubscribing ends it.
+#[tokio::test]
+async fn content_changes_go_to_live_subscribers() {
+    let (h, mut rx) = harness_with_hub();
+    h.create("Ops", "jz", "").await;
+    h.call("PUT", "/Marti/api/missions/Ops/subscription?uid=ANDROID-B", "bee", &[], "").await;
+    drain(&mut rx);
+
+    h.call("PUT", "/Marti/api/missions/Ops/contents?creatorUid=ANDROID-jz", "jz", &[], r#"{"uids":["u-1","u-2"]}"#).await;
+    let sent = drain(&mut rx);
+    assert_eq!(sent.len(), 2, "one per change");
+    for (m, uid) in sent.iter().zip(["u-1", "u-2"]) {
+        assert_eq!(cot_type(&m.xml), "t-x-m-c");
+        assert!(m.dest_uids.as_deref().unwrap().contains(&"ANDROID-jz".to_string()), "the creator's own subscription");
+        assert!(m.dest_uids.as_deref().unwrap().contains(&"ANDROID-B".to_string()));
+        assert!(m.xml.contains(&format!("<MissionChanges><MissionChange><contentUid>{uid}</contentUid><creatorUid>ANDROID-jz</creatorUid>")), "{}", m.xml);
+        assert!(m.xml.contains("<type>ADD_CONTENT</type>"));
+    }
+
+    h.call("DELETE", "/Marti/api/missions/Ops/subscription?uid=ANDROID-B", "bee", &[], "").await;
+    h.call("DELETE", "/Marti/api/missions/Ops/contents?uid=u-1&creatorUid=ANDROID-jz", "jz", &[], "").await;
+    let sent = drain(&mut rx);
+    assert_eq!(sent.len(), 1);
+    assert!(!sent[0].dest_uids.as_deref().unwrap().contains(&"ANDROID-B".to_string()), "disconnected");
+    assert!(sent[0].xml.contains("<type>REMOVE_CONTENT</type>"));
+}
+
+#[tokio::test]
+async fn logs_and_keywords_are_announced() {
+    let (h, mut rx) = harness_with_hub();
+    h.create("Ops", "jz", "").await;
+    h.call("PUT", "/Marti/api/missions/Ops/subscription?uid=ANDROID-B", "bee", &[], "").await;
+    drain(&mut rx);
+
+    h.call("POST", "/Marti/api/missions/logs/entries", "jz", &[], r#"{"content":"x","creatorUid":"ANDROID-jz","missionNames":["Ops"]}"#).await;
+    h.call("PUT", "/Marti/api/missions/Ops/keywords?creatorUid=ANDROID-jz", "jz", &[], r#"["k"]"#).await;
+    h.call("PUT", "/Marti/api/missions/Ops/uid/u-1/keywords?creatorUid=ANDROID-jz", "jz", &[], r#"["a","b"]"#).await;
+    h.call("DELETE", "/Marti/api/missions/Ops/content/abc/keywords?creatorUid=ANDROID-jz", "jz", &[], "").await;
+    let sent = drain(&mut rx);
+    let types: Vec<String> = sent.iter().map(|m| cot_type(&m.xml)).collect();
+    assert_eq!(types, ["t-x-m-c-l", "t-x-m-c-k", "t-x-m-c-k-u", "t-x-m-c-k-c"]);
+    assert!(sent[1].dest_uids.is_none(), "mission keywords are broadcast");
+    assert!(sent[2].xml.contains(r#"<uidKeywords uid="u-1"><uidKeyword keyword="a"/><uidKeyword keyword="b"/></uidKeywords>"#));
+    assert!(sent[3].xml.contains("<contentKeywords/>"));
+}
+
+/// Invitations (`t-x-m-i`, with the token and role) and role changes
+/// (`t-x-m-r`) go to the client concerned; a duplicate invitation is 500.
+#[tokio::test]
+async fn invitations_and_role_changes_are_sent_to_the_client() {
+    let (h, mut rx) = harness_with_hub();
+    let (_, owner) = h.create("Ops", "jz", "&defaultRole=MISSION_SUBSCRIBER").await;
+    let auth = bearer(&owner);
+    drain(&mut rx);
+    let reply = h.call("PUT", "/Marti/api/missions/Ops/invite/clientUid/ANDROID-C?creatorUid=ANDROID-jz", "jz", &[("MissionAuthorization", &auth)], "").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let sent = drain(&mut rx);
+    assert_eq!(cot_type(&sent[0].xml), "t-x-m-i");
+    assert_eq!(sent[0].dest_uids.as_deref(), Some(&["ANDROID-C".to_string()][..]));
+    let invitation = h.get("/Marti/api/missions/Ops/invitations", "jz").await.data()[0].clone();
+    assert!(sent[0].xml.contains(&format!(r#"token="{}""#, invitation["token"].as_str().unwrap())));
+    assert!(sent[0].xml.contains(r#"<role type="MISSION_SUBSCRIBER"><permissions><permission type="MISSION_READ"/><permission type="MISSION_WRITE"/></permissions></role>"#));
+    let again = h.call("PUT", "/Marti/api/missions/Ops/invite/clientUid/ANDROID-C?creatorUid=ANDROID-jz", "jz", &[("MissionAuthorization", &auth)], "").await;
+    assert_eq!(again.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    h.call("PUT", "/Marti/api/missions/Ops/subscription?uid=ANDROID-D", "dee", &[], "").await;
+    drain(&mut rx);
+    h.call("PUT", "/Marti/api/missions/Ops/role?clientUid=ANDROID-D&role=MISSION_OWNER", "jz", &[("MissionAuthorization", &auth)], "").await;
+    let sent = drain(&mut rx);
+    assert_eq!(cot_type(&sent[0].xml), "t-x-m-r");
+    assert_eq!(sent[0].dest_uids.as_deref(), Some(&["ANDROID-D".to_string()][..]));
+    assert!(sent[0].xml.contains(r#"<role type="MISSION_OWNER">"#));
+}

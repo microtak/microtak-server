@@ -436,6 +436,13 @@ impl App {
             admin_common_name: config.admin_common_name.clone(),
         };
         Arc::clone(&latest_cot).spawn_feed(hub.subscribe());
+        let mission_notifier = Arc::new(crate::marti::mission_notify::MissionNotifier::new(
+            hub.sender(),
+            Arc::clone(&missions),
+            Arc::clone(&resources),
+            Arc::clone(&latest_cot),
+            Arc::clone(&groups),
+        ));
         let marti_router = missions_api::router_with(missions_api::MissionsState {
             store: Arc::clone(&missions),
             groups: Arc::clone(&groups),
@@ -443,6 +450,8 @@ impl App {
             tokens: mission_tokens,
             resources: Arc::clone(&resources),
             latest_cot,
+            notifier: Arc::clone(&mission_notifier),
+            clients: clients.clone(),
         })
             .merge(client_endpoints::router(clients.clone()))
             .merge(content_api::router(content_api::SyncState {
@@ -483,7 +492,8 @@ impl App {
         )
         .await?
         .with_groups(Arc::clone(&groups))
-        .with_admission(admission);
+        .with_admission(admission)
+        .with_missions(mission_notifier);
 
         if config.backup.enabled {
             let offsite = OffsiteTarget::new(config.backup.offsite_command.clone());

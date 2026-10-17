@@ -156,11 +156,13 @@ async fn handle_client(
                                     // broadcast channel (no subscribers at
                                     // all) is not an error for the sender.
                                     crate::metrics::inc(&crate::metrics::COUNTERS.cot_events_tcp);
+                                    let xml = crate::cot::strip_marti(&xml).into_owned();
                                     let _ = tx.send(Outbound {
                                         sender: peer,
                                         xml: xml.into(),
                                         dest_uids,
                                         groups: Arc::new(groups.active_groups(None, Direction::In)),
+                                        origin: crate::transport::hub::Origin::Client,
                                     });
                                 }
                                 DecodedItem::Skipped { error, .. } => {

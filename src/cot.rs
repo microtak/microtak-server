@@ -177,6 +177,11 @@ pub struct Dest {
     pub uid: Option<String>,
     #[serde(rename = "@callsign", skip_serializing_if = "Option::is_none", default)]
     pub callsign: Option<String>,
+    /// Streaming mission content (`StreamingEndpointRewriteFilter.MISSION_ATTR`).
+    #[serde(rename = "@mission", skip_serializing_if = "Option::is_none", default)]
+    pub mission: Option<String>,
+    #[serde(rename = "@mission-guid", skip_serializing_if = "Option::is_none", default)]
+    pub mission_guid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,6 +225,43 @@ fn cot_time(unix_millis: i64) -> String {
         dt.minute(),
         dt.second()
     )
+}
+
+/// The event without its first `/event/detail/marti` element, as the
+/// official server forwards CoT (`StreamingEndpointRewriteFilter` detaches
+/// `MARTI_XPATH` from every streamed event). Unchanged if there is none.
+pub fn strip_marti(xml: &str) -> std::borrow::Cow<'_, str> {
+    use quick_xml::events::Event as X;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut path: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        match reader.read_event() {
+            Ok(X::Start(e)) => {
+                let name = e.name().as_ref().to_vec();
+                if name == b"marti" && path == [b"event".to_vec(), b"detail".to_vec()] {
+                    let end_name = e.name().as_ref().to_vec();
+                    if reader.read_to_end(quick_xml::name::QName(&end_name)).is_err() {
+                        return std::borrow::Cow::Borrowed(xml);
+                    }
+                    let after = reader.buffer_position() as usize;
+                    return std::borrow::Cow::Owned(format!("{}{}", &xml[..before], &xml[after..]));
+                }
+                path.push(name);
+            }
+            Ok(X::Empty(e)) => {
+                if e.name().as_ref() == b"marti" && path == [b"event".to_vec(), b"detail".to_vec()] {
+                    let after = reader.buffer_position() as usize;
+                    return std::borrow::Cow::Owned(format!("{}{}", &xml[..before], &xml[after..]));
+                }
+            }
+            Ok(X::End(_)) => {
+                path.pop();
+            }
+            Ok(X::Eof) | Err(_) => return std::borrow::Cow::Borrowed(xml),
+            Ok(_) => {}
+        }
+    }
 }
 
 /// Now, in Unix milliseconds.
@@ -294,6 +336,17 @@ impl Event {
     /// attributes, unioned). `None` means this event carries no addressing
     /// info at all and should be broadcast, not that it has zero
     /// recipients — see `docs/TEST-PLAN.md` §7/§9 routing rules.
+    /// The missions this event is addressed to (`<marti><dest mission=…>`
+    /// / `mission-guid=…`): (names, guids).
+    pub fn dest_missions(&self) -> (Vec<String>, Vec<String>) {
+        let Some(marti) = self.detail.as_ref().and_then(|d| d.marti.as_ref()) else {
+            return (Vec::new(), Vec::new());
+        };
+        let names = marti.dest.iter().filter_map(|d| d.mission.clone()).collect();
+        let guids = marti.dest.iter().filter(|d| d.mission.is_none()).filter_map(|d| d.mission_guid.clone()).collect();
+        (names, guids)
+    }
+
     pub fn addressed_uids(&self) -> Option<Vec<&str>> {
         let detail = self.detail.as_ref()?;
         let mut uids = Vec::new();
@@ -390,6 +443,27 @@ pub(crate) mod tests {
         assert!(!event.is_control(), "exact types only");
         event.cot_type = "t-x-takp-v".to_string();
         assert!(!event.is_control(), "the server's own version announcement is not in the set");
+    }
+
+    /// `StreamingEndpointRewriteFilter`: the first `/event/detail/marti`
+    /// is removed from forwarded events; nothing else changes.
+    #[test]
+    fn marti_is_stripped_from_forwarded_events() {
+        let xml = r#"<?xml version="1.0"?><event version="2.0" uid="u" type="b-t-f" how="h-g-i-g-o" time="t" start="t" stale="t"><point lat="1" lon="2" hae="0" ce="0" le="0"/><detail><__chat id="c" chatroom="Ops"/><marti><dest uid="A"/><dest mission="Ops"/></marti><remarks>hi</remarks></detail></event>"#;
+        assert_eq!(
+            strip_marti(xml),
+            r#"<?xml version="1.0"?><event version="2.0" uid="u" type="b-t-f" how="h-g-i-g-o" time="t" start="t" stale="t"><point lat="1" lon="2" hae="0" ce="0" le="0"/><detail><__chat id="c" chatroom="Ops"/><remarks>hi</remarks></detail></event>"#
+        );
+        let empty = r#"<event version="2.0" uid="u" type="a" how="h" time="t" start="t" stale="t"><detail><marti/></detail></event>"#;
+        assert_eq!(strip_marti(empty), r#"<event version="2.0" uid="u" type="a" how="h" time="t" start="t" stale="t"><detail></detail></event>"#);
+        let nested = r#"<event version="2.0" uid="u" type="a" how="h" time="t" start="t" stale="t"><detail><link><marti/></link></detail></event>"#;
+        assert!(matches!(strip_marti(nested), std::borrow::Cow::Borrowed(_)), "only /event/detail/marti");
+        let event = Event::from_xml(strip_declaration_for_test(xml)).unwrap();
+        assert_eq!(event.dest_missions(), (vec!["Ops".to_string()], vec![]));
+    }
+
+    fn strip_declaration_for_test(xml: &str) -> &str {
+        &xml[xml.find("<event").unwrap()..]
     }
 
     /// The official pong (`SubmissionService.sendPong`): uid `takPong`,

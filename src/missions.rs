@@ -822,12 +822,20 @@ impl MissionStore {
 
     // --- invitations ------------------------------------------------------
 
-    /// `MissionService.missionInvite`: replaces an existing invitation of
-    /// the same invitee and type.
-    pub fn invite(&self, invitation: InvitationRecord) -> Result<(), MissionError> {
+    /// `MissionService.missionInvite`: `false` (and nothing stored) if the
+    /// same invitee of the same type is already invited -- the official
+    /// unique constraint.
+    pub fn invite(&self, invitation: InvitationRecord) -> Result<bool, MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, &invitation.mission_guid)?;
-        self.record(&mut state, Event::Invited { invitation })
+        let duplicate = state.invitations.iter().any(|i| {
+            i.mission_guid == invitation.mission_guid && i.invitation_type == invitation.invitation_type && i.invitee == invitation.invitee
+        });
+        if duplicate {
+            return Ok(false);
+        }
+        self.record(&mut state, Event::Invited { invitation })?;
+        Ok(true)
     }
 
     pub fn uninvite(&self, guid: &str, invitee: &str, invitation_type: InvitationType) -> Result<(), MissionError> {
@@ -1036,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn invitations_replace_and_match_case_insensitively() {
+    fn invitations_are_unique_and_match_case_insensitively() {
         let store = MissionStore::in_memory();
         let m = new_mission(&store, "Ops", 1_000);
         let invite = |role| InvitationRecord {
@@ -1049,11 +1057,11 @@ mod tests {
             token: format!("{role:?}"),
             role,
         };
-        store.invite(invite(Role::ReadOnlySubscriber)).unwrap();
-        store.invite(invite(Role::Subscriber)).unwrap();
+        assert!(store.invite(invite(Role::ReadOnlySubscriber)).unwrap());
+        assert!(!store.invite(invite(Role::Subscriber)).unwrap(), "a duplicate is refused");
         let found = store.invitations_for("ALPHA", InvitationType::Callsign);
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].role, Role::Subscriber);
+        assert_eq!(found[0].role, Role::ReadOnlySubscriber);
         assert!(store.invitations_for("Alpha", InvitationType::UserName).is_empty());
         store.uninvite(&m.guid, "alpha", InvitationType::Callsign).unwrap();
         assert!(store.invitations(&m.guid).is_empty());

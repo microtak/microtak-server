@@ -119,6 +119,7 @@ pub struct TlsRelay {
     clients: ConnectedClients,
     groups: Arc<GroupStore>,
     admission: Admission,
+    missions: Option<Arc<dyn crate::transport::hub::StreamingMissions>>,
 }
 
 impl TlsRelay {
@@ -138,7 +139,14 @@ impl TlsRelay {
             clients,
             groups: Arc::new(GroupStore::in_memory()),
             admission: Admission::default(),
+            missions: None,
         })
+    }
+
+    /// Route `<marti><dest mission=…>` content through `missions`.
+    pub fn with_missions(mut self, missions: Arc<dyn crate::transport::hub::StreamingMissions>) -> Self {
+        self.missions = Some(missions);
+        self
     }
 
     /// Connection limits and handshake timeout (default:
@@ -175,6 +183,7 @@ impl TlsRelay {
             let registry = Arc::clone(&self.registry);
             let clients = self.clients.clone();
             let groups = Arc::clone(&self.groups);
+            let missions = self.missions.clone();
             tokio::spawn(async move {
                 let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
                     return;
@@ -211,7 +220,7 @@ impl TlsRelay {
                 }
 
                 info!(%peer, cn, "mTLS client connected");
-                handle_client(tls_stream, peer, cn, peer_cert, tx, rx, registry, clients, groups).await;
+                handle_client(tls_stream, peer, cn, peer_cert, tx, rx, registry, clients, groups, missions).await;
             });
         }
     }
@@ -248,7 +257,23 @@ async fn handle_client(
     registry: Arc<DeviceRegistry>,
     clients: ConnectedClients,
     groups: Arc<GroupStore>,
+    missions: Option<Arc<dyn crate::transport::hub::StreamingMissions>>,
 ) {
+    // Whatever ends the session: it leaves its missions' live subscribers
+    // (`missionDisconnect` for every mission of the client uid).
+    struct LeaveMissions<'a> {
+        missions: &'a Option<Arc<dyn crate::transport::hub::StreamingMissions>>,
+        registry: &'a DeviceRegistry,
+        cn: &'a str,
+    }
+    impl Drop for LeaveMissions<'_> {
+        fn drop(&mut self) {
+            if let (Some(missions), Some(uid)) = (self.missions, self.registry.find(self.cn).and_then(|d| d.uid)) {
+                missions.client_disconnected(&uid);
+            }
+        }
+    }
+    let _leave = LeaveMissions { missions: &missions, registry: &registry, cn: &cn };
     clients.register(ClientEndpoint {
         remote_addr: peer,
         transport: Transport::Tls,
@@ -328,16 +353,32 @@ async fn handle_client(
                                     if event.is_situational_awareness() {
                                         clients.set_uid(peer, event.uid.clone());
                                     }
-                                    let dest_uids = event
-                                        .addressed_uids()
-                                        .map(|uids| uids.into_iter().map(String::from).collect::<Vec<_>>().into());
+                                    let mut dest: Vec<String> =
+                                        event.addressed_uids().unwrap_or_default().into_iter().map(String::from).collect();
+                                    let (mission_names, mission_guids) = event.dest_missions();
+                                    if let Some(missions) = &missions
+                                        && !(mission_names.is_empty() && mission_guids.is_empty())
+                                    {
+                                        let my_uid = registry.find(&cn).and_then(|d| d.uid);
+                                        for uid in missions.route(my_uid.as_deref(), &cn, &mission_names, &mission_guids, &event.uid) {
+                                            if !dest.contains(&uid) {
+                                                dest.push(uid);
+                                            }
+                                        }
+                                    }
+                                    // No recipients from the dests: routed like any
+                                    // other event (no explicit uids).
+                                    let dest_uids = (!dest.is_empty()).then(|| dest.into());
                                     crate::metrics::inc(&crate::metrics::COUNTERS.cot_events_tls);
-                                    // Relay the event as received (see `DecodedItem::Event`).
+                                    // Relayed without its `<marti>` element, as the
+                                    // official server forwards streamed CoT.
+                                    let xml = crate::cot::strip_marti(&xml).into_owned();
                                     let _ = tx.send(Outbound {
                                         sender: peer,
                                         xml: xml.into(),
                                         dest_uids,
                                         groups: Arc::new(groups.active_groups(Some(&cn), Direction::In)),
+                                        origin: crate::transport::hub::Origin::Client,
                                     });
                                 },
                                 DecodedItem::Skipped { error, .. } => {

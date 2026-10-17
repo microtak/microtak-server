@@ -457,6 +457,73 @@ async fn e2e_official_mission_lifecycle() {
     assert_eq!(gone.status(), 410);
 }
 
+/// One enrolled device used like ATAK uses it: the same certificate for
+/// its CoT stream (after a position report binds its uid) and the Marti API.
+async fn device(enrollment: &str, cn: &str, uid: &str, mtls_addr: SocketAddr, marti_api_addr: SocketAddr, ca_cert_pem: &str) -> (TlsStream<TcpStream>, reqwest::Client) {
+    let (cert, key) = enroll(enrollment, cn).await;
+    let key_again = rcgen::KeyPair::from_pem(&key.serialize_pem()).unwrap();
+    let mut stream = connect_mtls(mtls_addr, ca_cert_pem, &cert, key).await.unwrap();
+    stream.write_all(event_xml(uid).as_bytes()).await.unwrap();
+    let http = mtls_reqwest_client(ca_cert_pem, &cert, key_again, marti_api_addr);
+    (stream, http)
+}
+
+/// Mission notifications and streaming mission content over the wire, as
+/// the official server does them: a live subscriber gets `t-x-m-c` for
+/// content added through the API; a subscriber's marker sent with
+/// `<marti><dest mission=…>` joins the mission and goes only to the
+/// mission's live subscribers, without its `<marti>`.
+#[tokio::test]
+async fn e2e_mission_notifications_and_streaming_content() {
+    let app = App::bind(test_config()).await.unwrap();
+    let enrollment = format!("https://{}", app.enrollment_addr().unwrap());
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let mtls_addr = app.mtls_addr().unwrap();
+    let ca = app.ca_cert_pem.clone();
+    tokio::spawn(app.run());
+    let base = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
+
+    let (mut lead, lead_http) = device(&enrollment, "lead", "ANDROID-LEAD", mtls_addr, marti_api_addr, &ca).await;
+    let (mut member, member_http) = device(&enrollment, "member", "ANDROID-MEMBER", mtls_addr, marti_api_addr, &ca).await;
+    let (mut outsider, _) = device(&enrollment, "outsider", "ANDROID-OUT", mtls_addr, marti_api_addr, &ca).await;
+    // Let the position reports bind the uids, then clear what was relayed.
+    for stream in [&mut lead, &mut member, &mut outsider] {
+        receives_within(stream, "never-there", Duration::from_millis(300)).await;
+    }
+
+    let created = lead_http.put(format!("{base}/Marti/api/missions/Ops?creatorUid=ANDROID-LEAD")).send().await.unwrap();
+    assert_eq!(created.status(), 201);
+    let announced = read_until_contains(&mut member, "t-x-m-n").await;
+    assert!(announced.contains(r#"<mission type="CREATE" tool="public" name="Ops""#), "{announced}");
+    assert!(!receives_within(&mut lead, "t-x-m-n", Duration::from_millis(300)).await, "not to the author");
+
+    let sub = member_http.put(format!("{base}/Marti/api/missions/Ops/subscription?uid=ANDROID-MEMBER")).send().await.unwrap();
+    assert_eq!(sub.status(), 201);
+
+    lead_http
+        .put(format!("{base}/Marti/api/missions/Ops/contents?creatorUid=ANDROID-LEAD"))
+        .json(&serde_json::json!({ "uids": ["pin-1"] }))
+        .send()
+        .await
+        .unwrap();
+    let change = read_until_contains(&mut member, "</event>").await;
+    assert!(change.contains(r#"type="t-x-m-c""#) && change.contains("<contentUid>pin-1</contentUid>"), "{change}");
+    assert!(!receives_within(&mut outsider, "t-x-m-c", Duration::from_millis(300)).await, "not a subscriber");
+
+    // Streaming content: the lead (owner) sends a marker into the mission.
+    let streamed = marker_xml("marker-stream", "ANDROID-LEAD").replace("</detail>", r#"<marti><dest mission="Ops"/></marti></detail>"#);
+    lead.write_all(streamed.as_bytes()).await.unwrap();
+    let got = read_until_contains(&mut member, r#"uid="marker-stream""#).await;
+    let event_start = got.find(r#"uid="marker-stream""#).unwrap();
+    let event = &got[event_start..got[event_start..].find("</event>").unwrap() + event_start];
+    assert!(!event.contains("<marti"), "forwarded without <marti>: {event}");
+    assert!(!receives_within(&mut outsider, "marker-stream", Duration::from_millis(300)).await, "only to the mission's subscribers");
+
+    let mission: serde_json::Value = lead_http.get(format!("{base}/Marti/api/missions/Ops")).send().await.unwrap().json().await.unwrap();
+    let uids: Vec<&str> = mission["data"][0]["uids"].as_array().unwrap().iter().map(|u| u["data"].as_str().unwrap()).collect();
+    assert_eq!(uids, ["pin-1", "marker-stream"]);
+}
+
 /// Roles come from mission tokens, not certificates: a password-protected
 /// mission is closed to a device until it presents the password, which
 /// yields an ACCESS token.

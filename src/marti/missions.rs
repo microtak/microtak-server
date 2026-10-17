@@ -17,7 +17,8 @@
 //!   (the admin sees all); `__ANON__` alone at create means the caller's
 //!   own groups.
 //!
-//! Mission change announcements (CoT to subscribers) are not sent yet.
+//! Changes are announced to subscribers as the official server does
+//! ([`super::mission_notify`]).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -31,6 +32,7 @@ use axum::{Extension, Json, Router};
 use serde_json::{json, Value};
 
 use super::envelope::{api_response, cot_date_millis, random_uuid};
+use super::mission_notify::{Announcement, ChangeKind, MissionNotifier};
 use super::mission_token::{MissionTokenSigner, TokenType};
 use super::PeerIdentity;
 use crate::groups::GroupStore;
@@ -40,6 +42,7 @@ use crate::missions::{
     MissionRecord, MissionStore, NewMission, Permission, Role, SubscriptionRecord, Window,
 };
 use crate::sync::ResourceStore;
+use crate::transport::connections::ConnectedClients;
 
 #[derive(Clone)]
 pub struct MissionsState {
@@ -49,18 +52,38 @@ pub struct MissionsState {
     pub tokens: Arc<MissionTokenSigner>,
     pub resources: Arc<ResourceStore>,
     pub latest_cot: Arc<LatestCot>,
+    pub notifier: Arc<MissionNotifier>,
+    pub clients: ConnectedClients,
 }
 
 impl MissionsState {
     /// No groups, no admin, fresh keys -- for tests.
     pub fn in_memory() -> Self {
+        Self::with_hub(tokio::sync::broadcast::channel(64).0)
+    }
+
+    /// In memory, notifications going to `hub` -- for tests.
+    pub fn with_hub(hub: tokio::sync::broadcast::Sender<crate::transport::hub::Outbound>) -> Self {
+        let store = Arc::new(MissionStore::in_memory());
+        let groups = Arc::new(GroupStore::in_memory());
+        let resources = Arc::new(ResourceStore::in_memory());
+        let latest_cot = Arc::new(LatestCot::in_memory());
+        let notifier = Arc::new(MissionNotifier::new(
+            hub,
+            Arc::clone(&store),
+            Arc::clone(&resources),
+            Arc::clone(&latest_cot),
+            Arc::clone(&groups),
+        ));
         Self {
-            store: Arc::new(MissionStore::in_memory()),
-            groups: Arc::new(GroupStore::in_memory()),
+            store,
+            groups,
             admin_common_name: None,
             tokens: Arc::new(MissionTokenSigner::generate()),
-            resources: Arc::new(ResourceStore::in_memory()),
-            latest_cot: Arc::new(LatestCot::in_memory()),
+            resources,
+            latest_cot,
+            notifier,
+            clients: ConnectedClients::new(),
         }
     }
 }
@@ -828,6 +851,9 @@ async fn create_impl(
             })?;
             let extras = MissionExtras { token: Some(owner.token), owner_role: Some(Role::Owner), details: true, ..Default::default() };
             let json = mission_json(&state, &mission, &groups_seen(&caller, &mission), extras);
+            // `missionSubscribe` also makes the creator a live subscriber.
+            state.notifier.connect(&mission.guid, &request.creator_uid);
+            state.notifier.broadcast(&mission, Announcement::Create, &request.creator_uid);
             created("Mission", json!([json]))
         }
     }
@@ -887,6 +913,13 @@ fn update_existing(
         state.store.set_groups(&mission.guid, groups, now)?;
     }
     let updated = state.store.by_guid(&mission.guid).ok_or(ApiError::Internal)?;
+    if updated.fields != mission.fields
+        || updated.password_hash != mission.password_hash
+        || updated.default_role != mission.default_role
+        || updated.groups != mission.groups
+    {
+        state.notifier.broadcast(&updated, Announcement::Metadata, &request.creator_uid);
+    }
     let json = mission_json(state, &updated, &updated.groups, MissionExtras { details: true, ..Default::default() });
     ok("Mission", json!([json]))
 }
@@ -928,6 +961,7 @@ fn delete_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, p
         )));
     }
     let deleted = state.store.delete(&mission.guid, &params.string("creatorUid"), now_ms())?;
+    state.notifier.broadcast(&deleted, Announcement::Delete, &params.string("creatorUid"));
     let json = mission_json(state, &deleted, &groups_seen(caller, &deleted), MissionExtras::default());
     ok("Mission", json!([json]))
 }
@@ -975,16 +1009,20 @@ fn add_contents_impl(state: &MissionsState, caller: &Caller, mission: MissionRec
     }
     let creator = params.string("creatorUid");
     let now = now_ms();
+    let mut added = 0;
     for hash in hashes {
         // `getCachedResourcesByHash`: unknown hashes are skipped.
         if !state.resources.by_hash(&hash, None).is_empty() {
             state.store.add_content(&mission.guid, Content::Hash(hash), &creator, now)?;
+            added += 1;
         }
     }
     for uid in uids {
         state.store.add_content(&mission.guid, Content::Uid(uid), &creator, now)?;
+        added += 1;
     }
     let updated = state.store.by_guid(&mission.guid).ok_or(ApiError::Internal)?;
+    announce_latest_changes(state, &updated, added, &creator)?;
     // The official response copies the mission and clears its groups.
     let json = mission_json(state, &updated, &BTreeSet::new(), MissionExtras::default());
     ok("Mission", json!([json]))
@@ -1020,13 +1058,17 @@ fn remove_content_impl(state: &MissionsState, caller: &Caller, mission: MissionR
     require(role_for(state, &mission, caller), Permission::MissionWrite)?;
     let creator = params.string("creatorUid");
     let now = now_ms();
+    let mut removed = 0;
     if let Some(hash) = params.get("hash").filter(|h| !h.is_empty()) {
         state.store.remove_content(&mission.guid, Content::Hash(hash.to_string()), &creator, now)?;
+        removed += 1;
     }
     if let Some(uid) = params.get("uid").filter(|u| !u.is_empty()) {
         state.store.remove_content(&mission.guid, Content::Uid(uid.to_string()), &creator, now)?;
+        removed += 1;
     }
     let updated = state.store.by_guid(&mission.guid).ok_or(ApiError::Internal)?;
+    announce_latest_changes(state, &updated, removed, &creator)?;
     let json = mission_json(state, &updated, &groups_seen(caller, &updated), MissionExtras::default());
     ok("Mission", json!([json]))
 }
@@ -1053,6 +1095,17 @@ async fn remove_content_by_guid(
     let caller = caller(&state, &identity, &headers);
     let mission = existing(&state, &caller, Key::Guid(&guid))?;
     remove_content_impl(&state, &caller, mission, &Params::parse(query)?)
+}
+
+/// Announces the mission's `count` newest changes, oldest first.
+fn announce_latest_changes(state: &MissionsState, mission: &MissionRecord, count: usize, creator: &str) -> Result<(), ApiError> {
+    if count == 0 {
+        return Ok(());
+    }
+    let mut latest: Vec<ChangeRecord> = state.store.changes(&mission.guid, Window::ALL, false)?.into_iter().take(count).collect();
+    latest.reverse();
+    state.notifier.announce_content(mission, &latest, creator);
+    Ok(())
 }
 
 // --- changes ------------------------------------------------------------------------
@@ -1114,10 +1167,12 @@ async fn set_keywords(
     Extension(identity): Extension<PeerIdentity>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    RawQuery(query): RawQuery,
     body: Bytes,
 ) -> ApiResult {
     let (caller, mission) = writable_by_name(&state, &identity, &headers, &name)?;
     state.store.set_keywords(&mission.guid, keyword_list(&body)?.into_iter().collect(), now_ms())?;
+    state.notifier.broadcast(&mission, Announcement::Keyword, &Params::parse(query)?.string("creatorUid"));
     mission_response(&state, &caller, &mission.guid)
 }
 
@@ -1126,9 +1181,11 @@ async fn clear_keywords(
     Extension(identity): Extension<PeerIdentity>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> ApiResult {
     let (caller, mission) = writable_by_name(&state, &identity, &headers, &name)?;
     state.store.set_keywords(&mission.guid, BTreeSet::new(), now_ms())?;
+    state.notifier.broadcast(&mission, Announcement::Keyword, &Params::parse(query)?.string("creatorUid"));
     mission_response(&state, &caller, &mission.guid)
 }
 
@@ -1137,6 +1194,7 @@ async fn remove_keyword(
     Extension(identity): Extension<PeerIdentity>,
     headers: HeaderMap,
     Path((name, keyword)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
 ) -> ApiResult {
     let (caller, mission) = writable_by_name(&state, &identity, &headers, &name)?;
     let mut keywords = mission.keywords.clone();
@@ -1144,16 +1202,54 @@ async fn remove_keyword(
         return Err(ApiError::BadRequest(format!("mission '{name}' did not contain keyword {keyword}")));
     }
     state.store.set_keywords(&mission.guid, keywords, now_ms())?;
+    state.notifier.broadcast(&mission, Announcement::Keyword, &Params::parse(query)?.string("creatorUid"));
     mission_response(&state, &caller, &mission.guid)
 }
 
-async fn set_content_keywords_impl(state: MissionsState, identity: PeerIdentity, headers: HeaderMap, name: String, content: Content, body: Bytes) -> ApiResult {
+/// The change XML of `addUidKeyword` / `addContentKeyword` (as dom4j
+/// re-serializes it into the notification); `None` keywords = cleared.
+fn content_keywords_xml(content: &Content, keywords: Option<&[String]>) -> String {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('"', "&quot;");
+    match (content, keywords) {
+        (Content::Uid(uid), Some(k)) => format!(
+            r#"<uidKeywords uid="{}">{}</uidKeywords>"#,
+            esc(uid),
+            k.iter().map(|k| format!(r#"<uidKeyword keyword="{}"/>"#, esc(k))).collect::<String>()
+        ),
+        (Content::Uid(uid), None) => format!(r#"<uidKeywords uid="{}"/>"#, esc(uid)),
+        (Content::Hash(hash), Some(k)) => format!(
+            r#"<contentKeywords hash="{}">{}</contentKeywords>"#,
+            esc(hash),
+            k.iter().map(|k| format!(r#"<contentKeyword keyword="{}"/>"#, esc(k))).collect::<String>()
+        ),
+        (Content::Hash(_), None) => "<contentKeywords/>".to_string(),
+    }
+}
+
+fn content_keyword_kind(content: &Content) -> ChangeKind {
+    match content {
+        Content::Uid(_) => ChangeKind::UidKeyword,
+        Content::Hash(_) => ChangeKind::ResourceKeyword,
+    }
+}
+
+async fn set_content_keywords_impl(state: MissionsState, identity: PeerIdentity, headers: HeaderMap, name: String, content: Content, query: Option<String>, body: Bytes) -> ApiResult {
     let (_, mission) = writable_by_name(&state, &identity, &headers, &name)?;
     let keywords = keyword_list(&body)?;
     if keywords.is_empty() {
         return Err(ApiError::BadRequest("empty keywords array".into()));
     }
-    state.store.set_content_keywords(&mission.guid, content, keywords)?;
+    state.store.set_content_keywords(&mission.guid, content.clone(), keywords.clone())?;
+    let xml = content_keywords_xml(&content, Some(&keywords));
+    state.notifier.announce(&mission, content_keyword_kind(&content), &Params::parse(query)?.string("creatorUid"), Some(&xml));
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn clear_content_keywords_impl(state: MissionsState, identity: PeerIdentity, headers: HeaderMap, name: String, content: Content, query: Option<String>) -> ApiResult {
+    let (_, mission) = writable_by_name(&state, &identity, &headers, &name)?;
+    state.store.set_content_keywords(&mission.guid, content.clone(), Vec::new())?;
+    let xml = content_keywords_xml(&content, None);
+    state.notifier.announce(&mission, content_keyword_kind(&content), &Params::parse(query)?.string("creatorUid"), Some(&xml));
     Ok(StatusCode::OK.into_response())
 }
 
@@ -1162,9 +1258,10 @@ async fn set_uid_keywords(
     Extension(identity): Extension<PeerIdentity>,
     headers: HeaderMap,
     Path((name, uid)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
     body: Bytes,
 ) -> ApiResult {
-    set_content_keywords_impl(state, identity, headers, name, Content::Uid(uid), body).await
+    set_content_keywords_impl(state, identity, headers, name, Content::Uid(uid), query, body).await
 }
 
 async fn set_hash_keywords(
@@ -1172,9 +1269,10 @@ async fn set_hash_keywords(
     Extension(identity): Extension<PeerIdentity>,
     headers: HeaderMap,
     Path((name, hash)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
     body: Bytes,
 ) -> ApiResult {
-    set_content_keywords_impl(state, identity, headers, name, Content::Hash(hash), body).await
+    set_content_keywords_impl(state, identity, headers, name, Content::Hash(hash), query, body).await
 }
 
 async fn clear_uid_keywords(
@@ -1182,10 +1280,9 @@ async fn clear_uid_keywords(
     Extension(identity): Extension<PeerIdentity>,
     headers: HeaderMap,
     Path((name, uid)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
 ) -> ApiResult {
-    let (_, mission) = writable_by_name(&state, &identity, &headers, &name)?;
-    state.store.set_content_keywords(&mission.guid, Content::Uid(uid), Vec::new())?;
-    Ok(StatusCode::OK.into_response())
+    clear_content_keywords_impl(state, identity, headers, name, Content::Uid(uid), query).await
 }
 
 async fn clear_hash_keywords(
@@ -1193,10 +1290,9 @@ async fn clear_hash_keywords(
     Extension(identity): Extension<PeerIdentity>,
     headers: HeaderMap,
     Path((name, hash)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
 ) -> ApiResult {
-    let (_, mission) = writable_by_name(&state, &identity, &headers, &name)?;
-    state.store.set_content_keywords(&mission.guid, Content::Hash(hash), Vec::new())?;
-    Ok(StatusCode::OK.into_response())
+    clear_content_keywords_impl(state, identity, headers, name, Content::Hash(hash), query).await
 }
 
 // --- token / password / expiration ---------------------------------------------------------
@@ -1219,7 +1315,7 @@ async fn access_token(
     created("java.lang.String", token.into())
 }
 
-fn set_password_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, password: Option<&str>) -> ApiResult {
+fn set_password_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, password: Option<&str>, params: &Params) -> ApiResult {
     require(role_for(state, &mission, caller), Permission::MissionSetPassword)?;
     let hash = match password {
         // The official PUT hashes whatever it gets, the empty default too.
@@ -1227,6 +1323,7 @@ fn set_password_impl(state: &MissionsState, caller: &Caller, mission: MissionRec
         None => None,
     };
     state.store.set_password(&mission.guid, hash, now_ms())?;
+    state.notifier.broadcast(&mission, Announcement::Metadata, &params.string("creatorUid"));
     Ok(StatusCode::OK.into_response())
 }
 
@@ -1239,8 +1336,9 @@ async fn set_password_by_name(
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
     let mission = existing(&state, &caller, Key::Name(&name))?;
-    let password = Params::parse(query)?.string("password");
-    set_password_impl(&state, &caller, mission, Some(&password))
+    let params = Params::parse(query)?;
+    let password = params.string("password");
+    set_password_impl(&state, &caller, mission, Some(&password), &params)
 }
 
 async fn set_password_by_guid(
@@ -1252,8 +1350,9 @@ async fn set_password_by_guid(
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
     let mission = existing(&state, &caller, Key::Guid(&guid))?;
-    let password = Params::parse(query)?.string("password");
-    set_password_impl(&state, &caller, mission, Some(&password))
+    let params = Params::parse(query)?;
+    let password = params.string("password");
+    set_password_impl(&state, &caller, mission, Some(&password), &params)
 }
 
 async fn remove_password_by_name(
@@ -1261,10 +1360,11 @@ async fn remove_password_by_name(
     Extension(identity): Extension<PeerIdentity>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
     let mission = existing(&state, &caller, Key::Name(&name))?;
-    set_password_impl(&state, &caller, mission, None)
+    set_password_impl(&state, &caller, mission, None, &Params::parse(query)?)
 }
 
 async fn remove_password_by_guid(
@@ -1272,10 +1372,11 @@ async fn remove_password_by_guid(
     Extension(identity): Extension<PeerIdentity>,
     headers: HeaderMap,
     Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> ApiResult {
     let caller = caller(&state, &identity, &headers);
     let mission = existing(&state, &caller, Key::Guid(&guid))?;
-    set_password_impl(&state, &caller, mission, None)
+    set_password_impl(&state, &caller, mission, None, &Params::parse(query)?)
 }
 
 fn set_expiration_impl(state: &MissionsState, mission: MissionRecord, params: &Params) -> ApiResult {
@@ -1382,6 +1483,7 @@ fn subscribe_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord
     let sub = state.store.subscribe(&mission.guid, &client_uid, &caller.username, role, now, |id| {
         tokens.create(id, TokenType::Subscription, &name, &guid, now / 1000)
     })?;
+    state.notifier.connect(&mission.guid, &client_uid);
     // Subscribing consumes the client's clientUid invitation.
     state.store.uninvite(&mission.guid, &uid, InvitationType::ClientUid)?;
     let mission_value = (caller.api_version >= 3).then(|| {
@@ -1426,6 +1528,7 @@ fn unsubscribe_impl(state: &MissionsState, caller: &Caller, mission: MissionReco
     require(role_for(state, &mission, caller), Permission::MissionRead)?;
     let (uid, topic) = (params.string("uid"), params.string("topic"));
     let client_uid = if topic.is_empty() { uid } else { format!("topic:{topic}") };
+    state.notifier.disconnect(&mission.guid, &client_uid);
     if !params.bool("disconnectOnly", true)? {
         state.store.unsubscribe(&mission.guid, &client_uid, Some(&caller.username))?;
     }
@@ -1481,7 +1584,7 @@ fn set_subscription_roles_impl(state: &MissionsState, caller: &Caller, mission: 
             if !username.is_empty() { s.username == username } else { s.client_uid == client_uid }
         });
         if exists {
-            state.store.set_subscription_role(&mission.guid, &client_uid, &username, new_role)?;
+            set_role(state, &mission, &client_uid, &username, Some(new_role))?;
         } else {
             let (invitee, kind) = if !username.is_empty() { (username, InvitationType::UserName) } else { (client_uid, InvitationType::ClientUid) };
             invite_record(state, &mission, &invitee, kind, new_role, &creator, now)?;
@@ -1634,18 +1737,37 @@ fn role_set_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord,
         return Err(ApiError::BadRequest(String::new()));
     }
     let (client_uid, username) = (params.string("clientUid"), params.string("username"));
-    match params.role("role")? {
-        Some(new_role) => {
-            if !may_assign(&mission, role, new_role) {
-                return Err(ApiError::Forbidden(format!("validateRoleAssignment failed! Illegal attempt to assign role {}", new_role.name())));
-            }
-            state.store.set_subscription_role(&mission.guid, &client_uid, &username, new_role)?;
+    let new_role = params.role("role")?;
+    if let Some(new_role) = new_role
+        && !may_assign(&mission, role, new_role)
+    {
+        return Err(ApiError::Forbidden(format!("validateRoleAssignment failed! Illegal attempt to assign role {}", new_role.name())));
+    }
+    set_role(state, &mission, &client_uid, &username, new_role)?;
+    Ok(StatusCode::OK.into_response())
+}
+
+/// `MissionService.setRole`: change the stored role (none = unsubscribe),
+/// then tell the client (`t-x-m-r`) -- for a username, its live connection.
+fn set_role(state: &MissionsState, mission: &MissionRecord, client_uid: &str, username: &str, role: Option<Role>) -> Result<(), ApiError> {
+    match role {
+        Some(role) => {
+            state.store.set_subscription_role(&mission.guid, client_uid, username, role)?;
         }
         None => {
-            state.store.unsubscribe(&mission.guid, &client_uid, Some(&username))?;
+            state.notifier.disconnect(&mission.guid, client_uid);
+            state.store.unsubscribe(&mission.guid, client_uid, Some(username))?;
         }
     }
-    Ok(StatusCode::OK.into_response())
+    let mut target = client_uid.to_string();
+    if !username.is_empty()
+        && let Some(uid) = state.clients.list().into_iter().find(|c| c.common_name.as_deref() == Some(username)).and_then(|c| c.uid) {
+            target = uid;
+        }
+    if !target.is_empty() {
+        state.notifier.role_change(mission, &target, "", role);
+    }
+    Ok(())
 }
 
 async fn set_role_by_name(
@@ -1674,6 +1796,8 @@ async fn set_role_by_guid(
 
 // --- invitations -----------------------------------------------------------------------------
 
+/// `missionInvite`: stores the invitation (`false` for a duplicate) and
+/// sends the invite (`t-x-m-i`) to the invitee's live connections.
 fn invite_record(
     state: &MissionsState,
     mission: &MissionRecord,
@@ -1682,19 +1806,24 @@ fn invite_record(
     role: Role,
     creator: &str,
     now: i64,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     let token = state.tokens.create(&random_uuid(), TokenType::Invitation, &mission.name, &mission.guid, now / 1000);
-    state.store.invite(InvitationRecord {
+    let stored = state.store.invite(InvitationRecord {
         mission_guid: mission.guid.clone(),
         mission_name: mission.name.clone(),
         invitee: invitee.to_string(),
         invitation_type: kind,
         creator_uid: creator.to_string(),
         create_time_ms: now,
-        token,
+        token: token.clone(),
         role,
     })?;
-    Ok(())
+    if stored {
+        let connected: Vec<(Option<String>, Option<String>)> = state.clients.list().into_iter().map(|c| (c.common_name, c.uid)).collect();
+        let uids = state.notifier.invitees(kind, invitee, &connected);
+        state.notifier.invite(mission, uids, creator, &token, role);
+    }
+    Ok(stored)
 }
 
 /// Invitations for the caller: by client uid, by username (and, in the
@@ -1770,7 +1899,10 @@ fn invite_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, k
     if !may_assign(&mission, role_for(state, &mission, caller), invite_role) {
         return Err(ApiError::Forbidden(format!("validateRoleAssignment failed! Illegal attempt to assign role {}", invite_role.name())));
     }
-    invite_record(state, &mission, invitee, kind, invite_role, creator, now_ms())?;
+    if !invite_record(state, &mission, invitee, kind, invite_role, creator, now_ms())? {
+        // A duplicate: the official `missionInvite` returns false → 500.
+        return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
     Ok(StatusCode::OK.into_response())
 }
 
@@ -1870,6 +2002,16 @@ fn check_log_missions(state: &MissionsState, caller: &Caller, names: &[String], 
     Ok(())
 }
 
+/// `addUpdateLogEntry` / `deleteLogEntry`: a `t-x-m-c-l` to each named
+/// mission's live subscribers.
+fn announce_log(state: &MissionsState, caller: &Caller, entry: &LogEntryRecord) {
+    for name in &entry.mission_names {
+        if let Some(mission) = state.store.by_name(name, |m| visible(caller, m)) {
+            state.notifier.announce(&mission, ChangeKind::Log, &entry.creator_uid, None);
+        }
+    }
+}
+
 fn log_entry_from(v: &Value, id: String, server_time_ms: i64) -> Result<LogEntryRecord, ApiError> {
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
     Ok(LogEntryRecord {
@@ -1900,6 +2042,7 @@ async fn post_log_entry(
     let entry = log_entry_from(&v, random_uuid(), now_ms())?;
     check_log_missions(&state, &caller, &entry.mission_names, Permission::MissionWrite)?;
     let saved = state.store.save_log_entry(entry)?;
+    announce_log(&state, &caller, &saved);
     ok("com.bbn.marti.sync.model.LogEntry", log_json(&saved))
 }
 
@@ -1924,6 +2067,7 @@ async fn put_log_entry(
         return Err(ApiError::BadRequest(format!("Log entry {id} not found")));
     }
     let saved = state.store.save_log_entry(entry)?;
+    announce_log(&state, &caller, &saved);
     ok("com.bbn.marti.sync.model.LogEntry", log_json(&saved))
 }
 
@@ -1949,6 +2093,7 @@ async fn delete_log_entry(
     let entry = state.store.log_entry(&id).ok_or_else(|| ApiError::NotFound(format!("log entry {id} not found")))?;
     check_log_missions(&state, &caller, &entry.mission_names, Permission::MissionWrite)?;
     state.store.delete_log_entry(&id)?;
+    announce_log(&state, &caller, &entry);
     Ok(StatusCode::OK.into_response())
 }
 

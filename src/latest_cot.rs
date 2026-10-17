@@ -101,11 +101,12 @@ impl LatestCot {
             loop {
                 tokio::select! {
                     message = rx.recv() => match message {
-                        Ok(message) => {
+                        Ok(message) if message.origin == crate::transport::hub::Origin::Client => {
                             if let Ok(event) = crate::cot::Event::from_xml(strip_declaration(&message.xml)) {
                                 self.record(&event.uid, &message.xml, crate::cot::now_unix_millis());
                             }
                         }
+                        Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     },
