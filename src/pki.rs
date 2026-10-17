@@ -266,6 +266,32 @@ pub fn normalize_fingerprint(hash: &str) -> Option<String> {
     )
 }
 
+/// What the certificate admin API reports about an issued certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertDetails {
+    /// Serial number in lowercase hex without leading zeros (Java's
+    /// `BigInteger.toString(16)`, as the official `TakCert` writes it).
+    pub serial_hex: String,
+    pub issuer_dn: String,
+    pub not_before_unix: i64,
+    pub not_after_unix: i64,
+}
+
+pub fn cert_details(cert_pem: &str) -> Option<CertDetails> {
+    let der = cert_pem_to_der(cert_pem).ok()?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(der.as_ref()).ok()?;
+    let serial = parsed.tbs_certificate.raw_serial();
+    let mut serial_hex: String = serial.iter().map(|b| format!("{b:02x}")).collect();
+    let trimmed = serial_hex.trim_start_matches('0');
+    serial_hex = if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() };
+    Some(CertDetails {
+        serial_hex,
+        issuer_dn: parsed.issuer().to_string(),
+        not_before_unix: parsed.validity().not_before.timestamp(),
+        not_after_unix: parsed.validity().not_after.timestamp(),
+    })
+}
+
 /// Extract the Common Name from a DER-encoded certificate, e.g. an mTLS
 /// peer certificate presented during a handshake. Shared by
 /// `transport::tls` and `marti::MtlsHttpServer` — one identity-extraction

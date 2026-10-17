@@ -317,7 +317,7 @@ See `docs/ARCHITECTURE.md` "Groups". Mutation-tested: 8/8 caught (plus a deliber
 
 ## 24. Certificate revocation and identity blocks (2026-10-17)
 
-Before this, `DeviceRegistry::revoke` existed but nothing called it, revoking a user account left its certificate working, and only the CoT relay checked revocation (at connect). Now two levels (`src/registry.rs` `Access`): **revoke a certificate** by fingerprint (a lost device; the identity can enroll a new one with its password account) and **block an identity** (every certificate, re-enrollment included, until unblocked). Checked on every CoT connection, every Marti API connection *and* request, and live CoT sessions are cut when a revocation lands (registry change signal).
+Before this, `DeviceRegistry::revoke` existed but nothing called it, revoking a user account left its certificate working, and only the CoT relay checked revocation (at connect). Now two levels (`src/registry.rs` `Access`): **revoke a certificate** (official certificate admin API, by id or hash) (a lost device; the identity can enroll a new one with its password account) and **block an identity** (every certificate, re-enrollment included, until unblocked). Checked on every CoT connection, every Marti API connection *and* request, and live CoT sessions are cut when a revocation lands (registry change signal).
 
 | ID | Test |
 |---|---|
@@ -325,6 +325,6 @@ Before this, `DeviceRegistry::revoke` existed but nothing called it, revoking a 
 | TC-REVOKE-02 | `registry::blocking_rejects_every_certificate_until_unblocked`, `unblocking_does_not_revive_a_revoked_certificate`, `e2e_blocking_an_identity_locks_it_out_until_unblocked` |
 | TC-REVOKE-03 | `registry::revocations_are_signalled`, live-session cut in both e2e tests above |
 | TC-REVOKE-04 | `registry::certificate_revocations_and_unblocks_survive_a_reload` |
-| TC-REVOKE-05 | `e2e_device_admin_api_lists_devices_and_is_admin_only` (`GET /Marti/api/admin/devices`, `POST …/:cn/revokeCertificate`, `PUT/DELETE …/:cn/block`) |
-| TC-REVOKE-06 | `e2e_certadmin_revoke_by_hash` (official `DELETE /Marti/api/certadmin/cert/revoke/:hashes`) |
+| TC-REVOKE-05 | `e2e_certadmin_lists_certificates_in_the_official_shape`, `e2e_certadmin_is_admin_only` -- official `CertManagerAdminApi`: envelope, `TakCert` fields, COT dates, active/replaced, unknown hash = 500 |
+| TC-REVOKE-06 | `e2e_certadmin_revokes_and_deletes_by_id` (official `revoke/{ids}`, `download/{ids}` zip, `delete/{ids}`) |
 | TC-REVOKE-07 | `e2e_revoking_a_user_account_revokes_its_certificate` |

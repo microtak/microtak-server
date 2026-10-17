@@ -1692,18 +1692,18 @@ async fn e2e_revoking_a_certificate_cuts_the_device_off_and_it_re_enrolls() {
     let mut live = server.stream(&old_cert, &old_key).await;
     live.write_all(event_xml("ALICE-UID").as_bytes()).await.unwrap();
 
+    // The official certificate admin API: revoke by hash.
+    let hash = pki::fingerprint_sha256_colon_hex(&old_cert).unwrap();
     let response = server
         .admin
-        .post(format!("{}/Marti/api/admin/devices/alice/revokeCertificate", server.api_url))
+        .delete(format!("{}/Marti/api/certadmin/cert/{hash}", server.api_url))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(
-        body["fingerprint"].as_str().unwrap(),
-        pki::fingerprint_sha256_colon_hex(&old_cert).unwrap()
-    );
+    assert_eq!(body["type"], "TakCert");
+    assert_eq!(body["data"]["hash"], hash.as_str());
 
     assert!(closed_within(&mut live, Duration::from_secs(2)).await, "the live CoT session is cut");
     assert!(!server.api_works(&old_cert, &old_key).await, "the revoked cert can't use the API");
@@ -1746,83 +1746,6 @@ async fn e2e_blocking_an_identity_locks_it_out_until_unblocked() {
         .unwrap();
     assert_eq!(unblock.status(), 204);
     assert!(server.api_works(&cert, &key).await, "unblocked: the certificate works again");
-}
-
-/// The device list shows what the admin needs to decide, and only the
-/// admin may see or change it.
-#[tokio::test]
-async fn e2e_device_admin_api_lists_devices_and_is_admin_only() {
-    let server = start_with_admin().await;
-    let password = server.mint_user("carol").await;
-    let (cert, key) = server.enroll_with_password("carol", &password).await.1.unwrap();
-
-    let carol = server.client(&cert, &key);
-    for request in [
-        carol.get(format!("{}/Marti/api/admin/devices", server.api_url)),
-        carol.post(format!("{}/Marti/api/admin/devices/carol/revokeCertificate", server.api_url)),
-        carol.put(format!("{}/Marti/api/admin/devices/carol/block", server.api_url)),
-    ] {
-        assert_eq!(request.send().await.unwrap().status(), 403);
-    }
-
-    let devices: serde_json::Value = server
-        .admin
-        .get(format!("{}/Marti/api/admin/devices", server.api_url))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let entry = devices
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|d| d["commonName"] == "carol")
-        .expect("carol is listed");
-    assert_eq!(entry["blocked"], false);
-    assert_eq!(entry["certificateRevoked"], false);
-    assert_eq!(
-        entry["certificateFingerprint"].as_str().unwrap(),
-        pki::fingerprint_sha256_colon_hex(&cert).unwrap()
-    );
-
-    let missing = server
-        .admin
-        .put(format!("{}/Marti/api/admin/devices/nobody/block", server.api_url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(missing.status(), 404);
-}
-
-/// The official TAK Server's certificate-admin revoke, by fingerprint.
-#[tokio::test]
-async fn e2e_certadmin_revoke_by_hash() {
-    let server = start_with_admin().await;
-    let password = server.mint_user("dave").await;
-    let (cert, key) = server.enroll_with_password("dave", &password).await.1.unwrap();
-    let hash = pki::fingerprint_sha256_colon_hex(&cert).unwrap();
-
-    let response = server
-        .admin
-        .delete(format!("{}/Marti/api/certadmin/cert/revoke/{hash}", server.api_url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    assert!(!server.api_works(&cert, &key).await);
-
-    let lookup: serde_json::Value = server
-        .admin
-        .get(format!("{}/Marti/api/certadmin/cert/{hash}", server.api_url))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(lookup["data"]["revocationDate"].is_string(), "{lookup}");
 }
 
 /// Revoking a password account also revokes the certificate issued to it --
@@ -1926,5 +1849,159 @@ async fn e2e_metrics_report_what_the_server_holds() {
     assert!(text.contains("microtak_build_info{version=\""));
     for gauge in ["microtak_password_accounts", "microtak_groups", "microtak_enrollment_tokens_active", "microtak_certificates_revoked"] {
         assert!(sample(&text, gauge).is_some(), "{gauge} missing");
+    }
+}
+
+// ---------------------------------------------------------------------
+// Official certificate admin API (TAK Server CertManagerAdminApi.java)
+// ---------------------------------------------------------------------
+
+impl Running {
+    /// Enroll `cn` with its password account, passing `clientUid` like ATAK.
+    async fn enroll_with_client_uid(&self, cn: &str, password: &str, client_uid: &str) -> (String, rcgen::KeyPair) {
+        let (csr, key) = pki::build_csr(cn).unwrap();
+        let response = enrollment_client()
+            .post(format!("{}/Marti/api/tls/signClient/v2?clientUid={client_uid}", self.enrollment_url))
+            .basic_auth(cn, Some(password))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(csr)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        (wrap_pem(body["signedCert"].as_str().unwrap()), key)
+    }
+
+    async fn admin_get(&self, path: &str) -> (u16, serde_json::Value) {
+        let response = self.admin.get(format!("{}{path}", self.api_url)).send().await.unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().await.unwrap_or(serde_json::Value::Null))
+    }
+}
+
+/// The official response envelope: {version: "3", type, data, nodeId}.
+fn assert_envelope(body: &serde_json::Value, kind: &str) {
+    assert_eq!(body["version"], "3", "{body}");
+    assert_eq!(body["type"], kind, "{body}");
+    assert!(body["nodeId"].as_str().is_some_and(|id| !id.is_empty()), "{body}");
+}
+
+/// Official COT date format `yyyy-MM-dd'T'HH:mm:ss.S'Z'` (milliseconds
+/// unpadded, as Java's SimpleDateFormat writes them).
+fn is_cot_date(value: &serde_json::Value) -> bool {
+    let Some(s) = value.as_str() else { return false };
+    let Some((secs, millis)) = s.strip_suffix('Z').and_then(|v| v.split_once('.')) else { return false };
+    secs.len() == 19 && !millis.is_empty() && millis.len() <= 3 && millis.chars().all(|c| c.is_ascii_digit())
+}
+
+#[tokio::test]
+async fn e2e_certadmin_lists_certificates_in_the_official_shape() {
+    let server = start_with_admin().await;
+    let password = server.mint_user("alice").await;
+    let (first, _) = server.enroll_with_client_uid("alice", &password, "ANDROID-A").await;
+    let (second, _) = server.enroll_with_client_uid("alice", &password, "ANDROID-A").await;
+
+    let (status, all) = server.admin_get("/Marti/api/certadmin/cert").await;
+    assert_eq!(status, 200);
+    assert_envelope(&all, "TakCert");
+    let alice: Vec<&serde_json::Value> =
+        all["data"].as_array().unwrap().iter().filter(|c| c["userDn"] == "alice").collect();
+    assert_eq!(alice.len(), 2, "both issued certificates are listed: {all}");
+    let cert = alice[0];
+    assert!(cert["id"].is_i64());
+    assert_eq!(cert["hash"], pki::fingerprint_sha256_colon_hex(&first).unwrap().as_str());
+    assert_eq!(cert["clientUid"], "ANDROID-A");
+    assert_eq!(cert["subjectDn"], "CN=alice");
+    assert!(cert["certificate"].as_str().unwrap().contains("BEGIN CERTIFICATE"));
+    assert!(cert["serialNumber"].as_str().unwrap().chars().all(|c| c.is_ascii_hexdigit()));
+    for field in ["issuanceDate", "expirationDate", "effectiveDate"] {
+        assert!(is_cot_date(&cert[field]), "{field}: {}", cert[field]);
+    }
+    assert!(cert.get("revocationDate").is_none(), "null fields are omitted (NON_NULL)");
+
+    let (_, by_user) = server.admin_get("/Marti/api/certadmin/cert?username=alice").await;
+    assert_eq!(by_user["data"].as_array().unwrap().len(), 2);
+
+    // Active = newest per clientUid + user; replaced = the older ones.
+    let (_, active) = server.admin_get("/Marti/api/certadmin/cert/active").await;
+    let second_hash = pki::fingerprint_sha256_colon_hex(&second).unwrap();
+    let active_alice: Vec<_> = active["data"].as_array().unwrap().iter().filter(|c| c["userDn"] == "alice").collect();
+    assert_eq!(active_alice.len(), 1);
+    assert_eq!(active_alice[0]["hash"], second_hash.as_str());
+    let (_, replaced) = server.admin_get("/Marti/api/certadmin/cert/replaced").await;
+    assert!(replaced["data"].as_array().unwrap().iter().any(|c| c["hash"] == cert["hash"]));
+
+    let (status, one) = server.admin_get(&format!("/Marti/api/certadmin/cert/{second_hash}")).await;
+    assert_eq!(status, 200);
+    assert_envelope(&one, "TakCert");
+    assert_eq!(one["data"]["hash"], second_hash.as_str());
+
+    // Unknown hash: the official server answers 500 (clients rely on it).
+    let (status, _) = server.admin_get(&format!("/Marti/api/certadmin/cert/{}", "AB:".repeat(31) + "AB")).await;
+    assert_eq!(status, 500);
+
+    let pem = server
+        .admin
+        .get(format!("{}/Marti/api/certadmin/cert/{second_hash}/download", server.api_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pem.status(), 200);
+    assert!(pem.headers()["content-disposition"].to_str().unwrap().contains("alice_ClientCert.pem"));
+    assert!(pem.text().await.unwrap().contains("BEGIN CERTIFICATE"));
+}
+
+#[tokio::test]
+async fn e2e_certadmin_revokes_and_deletes_by_id() {
+    let server = start_with_admin().await;
+    let password = server.mint_user("bob").await;
+    let (cert, key) = server.enroll_with_client_uid("bob", &password, "IOS-B").await;
+    let hash = pki::fingerprint_sha256_colon_hex(&cert).unwrap();
+    let (_, all) = server.admin_get("/Marti/api/certadmin/cert?username=bob").await;
+    let id = all["data"][0]["id"].as_i64().unwrap();
+    assert!(server.api_works(&cert, &key).await);
+
+    let response = server
+        .admin
+        .delete(format!("{}/Marti/api/certadmin/cert/revoke/{id}", server.api_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(!server.api_works(&cert, &key).await, "revoked by id");
+    let (_, revoked) = server.admin_get("/Marti/api/certadmin/cert/revoked").await;
+    let entry = revoked["data"].as_array().unwrap().iter().find(|c| c["hash"] == hash.as_str()).unwrap();
+    assert!(is_cot_date(&entry["revocationDate"]), "{entry}");
+
+    let zip = server
+        .admin
+        .get(format!("{}/Marti/api/certadmin/cert/download/{id}", server.api_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(zip.headers()["content-type"], "application/zip");
+    assert!(zip.bytes().await.unwrap().starts_with(b"PK\x03\x04"));
+
+    let response = server
+        .admin
+        .delete(format!("{}/Marti/api/certadmin/cert/delete/{id}", server.api_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let (_, after) = server.admin_get("/Marti/api/certadmin/cert?username=bob").await;
+    assert!(after["data"].as_array().unwrap().is_empty(), "{after}");
+}
+
+#[tokio::test]
+async fn e2e_certadmin_is_admin_only() {
+    let server = start_with_admin().await;
+    let password = server.mint_user("carol").await;
+    let (cert, key) = server.enroll_with_password("carol", &password).await.1.unwrap();
+    let carol = server.client(&cert, &key);
+    for path in ["/Marti/api/certadmin/cert", "/Marti/api/certadmin/cert/active", "/Marti/api/certadmin/cert/revoked"] {
+        let status = carol.get(format!("{}{path}", server.api_url)).send().await.unwrap().status();
+        assert_eq!(status, 403, "{path}");
     }
 }

@@ -27,6 +27,7 @@ pub mod servernames;
 pub mod registry;
 pub mod transport;
 pub mod users;
+pub mod zip;
 
 // Planned modules, not yet implemented (see docs/TEST-PLAN.md for the test
 // cases each will need to satisfy before being considered done):

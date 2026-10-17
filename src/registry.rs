@@ -15,7 +15,7 @@
 //! TC-TLS-04 (rejecting a connection that claims a `uid` belonging to a
 //! different, already-enrolled device).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
@@ -70,6 +70,10 @@ enum RegistryEvent {
         common_name: String,
         cert_pem: String,
         at_unix: i64,
+        /// The enrolling client's `clientUid` query parameter (ATAK sends
+        /// its device uid), kept for the certificate admin API.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_uid: Option<String>,
     },
     Revoked {
         common_name: String,
@@ -82,6 +86,13 @@ enum RegistryEvent {
     /// lost device's. The identity stays usable with a new certificate.
     CertRevoked {
         fingerprint: String,
+        /// When (absent in logs written before revocation dates were kept).
+        #[serde(default)]
+        at_unix: i64,
+    },
+    /// Certificate rows removed (official `certadmin/cert/delete/{ids}`).
+    CertDeleted {
+        id: i64,
     },
     /// Lifts a `Revoked` (identity block). Revoked certificates stay revoked.
     Unblocked {
@@ -100,11 +111,25 @@ pub enum Access {
     CertRevoked,
 }
 
+/// One issued certificate -- a row of the official TAK Server's
+/// `certificate` table (`TakCert`). Every enrollment issues one; ids are
+/// assigned in log order, so they are stable across restarts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CertRecord {
+    pub id: i64,
+    pub common_name: String,
+    pub cert_pem: String,
+    pub client_uid: Option<String>,
+    pub issued_at_unix: i64,
+}
+
 #[derive(Debug, Default)]
 struct RegistryState {
     devices: HashMap<String, DeviceRecord>,
-    /// Revoked certificate fingerprints (uppercase colon hex).
-    revoked_certs: HashSet<String>,
+    /// Revoked certificate fingerprints (uppercase colon hex) -> when.
+    revoked_certs: HashMap<String, i64>,
+    certificates: Vec<CertRecord>,
+    next_cert_id: i64,
 }
 
 pub struct DeviceRegistry {
@@ -152,11 +177,24 @@ impl DeviceRegistry {
         cert_pem: &str,
         now_unix: i64,
     ) -> Result<DeviceRecord, RegistryError> {
+        self.enroll_with_client_uid(common_name, cert_pem, now_unix, None)
+    }
+
+    /// [`Self::enroll`], recording the client's `clientUid` with the
+    /// issued certificate.
+    pub fn enroll_with_client_uid(
+        &self,
+        common_name: &str,
+        cert_pem: &str,
+        now_unix: i64,
+        client_uid: Option<&str>,
+    ) -> Result<DeviceRecord, RegistryError> {
         let mut state = self.state.write().unwrap();
         let event = RegistryEvent::Enrolled {
             common_name: common_name.to_string(),
             cert_pem: cert_pem.to_string(),
             at_unix: now_unix,
+            client_uid: client_uid.map(str::to_string),
         };
         if let Some(log) = &self.log {
             log.append(&event)?;
@@ -178,6 +216,17 @@ impl DeviceRegistry {
         cert_pem: &str,
         now_unix: i64,
     ) -> Result<DeviceRecord, RegistryError> {
+        self.enroll_new_with_client_uid(common_name, cert_pem, now_unix, None)
+    }
+
+    /// [`Self::enroll_new`], recording the client's `clientUid`.
+    pub fn enroll_new_with_client_uid(
+        &self,
+        common_name: &str,
+        cert_pem: &str,
+        now_unix: i64,
+        client_uid: Option<&str>,
+    ) -> Result<DeviceRecord, RegistryError> {
         let mut state = self.state.write().unwrap();
         if state.devices.contains_key(common_name) {
             return Err(RegistryError::AlreadyEnrolled(common_name.to_string()));
@@ -186,6 +235,7 @@ impl DeviceRegistry {
             common_name: common_name.to_string(),
             cert_pem: cert_pem.to_string(),
             at_unix: now_unix,
+            client_uid: client_uid.map(str::to_string),
         };
         if let Some(log) = &self.log {
             log.append(&event)?;
@@ -256,10 +306,41 @@ impl DeviceRegistry {
             return Access::Blocked;
         }
         let fingerprint = crate::pki::fingerprint_sha256_colon_hex_der(cert_der);
-        if state.revoked_certs.contains(&fingerprint) {
+        if state.revoked_certs.contains_key(&fingerprint) {
             return Access::CertRevoked;
         }
         Access::Allowed
+    }
+
+    /// Every issued certificate still on record, oldest first.
+    pub fn certificates(&self) -> Vec<CertRecord> {
+        self.state.read().unwrap().certificates.clone()
+    }
+
+    /// When the certificate with this fingerprint was revoked, if it was
+    /// (`Some(0)`: revoked before dates were recorded).
+    pub fn cert_revoked_at(&self, fingerprint: &str) -> Option<i64> {
+        let fp = crate::pki::normalize_fingerprint(fingerprint)?;
+        self.state.read().unwrap().revoked_certs.get(&fp).copied()
+    }
+
+    /// Remove certificate rows (official `certadmin/cert/delete/{ids}`);
+    /// returns the ids that existed. A deleted certificate that was revoked
+    /// stays revoked -- deleting a row must not revive it.
+    pub fn delete_certs(&self, ids: &[i64]) -> Result<Vec<i64>, RegistryError> {
+        let mut state = self.state.write().unwrap();
+        let mut deleted = Vec::new();
+        for &id in ids {
+            if state.certificates.iter().any(|c| c.id == id) {
+                let event = RegistryEvent::CertDeleted { id };
+                if let Some(log) = &self.log {
+                    log.append(&event)?;
+                }
+                apply_event(&mut state, &event);
+                deleted.push(id);
+            }
+        }
+        Ok(deleted)
     }
 
     /// How many certificates are revoked (for metrics).
@@ -271,7 +352,7 @@ impl DeviceRegistry {
     /// [`crate::pki::normalize_fingerprint`]) is revoked.
     pub fn is_cert_revoked(&self, fingerprint: &str) -> bool {
         crate::pki::normalize_fingerprint(fingerprint)
-            .is_some_and(|fp| self.state.read().unwrap().revoked_certs.contains(&fp))
+            .is_some_and(|fp| self.state.read().unwrap().revoked_certs.contains_key(&fp))
     }
 
     /// Revoke one certificate by SHA-256 fingerprint -- the official
@@ -280,8 +361,9 @@ impl DeviceRegistry {
         let fingerprint = crate::pki::normalize_fingerprint(fingerprint)
             .ok_or_else(|| RegistryError::InvalidFingerprint(fingerprint.to_string()))?;
         let mut state = self.state.write().unwrap();
-        if !state.revoked_certs.contains(&fingerprint) {
-            let event = RegistryEvent::CertRevoked { fingerprint };
+        if !state.revoked_certs.contains_key(&fingerprint) {
+            let at_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+            let event = RegistryEvent::CertRevoked { fingerprint, at_unix };
             if let Some(log) = &self.log {
                 log.append(&event)?;
             }
@@ -395,13 +477,22 @@ impl DeviceRegistry {
 /// live mutations and for replaying the log on startup — one
 /// implementation of "what does this event mean," not two.
 fn apply_event(state: &mut RegistryState, event: &RegistryEvent) {
-    let devices = &mut state.devices;
     match event {
         RegistryEvent::Enrolled {
             common_name,
             cert_pem,
             at_unix,
+            client_uid,
         } => {
+            state.next_cert_id += 1;
+            state.certificates.push(CertRecord {
+                id: state.next_cert_id,
+                common_name: common_name.clone(),
+                cert_pem: cert_pem.clone(),
+                client_uid: client_uid.clone(),
+                issued_at_unix: *at_unix,
+            });
+            let devices = &mut state.devices;
             let existing = devices.get(common_name);
             let existing_uid = existing.and_then(|d| d.uid.clone());
             let was_revoked = existing.map(|d| d.revoked).unwrap_or(false);
@@ -417,20 +508,23 @@ fn apply_event(state: &mut RegistryState, event: &RegistryEvent) {
             );
         }
         RegistryEvent::Revoked { common_name } => {
-            if let Some(device) = devices.get_mut(common_name) {
+            if let Some(device) = state.devices.get_mut(common_name) {
                 device.revoked = true;
             }
         }
         RegistryEvent::UidBound { common_name, uid } => {
-            if let Some(device) = devices.get_mut(common_name) {
+            if let Some(device) = state.devices.get_mut(common_name) {
                 device.uid = Some(uid.clone());
             }
         }
-        RegistryEvent::CertRevoked { fingerprint } => {
-            state.revoked_certs.insert(fingerprint.clone());
+        RegistryEvent::CertRevoked { fingerprint, at_unix } => {
+            state.revoked_certs.entry(fingerprint.clone()).or_insert(*at_unix);
+        }
+        RegistryEvent::CertDeleted { id } => {
+            state.certificates.retain(|c| c.id != *id);
         }
         RegistryEvent::Unblocked { common_name } => {
-            if let Some(device) = devices.get_mut(common_name) {
+            if let Some(device) = state.devices.get_mut(common_name) {
                 device.revoked = false;
             }
         }

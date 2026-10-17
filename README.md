@@ -91,21 +91,25 @@ invite-token gate entirely.
 
 ### Revoking access
 
+The official TAK Server's certificate admin API (`/Marti/api/certadmin/*`):
+
+- `GET /Marti/api/certadmin/cert` (optionally `?username=`), `/active`,
+  `/replaced`, `/expired`, `/revoked`: every issued certificate with its
+  `id`, `hash`, `clientUid`, dates.
 - **Lost or compromised device:** revoke its certificate —
-  `POST /Marti/api/admin/devices/<name>/revokeCertificate` (CLI:
-  `device revoke-cert`). That certificate stops working immediately,
-  including the device's live connection. The identity itself stays
-  usable: its owner enrolls a new device with their password account.
-- **Lock someone out:** block the identity —
-  `PUT /Marti/api/admin/devices/<name>/block` (CLI: `device block`). Every
-  certificate of that identity is refused and it can't re-enroll, until
-  `DELETE …/block` (`device unblock`). Certificates revoked individually
-  stay revoked.
+  `DELETE /Marti/api/certadmin/cert/<hash>` or
+  `DELETE /Marti/api/certadmin/cert/revoke/<id>[,<id>...]` (CLI:
+  `device revoke-cert <name>`). It stops working at once, its live
+  connection included. The identity stays usable: its owner enrolls a new
+  device with their password account.
+- Download (`/cert/<hash>/download`, `/cert/download/<ids>` as zip) and
+  delete (`/cert/delete/<ids>`) as on the official server.
 - Revoking a password account (`DELETE /Marti/api/admin/users/<name>`) also
   revokes the certificate issued to it.
-- `GET /Marti/api/admin/devices` lists every identity with its certificate
-  fingerprint and status; the official TAK Server's
-  `DELETE /Marti/api/certadmin/cert/revoke/<fingerprints>` works too.
+- **Lock someone out entirely** (MicroTAK extension, no official
+  counterpart): `PUT /Marti/api/admin/devices/<name>/block` (CLI:
+  `device block`) refuses every certificate of that identity and its
+  re-enrollment until `DELETE …/block` (`device unblock`).
 
 ## System requirements
 

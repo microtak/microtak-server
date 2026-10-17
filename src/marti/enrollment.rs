@@ -142,6 +142,10 @@ async fn get_ca_pem(State(state): State<Arc<EnrollmentState>>) -> impl IntoRespo
 struct EnrollQuery {
     #[serde(default)]
     token: Option<String>,
+    /// The enrolling device's uid (ATAK sends it), recorded with the issued
+    /// certificate for the certificate admin API (official `clientUid`).
+    #[serde(default, rename = "clientUid")]
+    client_uid: Option<String>,
 }
 
 /// TC-ENROLL-02/03/06/07, plus the identity rules of TC-ENROLL-13/15:
@@ -293,7 +297,7 @@ async fn sign_client_v2(
                 return error_response(StatusCode::FORBIDDEN, "this identity is blocked");
             }
             // Proven owner of this identity: may create or rotate it.
-            state.registry.enroll(common_name, &signed.cert_pem, now)
+            state.registry.enroll_with_client_uid(common_name, &signed.cert_pem, now, query.client_uid.as_deref())
         }
         None if state.is_admin_cn(common_name) => {
             let Some(token) = presented_token.as_deref() else {
@@ -304,7 +308,7 @@ async fn sign_client_v2(
                 return too_many_attempts();
             }
             match state.bootstrap.consume_with(token, || {
-                state.registry.enroll_new(common_name, &signed.cert_pem, now)
+                state.registry.enroll_new_with_client_uid(common_name, &signed.cert_pem, now, query.client_uid.as_deref())
             }) {
                 Ok(record) => {
                     info!(common_name, "admin device enrolled with the bootstrap token");
@@ -349,7 +353,7 @@ async fn sign_client_v2(
                     );
                 }
             }
-            state.registry.enroll_new(common_name, &signed.cert_pem, now)
+            state.registry.enroll_new_with_client_uid(common_name, &signed.cert_pem, now, query.client_uid.as_deref())
         }
     };
 

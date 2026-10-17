@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -30,10 +30,10 @@ use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use super::PeerIdentity;
+use super::{PeerIdentity, envelope};
 use crate::enrollment_tokens::{EnrollmentTokenError, EnrollmentTokenStore};
 use crate::pki;
-use crate::registry::{DeviceRegistry, RegistryError};
+use crate::registry::{CertRecord, DeviceRegistry, RegistryError};
 use crate::groups::{grants_from, GroupError, GroupGrant, GroupStore, Membership};
 use crate::users::UserStore;
 
@@ -68,20 +68,23 @@ pub fn router(state: AdminState) -> Router {
             "/Marti/api/admin/groups/:name/members/:identity",
             axum::routing::put(set_group_member).delete(remove_group_member),
         )
-        .route("/Marti/api/admin/devices", axum::routing::get(list_devices))
-        .route(
-            "/Marti/api/admin/devices/:common_name/revokeCertificate",
-            post(revoke_device_certificate),
-        )
         .route(
             "/Marti/api/admin/devices/:common_name/block",
             axum::routing::put(block_device).delete(unblock_device),
         )
-        .route("/Marti/api/certadmin/cert/:hash", axum::routing::get(get_cert_by_hash))
+        .route("/Marti/api/certadmin/cert", axum::routing::get(list_certs))
+        .route("/Marti/api/certadmin/cert/active", axum::routing::get(list_active_certs))
+        .route("/Marti/api/certadmin/cert/replaced", axum::routing::get(list_replaced_certs))
+        .route("/Marti/api/certadmin/cert/expired", axum::routing::get(list_expired_certs))
+        .route("/Marti/api/certadmin/cert/revoked", axum::routing::get(list_revoked_certs))
+        .route("/Marti/api/certadmin/cert/download/:ids", axum::routing::get(download_certs))
+        .route("/Marti/api/certadmin/cert/delete/:ids", axum::routing::delete(delete_certs))
+        .route("/Marti/api/certadmin/cert/revoke/:ids", axum::routing::delete(revoke_certs_by_id))
         .route(
-            "/Marti/api/certadmin/cert/revoke/:hashes",
-            axum::routing::delete(revoke_certs_by_hash),
+            "/Marti/api/certadmin/cert/:hash",
+            axum::routing::get(get_cert_by_hash).delete(revoke_cert_by_hash),
         )
+        .route("/Marti/api/certadmin/cert/:hash/download", axum::routing::get(download_cert))
         .with_state(state)
 }
 
@@ -326,8 +329,9 @@ fn random_password() -> String {
 }
 
 // ---------------------------------------------------------------------
-// Devices: certificate revocation and identity blocks -- see
-// `crate::registry::Access`
+// Certificate admin -- the official TAK Server's CertManagerAdminApi.java
+// (`/Marti/api/certadmin/*`), plus MicroTAK's identity block, which has no
+// official counterpart.
 // ---------------------------------------------------------------------
 
 fn registry_error_response(error: RegistryError) -> Response {
@@ -343,56 +347,304 @@ fn registry_error_response(error: RegistryError) -> Response {
     }
 }
 
-/// `GET /Marti/api/admin/devices`: every enrolled identity with its current
-/// certificate and whether it (or the identity) is revoked.
-async fn list_devices(
+/// The official server reports failures here (unknown hash, bad id list)
+/// as a bare `sendError(500)`; clients (node-tak) rely on that.
+fn official_error() -> Response {
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+/// One row as the official `TakCert` serializes it (`@JsonInclude(NON_NULL)`:
+/// `revocationDate` only when revoked).
+fn tak_cert_json(registry: &DeviceRegistry, cert: &CertRecord) -> serde_json::Value {
+    let hash = pki::fingerprint_sha256_colon_hex(&cert.cert_pem).unwrap_or_default();
+    let details = pki::cert_details(&cert.cert_pem);
+    let mut json = serde_json::json!({
+        "id": cert.id,
+        "creatorDn": details.as_ref().map(|d| d.issuer_dn.clone()),
+        "subjectDn": format!("CN={}", cert.common_name),
+        "userDn": cert.common_name,
+        "certificate": cert.cert_pem,
+        "hash": hash,
+        "clientUid": cert.client_uid.clone().unwrap_or_default(),
+        "serialNumber": details.as_ref().map(|d| d.serial_hex.clone()),
+        "issuanceDate": envelope::cot_date(cert.issued_at_unix),
+        "expirationDate": details.as_ref().map(|d| envelope::cot_date(d.not_after_unix)),
+        "effectiveDate": details.as_ref().map(|d| envelope::cot_date(d.not_before_unix)),
+    });
+    if let Some(at) = registry.cert_revoked_at(&hash) {
+        json["revocationDate"] = serde_json::Value::String(envelope::cot_date(at));
+    }
+    // NON_NULL: drop fields we couldn't compute rather than send nulls.
+    if let Some(map) = json.as_object_mut() {
+        map.retain(|_, v| !v.is_null());
+    }
+    json
+}
+
+fn certs_response(registry: &DeviceRegistry, certs: &[CertRecord]) -> Response {
+    let data: Vec<_> = certs.iter().map(|c| tak_cert_json(registry, c)).collect();
+    envelope::api_response("TakCert", data).into_response()
+}
+
+/// Ordered like the official `findAll(Sort.by("clientUid", "id"))`.
+fn sorted_certs(registry: &DeviceRegistry) -> Vec<CertRecord> {
+    let mut certs = registry.certificates();
+    certs.sort_by(|a, b| {
+        a.client_uid.clone().unwrap_or_default().cmp(&b.client_uid.clone().unwrap_or_default()).then(a.id.cmp(&b.id))
+    });
+    certs
+}
+
+#[derive(Deserialize)]
+struct CertListQuery {
+    username: Option<String>,
+}
+
+/// `GET /Marti/api/certadmin/cert[?username=]`
+async fn list_certs(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Query(query): Query<CertListQuery>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    let certs: Vec<_> = sorted_certs(&state.registry)
+        .into_iter()
+        .filter(|c| query.username.as_deref().is_none_or(|u| u == c.common_name))
+        .collect();
+    certs_response(&state.registry, &certs)
+}
+
+/// The newest certificate per (clientUid, user) -- the official
+/// `getActive()` query, which doesn't look at revocation or expiry.
+fn newest_per_client(certs: &[CertRecord]) -> std::collections::HashMap<(String, String), i64> {
+    let mut newest = std::collections::HashMap::new();
+    for cert in certs {
+        let key = (cert.client_uid.clone().unwrap_or_default(), cert.common_name.clone());
+        let entry = newest.entry(key).or_insert((cert.issued_at_unix, cert.id));
+        if (cert.issued_at_unix, cert.id) > *entry {
+            *entry = (cert.issued_at_unix, cert.id);
+        }
+    }
+    newest.into_iter().map(|(k, (_, id))| (k, id)).collect()
+}
+
+/// `GET /Marti/api/certadmin/cert/active`
+async fn list_active_certs(
     State(state): State<AdminState>,
     Extension(identity): Extension<PeerIdentity>,
 ) -> Response {
     if let Some(response) = require_admin(&state, &identity) {
         return response;
     }
-    let mut devices = state.registry.all();
-    devices.sort_by(|a, b| a.common_name.cmp(&b.common_name));
-    let list: Vec<_> = devices
+    let certs = sorted_certs(&state.registry);
+    let newest = newest_per_client(&certs);
+    let active: Vec<_> = certs.into_iter().filter(|c| newest.values().any(|id| *id == c.id)).collect();
+    certs_response(&state.registry, &active)
+}
+
+/// `GET /Marti/api/certadmin/cert/replaced`
+async fn list_replaced_certs(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    let certs = sorted_certs(&state.registry);
+    let newest = newest_per_client(&certs);
+    let replaced: Vec<_> = certs.into_iter().filter(|c| !newest.values().any(|id| *id == c.id)).collect();
+    certs_response(&state.registry, &replaced)
+}
+
+/// `GET /Marti/api/certadmin/cert/expired`
+async fn list_expired_certs(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    let now = now_unix();
+    let expired: Vec<_> = sorted_certs(&state.registry)
         .into_iter()
-        .map(|device| {
-            let fingerprint = pki::fingerprint_sha256_colon_hex(&device.cert_pem);
-            let revoked = fingerprint
-                .as_deref()
-                .is_some_and(|fp| state.registry.is_cert_revoked(fp));
-            serde_json::json!({
-                "commonName": device.common_name,
-                "uid": device.uid,
-                "enrolledAt": device.enrolled_at_unix,
-                "blocked": device.revoked,
-                "certificateFingerprint": fingerprint,
-                "certificateRevoked": revoked,
-            })
+        .filter(|c| pki::cert_details(&c.cert_pem).is_some_and(|d| d.not_after_unix <= now))
+        .collect();
+    certs_response(&state.registry, &expired)
+}
+
+/// `GET /Marti/api/certadmin/cert/revoked`
+async fn list_revoked_certs(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    let revoked: Vec<_> = sorted_certs(&state.registry)
+        .into_iter()
+        .filter(|c| {
+            pki::fingerprint_sha256_colon_hex(&c.cert_pem).is_some_and(|fp| state.registry.is_cert_revoked(&fp))
         })
         .collect();
-    Json(list).into_response()
+    certs_response(&state.registry, &revoked)
 }
 
-/// `POST /Marti/api/admin/devices/:cn/revokeCertificate`: a lost or
-/// compromised device. Its current certificate stops working everywhere
-/// (live sessions are cut); the identity can enroll a new one.
-async fn revoke_device_certificate(
+fn parse_ids(ids: &str) -> Option<Vec<i64>> {
+    ids.split(',').map(|id| id.trim().parse().ok()).collect()
+}
+
+fn find_by_hash(registry: &DeviceRegistry, hash: &str) -> Option<CertRecord> {
+    let wanted = pki::normalize_fingerprint(hash)?;
+    registry
+        .certificates()
+        .into_iter()
+        .find(|c| pki::fingerprint_sha256_colon_hex(&c.cert_pem).as_deref() == Some(wanted.as_str()))
+}
+
+/// `GET /Marti/api/certadmin/cert/download/:ids` -- a zip of PEMs named
+/// `<n>_<userDn>_ClientCert.pem`.
+async fn download_certs(
     State(state): State<AdminState>,
     Extension(identity): Extension<PeerIdentity>,
-    Path(common_name): Path<String>,
+    Path(ids): Path<String>,
 ) -> Response {
     if let Some(response) = require_admin(&state, &identity) {
         return response;
     }
-    match state.registry.revoke_current_cert(&common_name) {
-        Ok(fingerprint) => Json(serde_json::json!({ "fingerprint": fingerprint })).into_response(),
-        Err(error) => registry_error_response(error),
+    let Some(ids) = parse_ids(&ids) else { return official_error() };
+    let certs: Vec<_> = state.registry.certificates().into_iter().filter(|c| ids.contains(&c.id)).collect();
+    let files: Vec<(String, Vec<u8>)> = certs
+        .iter()
+        .enumerate()
+        .map(|(n, c)| (format!("{}_{}_ClientCert.pem", n + 1, c.common_name), c.cert_pem.as_bytes().to_vec()))
+        .collect();
+    let date = OffsetDateTime::now_utc();
+    let filename = format!(
+        "ClientCertExport_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}.zip",
+        date.year(),
+        date.month() as u8,
+        date.day(),
+        date.hour(),
+        date.minute(),
+        date.second()
+    );
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename={filename}")),
+        ],
+        crate::zip::stored(&files),
+    )
+        .into_response()
+}
+
+/// `DELETE /Marti/api/certadmin/cert/delete/:ids`
+async fn delete_certs(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(ids): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    let Some(ids) = parse_ids(&ids) else { return official_error() };
+    match state.registry.delete_certs(&ids) {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(_) => official_error(),
     }
 }
 
-/// `PUT /Marti/api/admin/devices/:cn/block`: lock the identity out entirely
-/// (any certificate, re-enrollment included) until unblocked.
+/// `DELETE /Marti/api/certadmin/cert/revoke/:ids` -- numeric certificate
+/// ids; unknown ids are skipped (the official server logs and continues).
+/// Revoking cuts the certificate's live sessions.
+async fn revoke_certs_by_id(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(ids): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    let Some(ids) = parse_ids(&ids) else { return official_error() };
+    for cert in state.registry.certificates().into_iter().filter(|c| ids.contains(&c.id)) {
+        if let Some(fp) = pki::fingerprint_sha256_colon_hex(&cert.cert_pem)
+            && state.registry.revoke_cert(&fp).is_err()
+        {
+            return official_error();
+        }
+    }
+    StatusCode::OK.into_response()
+}
+
+/// `GET /Marti/api/certadmin/cert/:hash` -- real clients (node-tak's
+/// `Certificate.validate`) look up their own certificate by its SHA-256
+/// fingerprint to see whether the server still knows it and hasn't revoked
+/// it. Unknown: 500, as on the official server.
+async fn get_cert_by_hash(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(hash): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    match find_by_hash(&state.registry, &hash) {
+        Some(cert) => envelope::api_response("TakCert", tak_cert_json(&state.registry, &cert)).into_response(),
+        None => official_error(),
+    }
+}
+
+/// `GET /Marti/api/certadmin/cert/:hash/download` -- the PEM as text.
+async fn download_cert(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(hash): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    match find_by_hash(&state.registry, &hash) {
+        Some(cert) => (
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, "text/plain".to_string()),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename={}_ClientCert.pem", cert.common_name),
+                ),
+            ],
+            cert.cert_pem,
+        )
+            .into_response(),
+        None => official_error(),
+    }
+}
+
+/// `DELETE /Marti/api/certadmin/cert/:hash` -- revoke one certificate;
+/// returns it as it was before revocation (the official server serializes
+/// the row it loaded first).
+async fn revoke_cert_by_hash(
+    State(state): State<AdminState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(hash): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &identity) {
+        return response;
+    }
+    let Some(cert) = find_by_hash(&state.registry, &hash) else { return official_error() };
+    let before = tak_cert_json(&state.registry, &cert);
+    match state.registry.revoke_cert(&hash) {
+        Ok(()) => envelope::api_response("TakCert", before).into_response(),
+        Err(_) => official_error(),
+    }
+}
+
+/// `PUT /Marti/api/admin/devices/:cn/block` -- MicroTAK extension (no
+/// official counterpart): lock an identity out entirely (any certificate,
+/// re-enrollment included) until unblocked.
 async fn block_device(
     State(state): State<AdminState>,
     Extension(identity): Extension<PeerIdentity>,
@@ -413,8 +665,8 @@ async fn block_device(
     }
 }
 
-/// `DELETE /Marti/api/admin/devices/:cn/block`: lift the block. Certificates
-/// revoked individually stay revoked.
+/// `DELETE /Marti/api/admin/devices/:cn/block` -- MicroTAK extension: lift
+/// the block. Revoked certificates stay revoked.
 async fn unblock_device(
     State(state): State<AdminState>,
     Extension(identity): Extension<PeerIdentity>,
@@ -427,67 +679,6 @@ async fn unblock_device(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => registry_error_response(error),
     }
-}
-
-/// `DELETE /Marti/api/certadmin/cert/revoke/:hashes` -- the official TAK
-/// Server's certificate revoke: comma-separated SHA-256 fingerprints.
-async fn revoke_certs_by_hash(
-    State(state): State<AdminState>,
-    Extension(identity): Extension<PeerIdentity>,
-    Path(hashes): Path<String>,
-) -> Response {
-    if let Some(response) = require_admin(&state, &identity) {
-        return response;
-    }
-    let hashes: Vec<&str> = hashes.split(',').map(str::trim).filter(|h| !h.is_empty()).collect();
-    if let Some(bad) = hashes.iter().find(|h| pki::normalize_fingerprint(h).is_none()) {
-        return registry_error_response(RegistryError::InvalidFingerprint(bad.to_string()));
-    }
-    for hash in &hashes {
-        if let Err(error) = state.registry.revoke_cert(hash) {
-            return registry_error_response(error);
-        }
-    }
-    Json(serde_json::json!({ "revoked": hashes })).into_response()
-}
-
-/// `GET /Marti/api/certadmin/cert/:hash` -- confirmed from real client
-/// source (`dfpc-coe/node-tak`'s `lib/api/certificate.ts`'s `validate()`/
-/// `get()`): a real client looks up a certificate by the SHA-256
-/// fingerprint (colon-separated uppercase hex) it computed locally from its
-/// own copy of the cert, to check whether the server still considers it
-/// valid (known, not revoked). O(n) scan over the device registry
-/// computing each stored cert's fingerprint on the fly -- simple, and fine
-/// at this project's scale (see `pki::fingerprint_sha256_colon_hex`).
-async fn get_cert_by_hash(
-    State(state): State<AdminState>,
-    Extension(identity): Extension<PeerIdentity>,
-    Path(hash): Path<String>,
-) -> Response {
-    if let Some(response) = require_admin(&state, &identity) {
-        return response;
-    }
-    let Some(record) = state.registry.all().into_iter().find(|record| {
-        pki::fingerprint_sha256_colon_hex(&record.cert_pem).as_deref() == Some(hash.as_str())
-    }) else {
-        return error_response(StatusCode::NOT_FOUND, "unknown certificate".to_string());
-    };
-    Json(serde_json::json!({
-        "version": "3",
-        "type": "TakCert",
-        "data": {
-            "hash": hash,
-            "subjectDn": format!("CN={}", record.common_name),
-            "userDn": format!("CN={}", record.common_name),
-            "clientUid": record.common_name,
-            "revocationDate": if record.revoked || state.registry.is_cert_revoked(&hash) {
-                Some("revoked")
-            } else {
-                None
-            },
-        },
-    }))
-    .into_response()
 }
 
 // ---------------------------------------------------------------------
@@ -932,8 +1123,11 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(body["data"]["clientUid"], "device-a");
-        assert!(body["data"]["revocationDate"].is_null());
+        assert_eq!(body["type"], "TakCert");
+        assert_eq!(body["data"]["userDn"], "device-a");
+        // No `clientUid` at enrollment: the official default is "".
+        assert_eq!(body["data"]["clientUid"], "");
+        assert!(body["data"].get("revocationDate").is_none());
     }
 
     #[tokio::test]
@@ -943,8 +1137,8 @@ mod tests {
         let (csr_pem, _key) = crate::pki::build_csr("device-revoked").unwrap();
         let signed = ca.sign_csr(&csr_pem, time::Duration::days(365)).unwrap();
         registry.enroll("device-revoked", &signed.cert_pem, 1_000).unwrap();
-        registry.revoke("device-revoked").unwrap();
         let hash = crate::pki::fingerprint_sha256_colon_hex(&signed.cert_pem).unwrap();
+        registry.revoke_cert(&hash).unwrap();
 
         let response = request_as(
             &mut app,
@@ -958,11 +1152,13 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert!(!body["data"]["revocationDate"].is_null());
+        assert!(body["data"]["revocationDate"].as_str().is_some_and(|d| d.ends_with('Z')));
     }
 
+    /// The official server answers an unknown hash with sendError(500);
+    /// node-tak's `Certificate.validate` relies on exactly that.
     #[tokio::test]
-    async fn certadmin_lookup_of_unknown_hash_is_404() {
+    async fn certadmin_lookup_of_unknown_hash_is_500_like_the_official_server() {
         let (mut app, _tokens, _users, _registry) = app_with_admin(Some("jz-admin"));
         let response = request_as(
             &mut app,
@@ -972,6 +1168,6 @@ mod tests {
             "",
         )
         .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

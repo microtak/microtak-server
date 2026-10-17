@@ -277,6 +277,8 @@ impl App {
     pub async fn bind(config: AppConfig) -> Result<Self, AppError> {
         std::fs::create_dir_all(&config.data_dir)?;
 
+        // The official envelope's `nodeId`, stable per installation.
+        crate::marti::envelope::load_or_create_server_id(&config.data_dir)?;
         let ca = load_or_generate_ca(&config.data_dir, &config.ca_common_name)?;
         let ca_cert_pem = ca.ca_cert_pem();
         let registry = Arc::new(DeviceRegistry::load_or_create(
