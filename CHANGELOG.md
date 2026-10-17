@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/microtak/microtak-server/compare/v0.8.0...v0.8.1) (2026-10-17)
+
+
+### Bug Fixes
+
+* **oauth:** issue official RS256 access tokens ([0309cf6](https://github.com/microtak/microtak-server/commit/0309cf603142685e4dbc5bf3207ddc8d5e9c9091))
+
 ## [0.8.0](https://github.com/microtak/microtak-server/compare/v0.7.0...v0.8.0) (2026-10-17)
 
 
