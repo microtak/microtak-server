@@ -14,7 +14,7 @@ Usage: scripts/build.sh [options]
 
   -b, --build     Build only: cargo build --tests --locked
   -t, --test      Test only: cargo test --locked (unit tests + tests/e2e.rs)
-  -c, --clippy    Clippy only: cargo clippy --all-targets --locked -- -D warnings
+  -c, --clippy    Lint only: cargo fmt --check, then cargo clippy --all-targets --locked -- -D warnings
       --nix       Also run `nix flake check` (builds the package, runs
                   tests and clippy again, hermetically via the flake)
       --docker    Also build the Docker image locally (no push), like the
@@ -72,6 +72,8 @@ if [ "$do_test" -eq 1 ]; then
 fi
 
 if [ "$do_clippy" -eq 1 ]; then
+  echo "==> cargo fmt --check"
+  cargo fmt --check
   echo "==> cargo clippy --all-targets --locked -- -D warnings"
   cargo clippy --all-targets --locked -- -D warnings
 fi
