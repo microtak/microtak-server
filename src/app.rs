@@ -290,9 +290,13 @@ impl App {
             config.data_dir.join("devices.log"),
         )?);
         let groups = Arc::new(GroupStore::load_or_create(config.data_dir.join("groups.log"))?);
+        // Missions in the official model; MicroTAK ≤ 0.8's `missions.log`
+        // (a different model) is left alone, not migrated.
         let missions = Arc::new(MissionStore::load_or_create(
-            config.data_dir.join("missions.log"),
+            config.data_dir.join("official-missions.log"),
         )?);
+        let latest_cot = Arc::new(crate::latest_cot::LatestCot::load(config.data_dir.join("latest-cot.json")));
+        let mission_tokens = Arc::new(crate::marti::mission_token::MissionTokenSigner::load_or_create(&config.data_dir)?);
         let content_store = Arc::new(ContentStore::open(config.data_dir.join("content"))?);
         let resources = Arc::new(ResourceStore::load_or_create(config.data_dir.join("resources.log"))?);
         let enrollment_tokens = Arc::new(EnrollmentTokenStore::load_or_create(
@@ -431,10 +435,14 @@ impl App {
             groups: Arc::clone(&groups),
             admin_common_name: config.admin_common_name.clone(),
         };
+        Arc::clone(&latest_cot).spawn_feed(hub.subscribe());
         let marti_router = missions_api::router_with(missions_api::MissionsState {
             store: Arc::clone(&missions),
             groups: Arc::clone(&groups),
             admin_common_name: config.admin_common_name.clone(),
+            tokens: mission_tokens,
+            resources: Arc::clone(&resources),
+            latest_cot,
         })
             .merge(client_endpoints::router(clients.clone()))
             .merge(content_api::router(content_api::SyncState {
@@ -659,9 +667,22 @@ mod tests {
             .registry
             .enroll("device-a", "fake-cert-pem", 1_000)
             .unwrap();
-        first
+        let mission = first
             .missions
-            .create("m", None, "user-1", vec![], 1_000)
+            .create(
+                crate::missions::NewMission {
+                    guid: crate::marti::envelope::random_uuid(),
+                    name: "m".into(),
+                    fields: Default::default(),
+                    tool: "public".into(),
+                    creator_uid: "user-1".into(),
+                    groups: ["__ANON__".to_string()].into(),
+                    password_hash: None,
+                    default_role: None,
+                    invite_only: false,
+                },
+                1_000,
+            )
             .unwrap();
         let content_hash = first.content_store.put(b"persisted content", None).unwrap();
         drop(first); // never `.run()`, so nothing is actually listening to tear down
@@ -672,7 +693,7 @@ mod tests {
             "CA must survive a restart -- regenerating it would invalidate every issued cert"
         );
         assert!(second.registry.find("device-a").is_some());
-        assert!(second.missions.get("m").is_some());
+        assert!(second.missions.by_guid(&mission.guid).is_some());
         assert_eq!(
             second.content_store.get(&content_hash).unwrap().as_deref(),
             Some(&b"persisted content"[..])

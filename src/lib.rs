@@ -18,6 +18,7 @@ pub mod cot;
 pub mod enrollment_tokens;
 pub mod eventlog;
 pub mod groups;
+pub mod latest_cot;
 pub mod marti;
 pub mod metrics;
 pub mod missions;

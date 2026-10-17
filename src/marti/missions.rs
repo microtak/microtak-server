@@ -1,1167 +1,2018 @@
-//! Mission (Data Sync) metadata HTTP API — `/Marti/api/missions/*`.
+//! The official Mission API (`/Marti/api/missions/*`), as
+//! `TAK-Product-Center/Server`'s `MissionApi` serves it, on top of
+//! [`crate::missions::MissionStore`]. The full contract, with sources, is
+//! the wiki page `Official-Mission-API`; this module follows it:
 //!
-//! Implements the metadata half of `docs/TEST-PLAN.md` §5 on top of
-//! [`crate::missions::MissionStore`]. **Not implemented**: DataSync file
-//! *content* upload/download (TC-MARTI-07/08), `clientEndPoints`
-//! (TC-MARTI-09), device-profile-gated visibility.
+//! - **Mission lookup and role** (`MissionRoleAssignmentRequestHolderFilterBean`,
+//!   `getRoleForRequest`): an unknown mission is an empty 404 (a deleted
+//!   one 410) except on create; the caller's role comes from a mission
+//!   token (`MissionAuthorization`, else `Authorization: Bearer`) --
+//!   ACCESS → the default role, SUBSCRIPTION → that subscription's role --
+//!   else admin → owner, else nothing for password-protected or
+//!   invite-only missions, else the default role.
+//! - Permissions per endpoint as in the official `@PreAuthorize`
+//!   annotations; the official envelope `type` strings, date formats and
+//!   `ErrorResponse` bodies.
+//! - Groups: a mission is visible to callers sharing one of its groups
+//!   (the admin sees all); `__ANON__` alone at create means the caller's
+//!   own groups.
 //!
-//! **Groups** (`crate::groups`, 2026-09-29): every mission is visible in a
-//! set of groups (default: its creator's). A caller outside all of them
-//! gets 404 on every mission endpoint and doesn't see it listed -- the
-//! official server's mission group check; the admin sees everything. A
-//! non-admin can only put a mission into groups it belongs to.
-//!
-//! **TC-MARTI-10**: served mTLS-authenticated via
-//! [`super::MtlsHttpServer`], which also injects the connecting cert's CN
-//! as a [`super::PeerIdentity`] request extension. Every handler that
-//! accepts a `creatorUid`/`actorUid`/`uid` claim in the request rejects
-//! (403) if it doesn't match the authenticated [`PeerIdentity`] — MicroTAK's
-//! policy: an HTTP API caller's identity *is* its cert's CN, so a caller
-//! can't act as any identity it merely claims in a request body/query
-//! param, closing the gap this module used to have.
-//!
-//! **Roles (`docs/ARCHITECTURE.md` "Enrollment lockdown / admin API" and
-//! the mission-roles follow-up it names)**: on top of the identity-claim
-//! check above, some actions also require a specific
-//! [`crate::missions::MissionRole`] on the target mission, mirroring the
-//! official roles: `delete_mission` and `update_mission` (incl. its
-//! groups) require `Owner` (`MISSION_OWNER`); `add_content` requires a
-//! writing role, `Owner` or `Subscriber` (`MISSION_WRITE`) -- not
-//! `ReadOnlySubscriber` (`MISSION_READONLY_SUBSCRIBER`). Subscribing grants
-//! the mission's `defaultRole`. `assign_role`/`revoke_role` are
-//! `Owner`-only. Reading (`list`/`get`/`changes`) needs no role -- only
-//! membership of one of the mission's groups (see above).
-//!
-//! **`PUT` vs `PATCH` (TC-MARTI-02/12)**: `PUT /missions/:name` is
-//! strict-create-only (409 if the name is already taken); updates go
-//! through `PATCH /missions/:name` and only touch the fields provided.
-//! This is MicroTAK's own, deliberately stricter contract — a real reference
-//! implementation's `PUT` silently merges into an existing mission with no
-//! way for the caller to distinguish "created" from "updated," which this
-//! design avoids by construction rather than replicating.
+//! Mission change announcements (CoT to subscribers) are not sent yet.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::body::Bytes;
+use axum::extract::{Path, RawQuery, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
-use serde::Deserialize;
-use time::OffsetDateTime;
+use serde_json::{json, Value};
 
+use super::envelope::{api_response, cot_date_millis, random_uuid};
+use super::mission_token::{MissionTokenSigner, TokenType};
 use super::PeerIdentity;
 use crate::groups::GroupStore;
+use crate::latest_cot::LatestCot;
 use crate::missions::{
-    Mission, MissionContentRef, MissionError, MissionRole, MissionStore, MissionUpdate,
+    ChangeRecord, Content, InvitationRecord, InvitationType, LogEntryRecord, MissionError, MissionFields,
+    MissionRecord, MissionStore, NewMission, Permission, Role, SubscriptionRecord, Window,
 };
+use crate::sync::ResourceStore;
 
-/// What the mission API needs: the store, plus groups for visibility.
 #[derive(Clone)]
 pub struct MissionsState {
     pub store: Arc<MissionStore>,
     pub groups: Arc<GroupStore>,
-    /// The admin identity sees every mission.
     pub admin_common_name: Option<String>,
+    pub tokens: Arc<MissionTokenSigner>,
+    pub resources: Arc<ResourceStore>,
+    pub latest_cot: Arc<LatestCot>,
 }
 
-/// The mission API with no groups configured (everyone is `__ANON__`, so
-/// every mission is visible to everyone) -- see [`router_with`].
-pub fn router(store: Arc<MissionStore>) -> Router {
-    router_with(MissionsState {
-        store,
-        groups: Arc::new(GroupStore::in_memory()),
-        admin_common_name: None,
-    })
+impl MissionsState {
+    /// No groups, no admin, fresh keys -- for tests.
+    pub fn in_memory() -> Self {
+        Self {
+            store: Arc::new(MissionStore::in_memory()),
+            groups: Arc::new(GroupStore::in_memory()),
+            admin_common_name: None,
+            tokens: Arc::new(MissionTokenSigner::generate()),
+            resources: Arc::new(ResourceStore::in_memory()),
+            latest_cot: Arc::new(LatestCot::in_memory()),
+        }
+    }
 }
 
 pub fn router_with(state: MissionsState) -> Router {
     Router::new()
-        .route("/Marti/api/missions", get(list_missions))
+        .route("/Marti/api/missions", get(list_missions).delete(delete_mission_by_guid))
+        .route("/Marti/api/missions/all/subscriptions", get(all_subscriptions))
+        .route("/Marti/api/missions/all/subscriptions/guid", get(all_subscriptions_with_guid))
+        .route("/Marti/api/missions/all/invitations", get(all_invitation_names))
+        .route("/Marti/api/missions/invitations", get(my_invitations))
+        .route("/Marti/api/missions/all/logs", get(all_logs))
+        .route("/Marti/api/missions/logs/entries", post(post_log_entry).put(put_log_entry))
+        .route("/Marti/api/missions/logs/entries/:id", get(get_log_entry).delete(delete_log_entry))
         .route(
             "/Marti/api/missions/:name",
-            put(create_mission)
-                .get(get_mission)
-                .patch(update_mission)
-                .delete(delete_mission),
+            get(get_mission_by_name).put(create_mission_put).post(create_mission_post).delete(delete_mission_by_name),
         )
-        .route("/Marti/api/missions/:name/changes", get(get_changes))
-        .route(
-            "/Marti/api/missions/:name/contents",
-            put(add_content),
-        )
+        .route("/Marti/api/missions/guid/:guid", get(get_mission_by_guid))
+        .route("/Marti/api/missions/:name/contents", put(add_contents_by_name).delete(remove_content_by_name))
+        .route("/Marti/api/missions/guid/:guid/contents", put(add_contents_by_guid).delete(remove_content_by_guid))
+        .route("/Marti/api/missions/:name/changes", get(changes_by_name))
+        .route("/Marti/api/missions/guid/:guid/changes", get(changes_by_guid))
+        .route("/Marti/api/missions/:name/keywords", put(set_keywords).delete(clear_keywords))
+        .route("/Marti/api/missions/:name/keywords/:keyword", delete(remove_keyword))
+        .route("/Marti/api/missions/:name/uid/:uid/keywords", put(set_uid_keywords).delete(clear_uid_keywords))
+        .route("/Marti/api/missions/:name/content/:hash/keywords", put(set_hash_keywords).delete(clear_hash_keywords))
+        .route("/Marti/api/missions/:name/token", get(access_token))
         .route(
             "/Marti/api/missions/:name/subscription",
-            put(subscribe).delete(unsubscribe),
+            get(subscription_by_name).put(subscribe_by_name).post(set_subscription_roles_by_name).delete(unsubscribe_by_name),
         )
-        .route("/Marti/api/missions/:name/role", put(assign_role))
         .route(
-            "/Marti/api/missions/:name/role/:uid",
-            axum::routing::delete(revoke_role),
+            "/Marti/api/missions/guid/:guid/subscription",
+            get(subscription_by_guid).put(subscribe_by_guid).post(set_subscription_roles_by_guid).delete(unsubscribe_by_guid),
         )
+        .route("/Marti/api/missions/:name/subscriptions", get(subscribers_by_name))
+        .route("/Marti/api/missions/guid/:guid/subscriptions", get(subscribers_by_guid))
+        .route("/Marti/api/missions/:name/subscriptions/roles", get(subscription_roles_by_name))
+        .route("/Marti/api/missions/guid/:guid/subscriptions/roles", get(subscription_roles_by_guid))
+        .route("/Marti/api/missions/:name/role", get(role_by_name).put(set_role_by_name))
+        .route("/Marti/api/missions/guid/:guid/role", get(role_by_guid).put(set_role_by_guid))
+        .route("/Marti/api/missions/:name/invitations", get(invitations_by_name))
+        .route("/Marti/api/missions/guid/:guid/invitations", get(invitations_by_guid))
+        .route("/Marti/api/missions/:name/invite/:kind/:invitee", put(invite_by_name).delete(uninvite_by_name))
+        .route("/Marti/api/missions/guid/:guid/invite/:kind/:invitee", put(invite_by_guid).delete(uninvite_by_guid))
+        .route("/Marti/api/missions/:name/log", get(logs_for_mission))
+        .route("/Marti/api/missions/:name/cot", get(cot_by_name))
+        .route("/Marti/api/missions/guid/:guid/cot", get(cot_by_guid))
+        .route("/Marti/api/missions/:name/password", put(set_password_by_name).delete(remove_password_by_name))
+        .route("/Marti/api/missions/guid/:guid/password", put(set_password_by_guid).delete(remove_password_by_guid))
+        .route("/Marti/api/missions/:name/expiration", put(set_expiration_by_name))
+        .route("/Marti/api/missions/guid/:guid/expiration", put(set_expiration_by_guid))
         .with_state(state)
 }
 
-fn now_unix() -> i64 {
-    OffsetDateTime::now_utc().unix_timestamp()
+fn now_ms() -> i64 {
+    crate::cot::now_unix_millis()
 }
 
-fn error_response(status: StatusCode, message: String) -> Response {
-    (status, Json(serde_json::json!({ "error": message }))).into_response()
+/// `yyyy-MM-dd'T'HH:mm:ss.SSS'Z'` (`COT_DATE_FORMAT_PAD_MILLIS`).
+fn pad_millis(ms: i64) -> String {
+    let unpadded = cot_date_millis(ms);
+    let (head, millis) = unpadded.rsplit_once('.').expect("cot date has millis");
+    format!("{head}.{:0>3}Z", millis.trim_end_matches('Z'))
 }
 
-/// TC-MARTI-10's residual gap, closed: reject a request whose claimed
-/// identity (`creatorUid`/`actorUid`/`uid`) doesn't match the
-/// authenticated connection's own cert CN. MicroTAK's policy is that an
-/// HTTP API caller's identity *is* its cert's CN — the same identity
-/// enrollment issued it — so this needs no prior CoT-relay interaction,
-/// unlike checking against a `registry`-bound `uid` would.
-/// `None` if `claimed` matches; `Some(rejection)` to return immediately
-/// otherwise. Not `Result<(), Response>` -- `axum::response::Response` is
-/// large enough that clippy's `result_large_err` flags it, and there's no
-/// success payload to carry anyway.
-fn require_matching_identity(identity: &PeerIdentity, claimed: &str) -> Option<Response> {
-    if identity.0 == claimed {
-        None
+// --- errors -------------------------------------------------------------
+
+/// The official `CustomExceptionHandler` responses, plus the filter's
+/// body-less 404/410 and Spring Security's access-denied 403.
+#[derive(Debug)]
+pub enum ApiError {
+    NotFound(String),
+    BadRequest(String),
+    Forbidden(String),
+    Gone(String),
+    Internal,
+    /// The request filter: unknown mission.
+    NoMission,
+    /// The request filter: deleted mission.
+    MissionGone,
+    /// A `@PreAuthorize` permission the caller's role lacks.
+    AccessDenied,
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = |status: StatusCode, name: &str, code: u32, message: String| {
+            (status, Json(json!({ "status": name, "code": code, "message": message }))).into_response()
+        };
+        let suffix = |m: &str| if m.is_empty() { String::new() } else { format!(": {m}") };
+        match self {
+            ApiError::NotFound(m) => body(StatusCode::NOT_FOUND, "NOT_FOUND", 1, format!("Not Found{}", suffix(&m))),
+            ApiError::BadRequest(m) => body(StatusCode::BAD_REQUEST, "BAD_REQUEST", 2, format!("Invalid Request{}", suffix(&m))),
+            ApiError::Forbidden(m) => body(StatusCode::FORBIDDEN, "FORBIDDEN", 10, suffix(&m)),
+            ApiError::Gone(m) => body(StatusCode::GONE, "GONE", 8, suffix(&m)),
+            ApiError::Internal => body(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_SERVER_ERROR", 6, String::new()),
+            ApiError::NoMission => StatusCode::NOT_FOUND.into_response(),
+            ApiError::MissionGone => StatusCode::GONE.into_response(),
+            ApiError::AccessDenied => StatusCode::FORBIDDEN.into_response(),
+        }
+    }
+}
+
+impl From<MissionError> for ApiError {
+    fn from(error: MissionError) -> Self {
+        match error {
+            MissionError::NotFound(guid) => ApiError::NotFound(format!("Mission guid '{guid}' not found - not deleted")),
+            MissionError::EventLog(e) => {
+                tracing::error!(error = %e, "mission store write failed");
+                ApiError::Internal
+            }
+        }
+    }
+}
+
+type ApiResult = Result<Response, ApiError>;
+
+// --- request parameters ---------------------------------------------------
+
+/// Query parameters, repeatable (Spring binds `group=a&group=b` to an array).
+struct Params(Vec<(String, String)>);
+
+impl Params {
+    fn parse(raw: Option<String>) -> Result<Self, ApiError> {
+        let raw = raw.unwrap_or_default();
+        serde_urlencoded::from_str(&raw)
+            .map(Params)
+            .map_err(|e| ApiError::BadRequest(format!("bad query string: {e}")))
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        self.0.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+
+    fn string(&self, name: &str) -> String {
+        self.get(name).unwrap_or("").to_string()
+    }
+
+    fn all(&self, name: &str) -> Vec<String> {
+        self.0.iter().filter(|(k, _)| k == name).map(|(_, v)| v.clone()).collect()
+    }
+
+    /// Spring's boolean conversion (`true/false/on/off/yes/no/1/0`).
+    fn bool(&self, name: &str, default: bool) -> Result<bool, ApiError> {
+        match self.get(name).map(|v| v.trim().to_ascii_lowercase()) {
+            None => Ok(default),
+            Some(v) if v.is_empty() => Ok(default),
+            Some(v) => match v.as_str() {
+                "true" | "on" | "yes" | "1" => Ok(true),
+                "false" | "off" | "no" | "0" => Ok(false),
+                _ => Err(ApiError::BadRequest(format!("invalid boolean for '{name}'"))),
+            },
+        }
+    }
+
+    fn long(&self, name: &str) -> Result<Option<i64>, ApiError> {
+        match self.get(name).filter(|v| !v.is_empty()) {
+            None => Ok(None),
+            Some(v) => v.trim().parse().map(Some).map_err(|_| ApiError::BadRequest(format!("invalid number for '{name}'"))),
+        }
+    }
+
+    fn role(&self, name: &str) -> Result<Option<Role>, ApiError> {
+        match self.get(name).filter(|v| !v.is_empty()) {
+            None => Ok(None),
+            Some(v) => Role::parse(v).map(Some).ok_or_else(|| ApiError::BadRequest(format!("invalid role '{v}'"))),
+        }
+    }
+
+    /// `secago` / `start` / `end` (`TimeUtils.validateTimeInterval`).
+    fn window(&self) -> Result<Window, ApiError> {
+        let parse_date = |name: &str| -> Result<Option<i64>, ApiError> {
+            match self.get(name).filter(|v| !v.is_empty()) {
+                None => Ok(None),
+                Some(v) => time::OffsetDateTime::parse(v, &time::format_description::well_known::Rfc3339)
+                    .map(|t| Some((t.unix_timestamp_nanos() / 1_000_000) as i64))
+                    .map_err(|_| ApiError::BadRequest(format!("invalid date for '{name}'"))),
+            }
+        };
+        let mut start = parse_date("start")?;
+        let end = parse_date("end")?;
+        if let Some(secago) = self.long("secago")?.filter(|s| *s > 0) {
+            start = Some(now_ms() - secago * 1000);
+        }
+        let window = Window { start_ms: start.unwrap_or(i64::MIN), end_ms: end.unwrap_or(i64::MAX) };
+        if window.start_ms >= window.end_ms {
+            return Err(ApiError::BadRequest("invalid time range".into()));
+        }
+        Ok(window)
+    }
+}
+
+/// Who is asking: the certificate's CN is the username.
+struct Caller {
+    username: String,
+    admin: bool,
+    groups: BTreeSet<String>,
+    token: Option<String>,
+    api_version: u32,
+}
+
+fn caller(state: &MissionsState, identity: &PeerIdentity, headers: &HeaderMap) -> Caller {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let token = header("MissionAuthorization")
+        .or_else(|| header("Authorization"))
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(String::from);
+    Caller {
+        username: identity.0.clone(),
+        admin: state.admin_common_name.as_deref() == Some(identity.0.as_str()),
+        groups: state.groups.all_group_names(&identity.0),
+        token,
+        // `getApiVersionNumberFromRequest`: absent or unparsable → 2.
+        api_version: header("API_VERSION").and_then(|v| v.trim().parse().ok()).unwrap_or(2),
+    }
+}
+
+fn visible(caller: &Caller, mission: &MissionRecord) -> bool {
+    caller.admin || mission.groups.iter().any(|g| caller.groups.contains(g))
+}
+
+enum Key<'a> {
+    Name(&'a str),
+    Guid(&'a str),
+}
+
+/// The request filter's lookup: `Ok(None)` only when `create` and nothing
+/// of that name exists for the caller.
+fn lookup(state: &MissionsState, caller: &Caller, key: Key<'_>, create: bool) -> Result<Option<MissionRecord>, ApiError> {
+    match key {
+        Key::Name(name) => {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(ApiError::BadRequest("empty 'name' path parameter".into()));
+            }
+            match state.store.by_name(name, |m| visible(caller, m)) {
+                Some(m) => Ok(Some(m)),
+                None if create => Ok(None),
+                None if state.store.is_deleted_name(name) => Err(ApiError::MissionGone),
+                None => Err(ApiError::NoMission),
+            }
+        }
+        Key::Guid(guid) => {
+            if uuid_parse(guid).is_none() {
+                return Err(ApiError::BadRequest("invalid mission UUID".into()));
+            }
+            match state.store.by_guid(guid) {
+                Some(m) if m.deleted => Err(ApiError::MissionGone),
+                Some(m) if visible(caller, &m) => Ok(Some(m)),
+                _ => Err(ApiError::NoMission),
+            }
+        }
+    }
+}
+
+fn existing(state: &MissionsState, caller: &Caller, key: Key<'_>) -> Result<MissionRecord, ApiError> {
+    lookup(state, caller, key, false).map(|m| m.expect("not a create"))
+}
+
+fn uuid_parse(s: &str) -> Option<()> {
+    let parts: Vec<&str> = s.split('-').collect();
+    let lens = [8, 4, 4, 4, 12];
+    (parts.len() == 5 && parts.iter().zip(lens).all(|(p, l)| p.len() == l && p.chars().all(|c| c.is_ascii_hexdigit())))
+        .then_some(())
+}
+
+/// `getRoleFromToken` for the given token types.
+fn role_from_token(state: &MissionsState, mission: &MissionRecord, caller: &Caller, types: &[TokenType]) -> Option<Role> {
+    let token = caller.token.as_deref()?;
+    let claims = state.tokens.decode(token)?;
+    if !types.contains(&claims.token_type) || claims.mission_name != mission.name {
+        return None;
+    }
+    match claims.token_type {
+        TokenType::Subscription => state.store.subscription_by_id(&mission.guid, &claims.id).map(|s| s.role),
+        TokenType::Invitation => state
+            .store
+            .invitation_by_token(token)
+            .filter(|i| i.mission_name.eq_ignore_ascii_case(&mission.name))
+            .map(|i| i.role),
+        TokenType::Access => Some(mission.effective_default_role()),
+    }
+}
+
+/// `getRoleForRequest`.
+fn role_for(state: &MissionsState, mission: &MissionRecord, caller: &Caller) -> Option<Role> {
+    if let Some(role) = role_from_token(state, mission, caller, &[TokenType::Access, TokenType::Subscription]) {
+        return Some(role);
+    }
+    if caller.admin {
+        return Some(Role::Owner);
+    }
+    if mission.password_protected() || mission.invite_only {
+        return None;
+    }
+    Some(mission.effective_default_role())
+}
+
+fn require(role: Option<Role>, permission: Permission) -> Result<(), ApiError> {
+    match role {
+        Some(r) if r.has(permission) => Ok(()),
+        _ => Err(ApiError::AccessDenied),
+    }
+}
+
+/// `validateRoleAssignment`.
+fn may_assign(mission: &MissionRecord, current: Option<Role>, assign: Role) -> bool {
+    let Some(current) = current else { return false };
+    current.has_all(assign) && (mission.password_protected() || assign.has_all(mission.effective_default_role()))
+}
+
+fn hash_password(password: &str) -> Result<String, ApiError> {
+    Ok(crate::users::hash_password(password))
+}
+
+fn password_matches(mission: &MissionRecord, password: &str) -> bool {
+    mission.password_hash.as_deref().is_some_and(|hash| crate::users::verify_password(password, hash))
+}
+
+// --- JSON -------------------------------------------------------------------
+
+fn role_json(role: Role) -> Value {
+    let permissions: Vec<Value> = role
+        .permissions()
+        .iter()
+        .map(|p| serde_json::to_value(p).expect("enum"))
+        .collect();
+    json!({ "type": role.name(), "permissions": permissions })
+}
+
+fn resource_json(state: &MissionsState, hash: &str) -> Option<Value> {
+    state.resources.by_hash(hash, None).into_iter().next().map(|r| r.resource_json())
+}
+
+#[derive(Default)]
+struct MissionExtras {
+    token: Option<String>,
+    owner_role: Option<Role>,
+    changes: Option<Vec<ChangeRecord>>,
+    logs: Option<Vec<LogEntryRecord>>,
+    /// `Mission.clear()`: no content (forbidden reads at API ≥ 3,
+    /// password-protected missions in the list).
+    cleared: bool,
+    /// Details and keywords on the adds (`hydrateDetails`).
+    details: bool,
+}
+
+fn mission_json(state: &MissionsState, m: &MissionRecord, groups: &BTreeSet<String>, extras: MissionExtras) -> Value {
+    let f = &m.fields;
+    let mut uids = Vec::new();
+    let mut contents = Vec::new();
+    if !extras.cleared {
+        for add in &m.contents {
+            let mut entry = serde_json::Map::new();
+            match &add.content {
+                Content::Uid(uid) => {
+                    entry.insert("data".into(), uid.clone().into());
+                }
+                Content::Hash(hash) => {
+                    if let Some(resource) = resource_json(state, hash) {
+                        entry.insert("data".into(), resource);
+                    }
+                }
+            }
+            entry.insert("timestamp".into(), pad_millis(add.timestamp_ms).into());
+            entry.insert("creatorUid".into(), add.creator_uid.clone().into());
+            if extras.details {
+                if let Some(keywords) = m.content_keywords.get(&add.content) {
+                    entry.insert("keywords".into(), json!(keywords));
+                }
+                if let Content::Uid(uid) = &add.content
+                    && let Some(details) = state.latest_cot.uid_details(uid) {
+                        entry.insert("details".into(), details);
+                    }
+            }
+            match add.content {
+                Content::Uid(_) => uids.push(Value::Object(entry)),
+                Content::Hash(_) => contents.push(Value::Object(entry)),
+            }
+        }
+    }
+    let mut out = serde_json::Map::new();
+    let mut put = |k: &str, v: Value| {
+        out.insert(k.to_string(), v);
+    };
+    put("name", m.name.clone().into());
+    put("description", f.description.clone().into());
+    put("chatRoom", f.chat_room.clone().into());
+    put("baseLayer", f.base_layer.clone().into());
+    put("bbox", f.bbox.clone().into());
+    if !f.bounding_polygon.is_empty() {
+        put("boundingPolygon", f.bounding_polygon.clone().into());
+    }
+    put("path", f.path.clone().into());
+    put("classification", f.classification.clone().into());
+    put("tool", m.tool.clone().into());
+    put("keywords", json!(m.keywords));
+    put("creatorUid", m.creator_uid.clone().into());
+    put("createTime", pad_millis(m.create_time_ms).into());
+    put("lastEdited", pad_millis(m.last_edited_ms).into());
+    put("groups", json!(groups));
+    put("externalData", json!([]));
+    put("feeds", json!([]));
+    put("mapLayers", json!([]));
+    if let Some(role) = m.default_role {
+        put("defaultRole", role_json(role));
+    }
+    if let Some(role) = extras.owner_role {
+        put("ownerRole", role_json(role));
+    }
+    put("inviteOnly", m.invite_only.into());
+    put("expiration", f.expiration.into());
+    put("guid", m.guid.clone().into());
+    put("uids", uids.into());
+    put("contents", contents.into());
+    put("passwordProtected", m.password_protected().into());
+    if let Some(token) = extras.token {
+        put("token", token.into());
+    }
+    if let Some(changes) = extras.changes {
+        put("missionChanges", changes.iter().map(|c| change_json(state, c)).collect());
+    }
+    if let Some(logs) = extras.logs {
+        put("logs", logs.iter().map(log_json).collect());
+    }
+    Value::Object(out)
+}
+
+/// The mission's groups as the caller sees them
+/// (`getGroupNamesForBitVectorString(mission, userGroups)`).
+fn groups_seen(caller: &Caller, mission: &MissionRecord) -> BTreeSet<String> {
+    if caller.admin {
+        mission.groups.clone()
     } else {
-        Some(error_response(
-            StatusCode::FORBIDDEN,
-            format!(
-                "claimed identity '{claimed}' does not match authenticated connection '{}'",
-                identity.0
-            ),
-        ))
+        mission.groups.intersection(&caller.groups).cloned().collect()
     }
 }
 
-fn mission_error_response(error: MissionError) -> Response {
-    match error {
-        MissionError::AlreadyExists(name) => {
-            error_response(StatusCode::CONFLICT, format!("mission '{name}' already exists"))
+fn change_json(state: &MissionsState, c: &ChangeRecord) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("type".into(), serde_json::to_value(c.change_type).expect("enum"));
+    out.insert("missionName".into(), c.mission_name.clone().into());
+    out.insert("missionGuid".into(), c.mission_guid.clone().into());
+    out.insert("timestamp".into(), pad_millis(c.timestamp_ms).into());
+    out.insert("serverTime".into(), pad_millis(c.server_time_ms).into());
+    out.insert("creatorUid".into(), c.creator_uid.clone().into());
+    out.insert("isFederatedChange".into(), false.into());
+    match &c.content {
+        Some(Content::Uid(uid)) => {
+            out.insert("contentUid".into(), uid.clone().into());
+            if let Some(details) = state.latest_cot.uid_details(uid) {
+                out.insert("details".into(), details);
+            }
         }
-        MissionError::NotFound(name) => {
-            error_response(StatusCode::NOT_FOUND, format!("no mission named '{name}'"))
+        Some(Content::Hash(hash)) => {
+            // `findContentResource`: a placeholder with only the hash if gone.
+            let resource = resource_json(state, hash).unwrap_or_else(|| json!({ "hash": hash }));
+            out.insert("contentResource".into(), resource);
         }
-        MissionError::CannotRemoveLastOwner { name, uid } => error_response(
-            StatusCode::CONFLICT,
-            format!("cannot remove '{uid}' from mission '{name}': it is the last remaining owner"),
-        ),
-        other => error_response(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        None => {}
     }
+    Value::Object(out)
 }
 
-/// `Owner`-only actions (delete, update, role management). `None` if
-/// `identity` holds `Owner` on `name`; `Some(rejection)` otherwise --
-/// including if the mission doesn't exist, so a caller can't distinguish
-/// "not found" from "not yours" through this check alone (the handler's own
-/// subsequent `NotFound` handling covers the former distinctly where it
-/// matters, e.g. after a real mutation attempt).
-fn require_owner(store: &MissionStore, name: &str, identity: &PeerIdentity) -> Option<Response> {
-    match store.role_of(name, &identity.0) {
-        Some(MissionRole::Owner) => None,
-        _ => Some(error_response(
-            StatusCode::FORBIDDEN,
-            "this action requires the Owner role on this mission".to_string(),
-        )),
+fn subscription_json(state: &MissionsState, s: &SubscriptionRecord, mission: Option<Value>, with_token: bool) -> Value {
+    let _ = state;
+    let mut out = serde_json::Map::new();
+    if with_token {
+        out.insert("token".into(), s.token.clone().into());
     }
+    if let Some(mission) = mission {
+        out.insert("mission".into(), mission);
+    }
+    out.insert("clientUid".into(), s.client_uid.clone().into());
+    out.insert("username".into(), s.username.clone().into());
+    out.insert("createTime".into(), cot_date_millis(s.create_time_ms).into());
+    out.insert("role".into(), role_json(s.role));
+    Value::Object(out)
 }
 
-/// Adding content -- official `MISSION_WRITE`: `Owner` or `Subscriber`.
-/// A caller with no role, or `ReadOnlySubscriber`, is rejected.
-fn require_write_role(store: &MissionStore, name: &str, identity: &PeerIdentity) -> Option<Response> {
-    match store.role_of(name, &identity.0) {
-        Some(role) if role.can_write() => None,
-        _ => Some(error_response(
-            StatusCode::FORBIDDEN,
-            "this action requires a writing role (Owner or Subscriber) on this mission".to_string(),
-        )),
-    }
+fn invitation_json(i: &InvitationRecord) -> Value {
+    json!({
+        "missionName": i.mission_name,
+        "invitee": i.invitee,
+        "type": i.invitation_type.name(),
+        "creatorUid": i.creator_uid,
+        "createTime": cot_date_millis(i.create_time_ms),
+        "token": i.token,
+        "missionGuid": i.mission_guid,
+        "role": role_json(i.role),
+    })
 }
 
-fn is_admin(state: &MissionsState, identity: &PeerIdentity) -> bool {
-    state.admin_common_name.as_deref() == Some(identity.0.as_str())
+fn log_json(e: &LogEntryRecord) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("id".into(), e.id.clone().into());
+    out.insert("content".into(), e.content.clone().into());
+    out.insert("creatorUid".into(), e.creator_uid.clone().into());
+    out.insert("entryUid".into(), e.entry_uid.clone().into());
+    out.insert("missionNames".into(), json!(e.mission_names));
+    out.insert("servertime".into(), pad_millis(e.server_time_ms).into());
+    if let Some(dtg) = e.dtg_ms {
+        out.insert("dtg".into(), pad_millis(dtg).into());
+    }
+    if let Some(created) = e.created_ms {
+        out.insert("created".into(), pad_millis(created).into());
+    }
+    out.insert("contentHashes".into(), json!(e.content_hashes));
+    out.insert("keywords".into(), json!(e.keywords));
+    Value::Object(out)
 }
 
-/// Whether `identity` may see `mission` at all: it shares one of the
-/// mission's groups (either direction), or it's the admin -- the official
-/// server's mission group check (`isGroupVectorAllowed`).
-fn can_see(state: &MissionsState, mission: &Mission, identity: &PeerIdentity) -> bool {
-    if is_admin(state, identity) {
-        return true;
-    }
-    let mine = state.groups.all_group_names(&identity.0);
-    mission.groups.iter().any(|group| mine.contains(group))
+fn ok(kind: &'static str, data: Value) -> ApiResult {
+    Ok(api_response(kind, data).into_response())
 }
 
-/// 404 -- not 403 -- for a mission the caller can't see, so its existence
-/// doesn't leak outside its groups.
-fn require_visible(state: &MissionsState, name: &str, identity: &PeerIdentity) -> Option<Response> {
-    match state.store.get(name) {
-        Some(mission) if can_see(state, &mission, identity) => None,
-        _ => Some(mission_error_response(MissionError::NotFound(name.to_string()))),
-    }
+fn created(kind: &'static str, data: Value) -> ApiResult {
+    Ok((StatusCode::CREATED, api_response(kind, data)).into_response())
 }
 
-/// Validate a requested group list: every group must exist, and a
-/// non-admin may only use groups it belongs to (it can't place a mission
-/// where it couldn't see it itself).
-fn validate_groups(state: &MissionsState, groups: &[String], identity: &PeerIdentity) -> Option<Response> {
-    if groups.is_empty() {
-        return Some(error_response(StatusCode::BAD_REQUEST, "a mission needs at least one group".to_string()));
-    }
-    if let Some(unknown) = groups.iter().find(|g| !state.groups.exists(g)) {
-        return Some(error_response(StatusCode::BAD_REQUEST, format!("unknown group '{unknown}'")));
-    }
-    if !is_admin(state, identity) {
-        let mine = state.groups.all_group_names(&identity.0);
-        if let Some(foreign) = groups.iter().find(|g| !mine.contains(*g)) {
-            return Some(error_response(
-                StatusCode::FORBIDDEN,
-                format!("not a member of group '{foreign}'"),
-            ));
-        }
-    }
-    None
-}
+// --- list / get ----------------------------------------------------------------
 
 async fn list_missions(
     State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
-) -> Json<Vec<Mission>> {
-    Json(
-        state
-            .store
-            .list()
-            .into_iter()
-            .filter(|mission| can_see(&state, mission, &identity))
-            .collect(),
-    )
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let params = Params::parse(query)?;
+    let include_protected = params.bool("passwordProtected", false)?;
+    let include_roles = params.bool("defaultRole", false)?;
+    let tool = params.get("tool").filter(|t| !t.is_empty()).unwrap_or("public").to_string();
+    // `getAllMissionsByToolNoGroupCheck`, newest first, then a set ordered
+    // (and de-duplicated) by lowercase name.
+    let mut candidates: Vec<MissionRecord> = state
+        .store
+        .list()
+        .into_iter()
+        .filter(|m| {
+            !m.invite_only
+                && (include_protected || !m.password_protected())
+                && (include_roles || matches!(m.default_role, None | Some(Role::Subscriber)))
+                && m.tool == tool
+        })
+        .collect();
+    candidates.sort_by_key(|m| std::cmp::Reverse(m.create_time_ms));
+    let mut by_name: std::collections::BTreeMap<String, MissionRecord> = std::collections::BTreeMap::new();
+    for m in candidates {
+        by_name.entry(m.name.to_lowercase()).or_insert(m);
+    }
+    let missions: Vec<Value> = by_name
+        .values()
+        .filter(|m| visible(&caller, m))
+        .map(|m| {
+            let extras = MissionExtras { cleared: m.password_protected(), ..Default::default() };
+            mission_json(&state, m, &groups_seen(&caller, m), extras)
+        })
+        .collect();
+    ok("Mission", missions.into())
 }
 
-#[derive(Deserialize)]
-struct CreateMissionRequest {
-    description: Option<String>,
-    #[serde(rename = "creatorUid")]
-    creator_uid: String,
-    #[serde(default)]
-    keywords: Vec<String>,
-    /// Groups the mission is visible in; default: the creator's groups.
-    #[serde(default)]
-    groups: Option<Vec<String>>,
-    /// Role subscribers get (official `defaultRole`): `subscriber`
-    /// (default) or `readonly_subscriber` (`MISSION_READONLY_SUBSCRIBER`).
-    #[serde(rename = "defaultRole", default)]
-    default_role: Option<MissionRole>,
+async fn get_mission_impl(state: MissionsState, caller: Caller, key: Key<'_>, params: Params) -> ApiResult {
+    let mission = existing(&state, &caller, key)?;
+    let window = params.window()?;
+    let password = params.string("password");
+    let mut extras = MissionExtras { details: true, ..Default::default() };
+    let readable = if !password.is_empty() {
+        if !password_matches(&mission, &password) {
+            return Err(ApiError::Forbidden("Illegal attempt to access mission! Password did not match.".into()));
+        }
+        extras.token = Some(state.tokens.create(&random_uuid(), TokenType::Access, &mission.name, &mission.guid, now_ms() / 1000));
+        true
+    } else {
+        role_for(&state, &mission, &caller).is_some_and(|r| r.has(Permission::MissionRead))
+    };
+    if !readable {
+        if caller.api_version <= 2 {
+            return Err(ApiError::Forbidden("Illegal attempt to access mission! Request did not have read access.".into()));
+        }
+        extras.cleared = true;
+    } else {
+        if params.bool("changes", false)? {
+            extras.changes = Some(state.store.changes(&mission.guid, window, false)?);
+        }
+        if params.bool("logs", false)? {
+            extras.logs = Some(state.store.log_entries_for(&mission.name, window));
+        }
+    }
+    let json = mission_json(&state, &mission, &groups_seen(&caller, &mission), extras);
+    ok("Mission", json!([json]))
 }
 
-/// TC-MARTI-01/02: strict create.
-async fn create_mission(
+async fn get_mission_by_name(
     State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
     Path(name): Path<String>,
-    Json(request): Json<CreateMissionRequest>,
-) -> Response {
-    if let Some(response) = require_matching_identity(&identity, &request.creator_uid) {
-        return response;
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    get_mission_impl(state, caller, Key::Name(&name), Params::parse(query)?).await
+}
+
+async fn get_mission_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    get_mission_impl(state, caller, Key::Guid(&guid), Params::parse(query)?).await
+}
+
+// --- create / update / delete ------------------------------------------------------
+
+/// What a create/update request asks for, query parameters overridden by
+/// a JSON `Mission` body (`doCreateMissionAllowDupe`).
+struct CreateRequest {
+    creator_uid: String,
+    groups: Vec<String>,
+    fields: MissionFields,
+    tool: String,
+    password: Option<String>,
+    default_role: Option<Role>,
+    expiration_given: bool,
+    invite_only: bool,
+}
+
+fn parse_create(params: &Params, headers: &HeaderMap, body: &Bytes) -> Result<CreateRequest, ApiError> {
+    let mut groups = params.all("group");
+    if groups.is_empty() {
+        groups.push(crate::groups::ANON_GROUP.to_string());
     }
-    let groups = match request.groups {
-        Some(groups) => groups,
-        None => state.groups.all_group_names(&identity.0).into_iter().collect(),
-    };
-    if let Some(response) = validate_groups(&state, &groups, &identity) {
-        return response;
-    }
-    let default_role = request.default_role.unwrap_or(MissionRole::Subscriber);
-    if default_role == MissionRole::Owner {
-        return error_response(StatusCode::BAD_REQUEST, "defaultRole can't be Owner".to_string());
-    }
-    match state.store.create_with(
-        &name,
-        request.description,
-        &request.creator_uid,
-        request.keywords,
+    let expiration = params.long("expiration")?;
+    let mut request = CreateRequest {
+        creator_uid: params.string("creatorUid"),
         groups,
-        default_role,
-        now_unix(),
-    ) {
-        Ok(mission) => (StatusCode::CREATED, Json(mission)).into_response(),
-        Err(error) => mission_error_response(error),
-    }
-}
-
-async fn get_mission(
-    State(state): State<MissionsState>,
-    Extension(identity): Extension<PeerIdentity>,
-    Path(name): Path<String>,
-) -> Response {
-    if let Some(response) = require_visible(&state, &name, &identity) {
-        return response;
-    }
-    match state.store.get(&name) {
-        Some(mission) => Json(mission).into_response(),
-        None => mission_error_response(MissionError::NotFound(name)),
-    }
-}
-
-#[derive(Deserialize)]
-struct UpdateMissionRequest {
-    description: Option<String>,
-    keywords: Option<Vec<String>>,
-    #[serde(rename = "actorUid")]
-    actor_uid: String,
-    /// Replace the groups the mission is visible in (official
-    /// `MISSION_UPDATE_GROUPS`, Owner only).
-    #[serde(default)]
-    groups: Option<Vec<String>>,
-}
-
-/// TC-MARTI-12: partial update, only provided fields change.
-async fn update_mission(
-    State(state): State<MissionsState>,
-    Extension(identity): Extension<PeerIdentity>,
-    Path(name): Path<String>,
-    Json(request): Json<UpdateMissionRequest>,
-) -> Response {
-    if let Some(response) = require_matching_identity(&identity, &request.actor_uid) {
-        return response;
-    }
-    if let Some(response) = require_visible(&state, &name, &identity) {
-        return response;
-    }
-    if let Some(response) = require_owner(&state.store, &name, &identity) {
-        return response;
-    }
-    if let Some(groups) = request.groups {
-        if let Some(response) = validate_groups(&state, &groups, &identity) {
-            return response;
+        fields: MissionFields {
+            description: params.string("description"),
+            chat_room: params.string("chatRoom"),
+            base_layer: params.string("baseLayer"),
+            bbox: params.string("bbox"),
+            bounding_polygon: params.all("boundingPolygon").into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(","),
+            path: params.string("path"),
+            classification: params.string("classification"),
+            expiration: expiration.unwrap_or(-1),
+        },
+        tool: params.get("tool").filter(|t| !t.is_empty()).unwrap_or("public").to_string(),
+        password: params.get("password").map(String::from),
+        default_role: params.role("defaultRole")?,
+        expiration_given: expiration.is_some(),
+        invite_only: params.bool("inviteOnly", false)?,
+    };
+    let is_json = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().contains("application/json"));
+    if is_json && !body.is_empty() {
+        let mission: Value =
+            serde_json::from_slice(body).map_err(|_| ApiError::BadRequest("exception parsing mission json!".into()))?;
+        let s = |k: &str| mission.get(k).and_then(|v| v.as_str()).map(String::from);
+        let f = &mut request.fields;
+        if let Some(v) = s("description") { f.description = v; }
+        if let Some(v) = s("chatRoom") { f.chat_room = v; }
+        if let Some(v) = s("baseLayer") { f.base_layer = v; }
+        if let Some(v) = s("bbox") { f.bbox = v; }
+        if let Some(v) = s("boundingPolygon") { f.bounding_polygon = v; }
+        if let Some(v) = s("path") { f.path = v; }
+        if let Some(v) = s("classification") { f.classification = v; }
+        if let Some(v) = s("tool") { request.tool = v; }
+        if let Some(v) = mission.get("defaultRole").and_then(|r| r.get("type")).and_then(|t| t.as_str()) {
+            request.default_role = Some(Role::parse(v).ok_or_else(|| ApiError::BadRequest("exception parsing mission json!".into()))?);
         }
-        if let Err(error) = state.store.set_groups(&name, groups, &request.actor_uid, now_unix()) {
-            return mission_error_response(error);
+        if let Some(v) = mission.get("expiration").and_then(|v| v.as_i64()) {
+            f.expiration = v;
+            request.expiration_given = true;
+        }
+        if let Some(groups) = mission.get("groups").and_then(|g| g.as_array()) {
+            request.groups = groups.iter().filter_map(|g| g.as_str().map(String::from)).collect();
+        }
+        if let Some(v) = mission.get("inviteOnly").and_then(|v| v.as_bool()) {
+            request.invite_only = v;
         }
     }
-    let update = MissionUpdate {
-        description: request.description,
-        keywords: request.keywords,
+    Ok(request)
+}
+
+/// The mission's groups for a request: `__ANON__` alone means the caller's
+/// own; otherwise they must exist and be a subset of the caller's.
+fn mission_groups(state: &MissionsState, caller: &Caller, requested: &[String]) -> Result<BTreeSet<String>, ApiError> {
+    if caller.groups.is_empty() && !caller.admin {
+        return Err(ApiError::Forbidden("Missing groups for user!".into()));
+    }
+    if requested.len() == 1 && requested[0] == crate::groups::ANON_GROUP && !caller.groups.contains(crate::groups::ANON_GROUP) {
+        return Ok(caller.groups.clone());
+    }
+    let requested: BTreeSet<String> = requested
+        .iter()
+        .filter(|g| state.groups.exists(g) || g.as_str() == crate::groups::ANON_GROUP)
+        .cloned()
+        .collect();
+    if requested.is_empty() {
+        return Err(ApiError::Forbidden("Missing groups for mission!".into()));
+    }
+    if !caller.admin && !requested.is_subset(&caller.groups) {
+        return Err(ApiError::Forbidden("Illegal attempt to set groupVector for Mission!".into()));
+    }
+    Ok(requested)
+}
+
+/// `doCreateMissionAllowDupe`'s `allowDupe` / `allowDupeInDifferentGroups`.
+struct Dupe {
+    allow: bool,
+    in_different_groups: bool,
+}
+
+async fn create_impl(
+    state: MissionsState,
+    caller: Caller,
+    name: String,
+    params: Params,
+    headers: HeaderMap,
+    body: Bytes,
+    dupe: Dupe,
+) -> ApiResult {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("empty 'name' path parameter".into()));
+    }
+    let request = parse_create(&params, &headers, &body)?;
+    let groups = mission_groups(&state, &caller, &request.groups)?;
+    let existing = lookup(&state, &caller, Key::Name(&name), true)?;
+    let now = now_ms();
+    match existing {
+        Some(mission) if !(dupe.allow && dupe.in_different_groups) => {
+            update_existing(&state, &caller, mission, request, groups, params.bool("allowGroupChange", false)?, now)
+        }
+        _ => {
+            let password_hash = match request.password.as_deref().filter(|p| !p.is_empty()) {
+                Some(p) => Some(hash_password(p)?),
+                None => None,
+            };
+            let mission = state.store.create(
+                NewMission {
+                    guid: random_uuid(),
+                    name,
+                    fields: request.fields,
+                    tool: request.tool,
+                    creator_uid: request.creator_uid.clone(),
+                    groups,
+                    password_hash,
+                    default_role: request.default_role,
+                    invite_only: request.invite_only,
+                },
+                now,
+            )?;
+            let tokens = Arc::clone(&state.tokens);
+            let (mname, mguid) = (mission.name.clone(), mission.guid.clone());
+            let owner = state.store.subscribe(&mission.guid, &request.creator_uid, &caller.username, Role::Owner, now, |id| {
+                tokens.create(id, TokenType::Subscription, &mname, &mguid, now / 1000)
+            })?;
+            let extras = MissionExtras { token: Some(owner.token), owner_role: Some(Role::Owner), details: true, ..Default::default() };
+            let json = mission_json(&state, &mission, &groups_seen(&caller, &mission), extras);
+            created("Mission", json!([json]))
+        }
+    }
+}
+
+fn update_existing(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    request: CreateRequest,
+    groups: BTreeSet<String>,
+    allow_group_change: bool,
+    now: i64,
+) -> ApiResult {
+    let role = role_for(state, &mission, caller);
+    if groups != mission.groups {
+        let may = caller.admin || role == Some(Role::Owner);
+        if !(may && allow_group_change) {
+            return Err(ApiError::Forbidden("Illegal attempt to change Mission groups!".into()));
+        }
+    }
+    if !role.is_some_and(|r| r.has(Permission::MissionWrite)) {
+        return Err(ApiError::Forbidden("Illegal attempt to update mission!".into()));
+    }
+    let mut fields = request.fields.clone();
+    if !request.expiration_given {
+        fields.expiration = -1;
+    }
+    if fields != mission.fields {
+        state.store.set_fields(&mission.guid, fields, now)?;
+    }
+    if let Some(password) = request.password.as_deref().filter(|p| !p.is_empty()) {
+        if !role.is_some_and(|r| r.has(Permission::MissionSetPassword)) {
+            return Err(ApiError::Forbidden("Illegal attempt to update mission password!".into()));
+        }
+        state.store.set_password(&mission.guid, Some(hash_password(password)?), now)?;
+    }
+    if let Some(default_role) = request.default_role
+        && mission.default_role != Some(default_role) {
+            let token_role = if caller.admin {
+                Some(Role::Owner)
+            } else {
+                role_from_token(state, &mission, caller, &[TokenType::Subscription])
+            };
+            let Some(token_role) = token_role else {
+                return Err(ApiError::Forbidden("Could not extract role from token to set mission default role!".into()));
+            };
+            if !token_role.has(Permission::MissionSetRole) {
+                return Err(ApiError::Forbidden("Illegal attempt to update default mission role with insufficient permissions!".into()));
+            }
+            if !token_role.has_all(default_role) {
+                return Err(ApiError::Forbidden("Illegal attempt to update default mission role beyond current permissions!".into()));
+            }
+            state.store.set_default_role(&mission.guid, Some(default_role), now)?;
+        }
+    if groups != mission.groups && role.is_some_and(|r| r.has(Permission::MissionUpdateGroups)) {
+        state.store.set_groups(&mission.guid, groups, now)?;
+    }
+    let updated = state.store.by_guid(&mission.guid).ok_or(ApiError::Internal)?;
+    let json = mission_json(state, &updated, &updated.groups, MissionExtras { details: true, ..Default::default() });
+    ok("Mission", json!([json]))
+}
+
+async fn create_mission_put(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    create_impl(state, caller, name, Params::parse(query)?, headers, body, Dupe { allow: false, in_different_groups: false }).await
+}
+
+async fn create_mission_post(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let params = Params::parse(query)?;
+    let allow_dupe = params.bool("allowDupe", false)?;
+    create_impl(state, caller, name, params, headers, body, Dupe { allow: allow_dupe, in_different_groups: true }).await
+}
+
+fn delete_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+    let role = role_for(state, &mission, caller);
+    require(role, Permission::MissionWrite)?;
+    if params.bool("deepDelete", false)? && !role.is_some_and(|r| r.has(Permission::MissionDelete)) {
+        return Err(ApiError::Forbidden(format!(
+            "Attempt to deepDelete mission: {}, by unauthorized user: {}",
+            mission.name,
+            params.string("creatorUid")
+        )));
+    }
+    let deleted = state.store.delete(&mission.guid, &params.string("creatorUid"), now_ms())?;
+    let json = mission_json(state, &deleted, &groups_seen(caller, &deleted), MissionExtras::default());
+    ok("Mission", json!([json]))
+}
+
+async fn delete_mission_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    delete_impl(&state, &caller, mission, &Params::parse(query)?)
+}
+
+async fn delete_mission_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let params = Params::parse(query)?;
+    let guid = params.string("guid");
+    if guid.is_empty() {
+        return Err(ApiError::BadRequest("empty 'guid' path parameter".into()));
+    }
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    delete_impl(&state, &caller, mission, &params)
+}
+
+// --- contents -----------------------------------------------------------------------
+
+fn add_contents_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params, body: &Bytes) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionWrite)?;
+    let content: Value = serde_json::from_slice(body).map_err(|_| ApiError::BadRequest(String::new()))?;
+    let list = |k: &str| -> Vec<String> {
+        content.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
     };
-    match state.store.update(&name, update, &request.actor_uid, now_unix()) {
-        Ok(mission) => Json(mission).into_response(),
-        Err(error) => mission_error_response(error),
+    let (hashes, uids) = (list("hashes"), list("uids"));
+    let has_paths = content.get("paths").and_then(|p| p.as_object()).is_some_and(|p| !p.is_empty());
+    if hashes.is_empty() && uids.is_empty() && !has_paths {
+        return Err(ApiError::BadRequest("at least one hash or uid must be provided in request".into()));
     }
+    let creator = params.string("creatorUid");
+    let now = now_ms();
+    for hash in hashes {
+        // `getCachedResourcesByHash`: unknown hashes are skipped.
+        if !state.resources.by_hash(&hash, None).is_empty() {
+            state.store.add_content(&mission.guid, Content::Hash(hash), &creator, now)?;
+        }
+    }
+    for uid in uids {
+        state.store.add_content(&mission.guid, Content::Uid(uid), &creator, now)?;
+    }
+    let updated = state.store.by_guid(&mission.guid).ok_or(ApiError::Internal)?;
+    // The official response copies the mission and clears its groups.
+    let json = mission_json(state, &updated, &BTreeSet::new(), MissionExtras::default());
+    ok("Mission", json!([json]))
 }
 
-async fn delete_mission(
+async fn add_contents_by_name(
     State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
     Path(name): Path<String>,
-) -> Response {
-    if let Some(response) = require_visible(&state, &name, &identity) {
-        return response;
-    }
-    if let Some(response) = require_owner(&state.store, &name, &identity) {
-        return response;
-    }
-    match state.store.delete(&name) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => mission_error_response(error),
-    }
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    add_contents_impl(&state, &caller, mission, &Params::parse(query)?, &body)
 }
 
-/// TC-MARTI-05.
-async fn get_changes(
+async fn add_contents_by_guid(
     State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    add_contents_impl(&state, &caller, mission, &Params::parse(query)?, &body)
+}
+
+fn remove_content_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionWrite)?;
+    let creator = params.string("creatorUid");
+    let now = now_ms();
+    if let Some(hash) = params.get("hash").filter(|h| !h.is_empty()) {
+        state.store.remove_content(&mission.guid, Content::Hash(hash.to_string()), &creator, now)?;
+    }
+    if let Some(uid) = params.get("uid").filter(|u| !u.is_empty()) {
+        state.store.remove_content(&mission.guid, Content::Uid(uid.to_string()), &creator, now)?;
+    }
+    let updated = state.store.by_guid(&mission.guid).ok_or(ApiError::Internal)?;
+    let json = mission_json(state, &updated, &groups_seen(caller, &updated), MissionExtras::default());
+    ok("Mission", json!([json]))
+}
+
+async fn remove_content_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
     Path(name): Path<String>,
-) -> Response {
-    if let Some(response) = require_visible(&state, &name, &identity) {
-        return response;
-    }
-    match state.store.changes(&name) {
-        Ok(changes) => Json(changes).into_response(),
-        Err(error) => mission_error_response(error),
-    }
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    remove_content_impl(&state, &caller, mission, &Params::parse(query)?)
 }
 
-#[derive(Deserialize)]
-struct AddContentRequest {
-    hash: String,
-    filename: String,
-    #[serde(rename = "creatorUid")]
-    creator_uid: String,
-}
-
-async fn add_content(
+async fn remove_content_by_guid(
     State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    remove_content_impl(&state, &caller, mission, &Params::parse(query)?)
+}
+
+// --- changes ------------------------------------------------------------------------
+
+fn changes_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionRead)?;
+    let changes = state.store.changes(&mission.guid, params.window()?, params.bool("squashed", true)?)?;
+    ok("MissionChange", changes.iter().map(|c| change_json(state, c)).collect())
+}
+
+async fn changes_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
     Path(name): Path<String>,
-    Json(request): Json<AddContentRequest>,
-) -> Response {
-    if let Some(response) = require_matching_identity(&identity, &request.creator_uid) {
-        return response;
-    }
-    if let Some(response) = require_visible(&state, &name, &identity) {
-        return response;
-    }
-    if let Some(response) = require_write_role(&state.store, &name, &identity) {
-        return response;
-    }
-    let content = MissionContentRef {
-        hash: request.hash,
-        filename: request.filename,
-        added_at_unix: now_unix(),
-        creator_uid: request.creator_uid,
-    };
-    match state.store.add_content(&name, content, now_unix()) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(error) => mission_error_response(error),
-    }
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    changes_impl(&state, &caller, mission, &Params::parse(query)?)
 }
 
-#[derive(Deserialize)]
-struct SubscriptionQuery {
-    uid: String,
-}
-
-/// TC-MARTI-04. A caller may only subscribe *itself* — `uid` must match the
-/// authenticated identity, same policy as every other identity claim in
-/// this module.
-async fn subscribe(
+async fn changes_by_guid(
     State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    changes_impl(&state, &caller, mission, &Params::parse(query)?)
+}
+
+// --- keywords -------------------------------------------------------------------------
+
+fn keyword_list(body: &Bytes) -> Result<Vec<String>, ApiError> {
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_slice::<Vec<String>>(body).map_err(|_| ApiError::BadRequest("Invalid Request Body".into()))
+}
+
+fn writable_by_name(state: &MissionsState, identity: &PeerIdentity, headers: &HeaderMap, name: &str) -> Result<(Caller, MissionRecord), ApiError> {
+    let caller = caller(state, identity, headers);
+    let mission = existing(state, &caller, Key::Name(name))?;
+    require(role_for(state, &mission, &caller), Permission::MissionWrite)?;
+    Ok((caller, mission))
+}
+
+fn mission_response(state: &MissionsState, caller: &Caller, guid: &str) -> ApiResult {
+    let m = state.store.by_guid(guid).ok_or(ApiError::Internal)?;
+    let json = mission_json(state, &m, &groups_seen(caller, &m), MissionExtras::default());
+    ok("Mission", json!([json]))
+}
+
+async fn set_keywords(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
     Path(name): Path<String>,
-    Query(query): Query<SubscriptionQuery>,
-) -> Response {
-    if let Some(response) = require_matching_identity(&identity, &query.uid) {
-        return response;
-    }
-    if let Some(response) = require_visible(&state, &name, &identity) {
-        return response;
-    }
-    match state.store.subscribe(&name, &query.uid, now_unix()) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(error) => mission_error_response(error),
-    }
+    body: Bytes,
+) -> ApiResult {
+    let (caller, mission) = writable_by_name(&state, &identity, &headers, &name)?;
+    state.store.set_keywords(&mission.guid, keyword_list(&body)?.into_iter().collect(), now_ms())?;
+    mission_response(&state, &caller, &mission.guid)
 }
 
-async fn unsubscribe(
+async fn clear_keywords(
     State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
     Path(name): Path<String>,
-    Query(query): Query<SubscriptionQuery>,
-) -> Response {
-    if let Some(response) = require_matching_identity(&identity, &query.uid) {
-        return response;
-    }
-    if let Some(response) = require_visible(&state, &name, &identity) {
-        return response;
-    }
-    match state.store.unsubscribe(&name, &query.uid, now_unix()) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(error) => mission_error_response(error),
-    }
+) -> ApiResult {
+    let (caller, mission) = writable_by_name(&state, &identity, &headers, &name)?;
+    state.store.set_keywords(&mission.guid, BTreeSet::new(), now_ms())?;
+    mission_response(&state, &caller, &mission.guid)
 }
 
-#[derive(Deserialize)]
-struct AssignRoleRequest {
-    uid: String,
-    role: MissionRole,
-}
-
-/// `Owner`-only: grant (or overwrite) another identity's role on this
-/// mission. Rejects demoting the mission's last `Owner` (see
-/// `MissionStore::assign_role`'s own doc comment) with 409, the same
-/// status this module already uses for other real state conflicts.
-async fn assign_role(
+async fn remove_keyword(
     State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
-    Path(name): Path<String>,
-    Json(request): Json<AssignRoleRequest>,
-) -> Response {
-    if let Some(response) = require_visible(&state, &name, &identity) {
-        return response;
+    headers: HeaderMap,
+    Path((name, keyword)): Path<(String, String)>,
+) -> ApiResult {
+    let (caller, mission) = writable_by_name(&state, &identity, &headers, &name)?;
+    let mut keywords = mission.keywords.clone();
+    if !keywords.remove(&keyword) {
+        return Err(ApiError::BadRequest(format!("mission '{name}' did not contain keyword {keyword}")));
     }
-    if let Some(response) = require_owner(&state.store, &name, &identity) {
-        return response;
-    }
-    match state.store.assign_role(&name, &request.uid, request.role, &identity.0, now_unix()) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(error) => mission_error_response(error),
-    }
+    state.store.set_keywords(&mission.guid, keywords, now_ms())?;
+    mission_response(&state, &caller, &mission.guid)
 }
 
-/// `Owner`-only: revoke another identity's role entirely. Same last-owner
-/// protection as [`assign_role`].
-async fn revoke_role(
+async fn set_content_keywords_impl(state: MissionsState, identity: PeerIdentity, headers: HeaderMap, name: String, content: Content, body: Bytes) -> ApiResult {
+    let (_, mission) = writable_by_name(&state, &identity, &headers, &name)?;
+    let keywords = keyword_list(&body)?;
+    if keywords.is_empty() {
+        return Err(ApiError::BadRequest("empty keywords array".into()));
+    }
+    state.store.set_content_keywords(&mission.guid, content, keywords)?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn set_uid_keywords(
     State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
     Path((name, uid)): Path<(String, String)>,
-) -> Response {
-    if let Some(response) = require_visible(&state, &name, &identity) {
-        return response;
+    body: Bytes,
+) -> ApiResult {
+    set_content_keywords_impl(state, identity, headers, name, Content::Uid(uid), body).await
+}
+
+async fn set_hash_keywords(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((name, hash)): Path<(String, String)>,
+    body: Bytes,
+) -> ApiResult {
+    set_content_keywords_impl(state, identity, headers, name, Content::Hash(hash), body).await
+}
+
+async fn clear_uid_keywords(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((name, uid)): Path<(String, String)>,
+) -> ApiResult {
+    let (_, mission) = writable_by_name(&state, &identity, &headers, &name)?;
+    state.store.set_content_keywords(&mission.guid, Content::Uid(uid), Vec::new())?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn clear_hash_keywords(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((name, hash)): Path<(String, String)>,
+) -> ApiResult {
+    let (_, mission) = writable_by_name(&state, &identity, &headers, &name)?;
+    state.store.set_content_keywords(&mission.guid, Content::Hash(hash), Vec::new())?;
+    Ok(StatusCode::OK.into_response())
+}
+
+// --- token / password / expiration ---------------------------------------------------------
+
+async fn access_token(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    let params = Params::parse(query)?;
+    // `validatePassword`: only checked when the mission has one.
+    if mission.password_protected() && !password_matches(&mission, &params.string("password")) {
+        return Err(ApiError::Forbidden("Illegal attempt to access mission! Password did not match.".into()));
     }
-    if let Some(response) = require_owner(&state.store, &name, &identity) {
-        return response;
+    let token = state.tokens.create(&random_uuid(), TokenType::Access, &mission.name, &mission.guid, now_ms() / 1000);
+    created("java.lang.String", token.into())
+}
+
+fn set_password_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, password: Option<&str>) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionSetPassword)?;
+    let hash = match password {
+        // The official PUT hashes whatever it gets, the empty default too.
+        Some(p) => Some(hash_password(p)?),
+        None => None,
+    };
+    state.store.set_password(&mission.guid, hash, now_ms())?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn set_password_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    let password = Params::parse(query)?.string("password");
+    set_password_impl(&state, &caller, mission, Some(&password))
+}
+
+async fn set_password_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    let password = Params::parse(query)?.string("password");
+    set_password_impl(&state, &caller, mission, Some(&password))
+}
+
+async fn remove_password_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    set_password_impl(&state, &caller, mission, None)
+}
+
+async fn remove_password_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    set_password_impl(&state, &caller, mission, None)
+}
+
+fn set_expiration_impl(state: &MissionsState, mission: MissionRecord, params: &Params) -> ApiResult {
+    // No `@PreAuthorize` on the official endpoint.
+    let mut fields = mission.fields.clone();
+    fields.expiration = params.long("expiration")?.unwrap_or(-1);
+    state.store.set_fields(&mission.guid, fields, now_ms())?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn set_expiration_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    set_expiration_impl(&state, mission, &Params::parse(query)?)
+}
+
+async fn set_expiration_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    set_expiration_impl(&state, mission, &Params::parse(query)?)
+}
+
+// --- subscriptions ----------------------------------------------------------------------
+
+fn subscription_get_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+    let sub = state
+        .store
+        .find_subscription(&mission.guid, &params.string("uid"), &caller.username)
+        .ok_or_else(|| ApiError::NotFound("Mission subscription not found".into()))?;
+    ok("com.bbn.marti.sync.model.MissionSubscription", subscription_json(state, &sub, None, true))
+}
+
+async fn subscription_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    subscription_get_impl(&state, &caller, mission, &Params::parse(query)?)
+}
+
+async fn subscription_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    subscription_get_impl(&state, &caller, mission, &Params::parse(query)?)
+}
+
+/// `createMissionSubscription`.
+fn subscribe_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+    let window = params.window()?;
+    let password = params.string("password");
+    let mut sub_role = role_from_token(state, &mission, caller, &[TokenType::Invitation, TokenType::Subscription, TokenType::Access]);
+    if mission.password_protected() {
+        if !password.is_empty() {
+            if !password_matches(&mission, &password) {
+                return Err(ApiError::Forbidden("Illegal attempt to subscribe to mission! Password did not match.".into()));
+            }
+        } else if sub_role.is_none() {
+            return Err(ApiError::Forbidden("Illegal attempt to subscribe to mission! No token role provided.".into()));
+        }
+    } else if !password.is_empty() {
+        return Err(ApiError::Forbidden("Illegal attempt to subscribe to mission! No password provided.".into()));
+    } else if mission.invite_only && sub_role.is_none() {
+        sub_role = state
+            .store
+            .invitations_for(&caller.username, InvitationType::UserName)
+            .into_iter()
+            .find(|i| i.mission_guid == mission.guid)
+            .map(|i| i.role);
+        if sub_role.is_none() {
+            return Err(ApiError::Forbidden("Illegal attempt to subscribe to invite only mission!".into()));
+        }
     }
-    match state.store.revoke_role(&name, &uid, &identity.0, now_unix()) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => mission_error_response(error),
+    let role = sub_role.unwrap_or_else(|| mission.effective_default_role());
+    let (uid, topic) = (params.string("uid"), params.string("topic"));
+    if uid.is_empty() && topic.is_empty() {
+        return Err(ApiError::BadRequest("either 'uid' or 'topic' parameter must be specified".into()));
     }
+    let client_uid = if topic.is_empty() { uid.clone() } else { format!("topic:{topic}") };
+    let now = now_ms();
+    let tokens = Arc::clone(&state.tokens);
+    let (name, guid) = (mission.name.clone(), mission.guid.clone());
+    let sub = state.store.subscribe(&mission.guid, &client_uid, &caller.username, role, now, |id| {
+        tokens.create(id, TokenType::Subscription, &name, &guid, now / 1000)
+    })?;
+    // Subscribing consumes the client's clientUid invitation.
+    state.store.uninvite(&mission.guid, &uid, InvitationType::ClientUid)?;
+    let mission_value = (caller.api_version >= 3).then(|| {
+        let extras = MissionExtras {
+            changes: state.store.changes(&mission.guid, window, false).ok(),
+            logs: Some(state.store.log_entries_for(&mission.name, window)),
+            details: true,
+            ..Default::default()
+        };
+        mission_json(state, &mission, &groups_seen(caller, &mission), extras)
+    });
+    created("com.bbn.marti.sync.model.MissionSubscription", subscription_json(state, &sub, mission_value, true))
+}
+
+async fn subscribe_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    subscribe_impl(&state, &caller, mission, &Params::parse(query)?)
+}
+
+async fn subscribe_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    subscribe_impl(&state, &caller, mission, &Params::parse(query)?)
+}
+
+/// `deleteMissionSubscription`: with `disconnectOnly` (default true) the
+/// stored subscription stays; only the live routing ends.
+fn unsubscribe_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionRead)?;
+    let (uid, topic) = (params.string("uid"), params.string("topic"));
+    let client_uid = if topic.is_empty() { uid } else { format!("topic:{topic}") };
+    if !params.bool("disconnectOnly", true)? {
+        state.store.unsubscribe(&mission.guid, &client_uid, Some(&caller.username))?;
+    }
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn unsubscribe_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    unsubscribe_impl(&state, &caller, mission, &Params::parse(query)?)
+}
+
+async fn unsubscribe_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    unsubscribe_impl(&state, &caller, mission, &Params::parse(query)?)
+}
+
+/// `setSubscriptionRole` → `inviteOrUpdate`.
+fn set_subscription_roles_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params, body: &Bytes) -> ApiResult {
+    let role = role_for(state, &mission, caller);
+    require(role, Permission::MissionSetRole)?;
+    let creator = params.get("creatorUid").ok_or_else(|| ApiError::BadRequest("missing creatorUid".into()))?.to_string();
+    let subs: Vec<Value> = serde_json::from_slice(body).map_err(|_| ApiError::BadRequest("Invalid Request Body".into()))?;
+    let mut parsed = Vec::new();
+    for s in &subs {
+        let client_uid = s.get("clientUid").and_then(|v| v.as_str());
+        let new_role = s.get("role").and_then(|r| r.get("type")).and_then(|t| t.as_str()).and_then(Role::parse);
+        let (Some(client_uid), Some(new_role)) = (client_uid, new_role) else {
+            return Err(ApiError::BadRequest("missing clientUid or role".into()));
+        };
+        if !may_assign(&mission, role, new_role) {
+            return Err(ApiError::Forbidden(format!("validateRoleAssignment failed! Illegal attempt to assign role {}", new_role.name())));
+        }
+        let username = s.get("username").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        parsed.push((client_uid.to_string(), username, new_role));
+    }
+    let now = now_ms();
+    for (client_uid, username, new_role) in parsed {
+        let exists = state.store.subscriptions(&mission.guid).iter().any(|s| {
+            if !username.is_empty() { s.username == username } else { s.client_uid == client_uid }
+        });
+        if exists {
+            state.store.set_subscription_role(&mission.guid, &client_uid, &username, new_role)?;
+        } else {
+            let (invitee, kind) = if !username.is_empty() { (username, InvitationType::UserName) } else { (client_uid, InvitationType::ClientUid) };
+            invite_record(state, &mission, &invitee, kind, new_role, &creator, now)?;
+        }
+    }
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn set_subscription_roles_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    set_subscription_roles_impl(&state, &caller, mission, &Params::parse(query)?, &body)
+}
+
+async fn set_subscription_roles_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    set_subscription_roles_impl(&state, &caller, mission, &Params::parse(query)?, &body)
+}
+
+fn subscribers_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionRead)?;
+    let uids: Vec<Value> = state.store.subscriptions(&mission.guid).into_iter().map(|s| s.client_uid.into()).collect();
+    ok("MissionSubscription", uids.into())
+}
+
+async fn subscribers_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    subscribers_impl(&state, &caller, mission)
+}
+
+async fn subscribers_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    subscribers_impl(&state, &caller, mission)
+}
+
+fn subscription_roles_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionRead)?;
+    let subs: Vec<Value> = state.store.subscriptions(&mission.guid).iter().map(|s| subscription_json(state, s, None, false)).collect();
+    ok("MissionSubscription", subs.into())
+}
+
+async fn subscription_roles_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    subscription_roles_impl(&state, &caller, mission)
+}
+
+async fn subscription_roles_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    subscription_roles_impl(&state, &caller, mission)
+}
+
+async fn all_subscriptions(State(state): State<MissionsState>, Extension(identity): Extension<PeerIdentity>, headers: HeaderMap) -> ApiResult {
+    if !caller(&state, &identity, &headers).admin {
+        return Err(ApiError::AccessDenied);
+    }
+    // `List<Map.Entry<String, String>>` → `{"<mission name>": "<client uid>"}` each.
+    let entries: Vec<Value> = state.store.all_subscriptions().into_iter().map(|(_, name, uid)| json!({ name: uid })).collect();
+    ok("MissionSubscription", entries.into())
+}
+
+async fn all_subscriptions_with_guid(State(state): State<MissionsState>, Extension(identity): Extension<PeerIdentity>, headers: HeaderMap) -> ApiResult {
+    if !caller(&state, &identity, &headers).admin {
+        return Err(ApiError::AccessDenied);
+    }
+    let entries: Vec<Value> = state
+        .store
+        .all_subscriptions()
+        .into_iter()
+        // A `Map.Entry` key is serialized with its `toString`, `guid=name`.
+        .map(|(guid, name, uid)| json!({ format!("{guid}={name}"): uid }))
+        .collect();
+    ok("MissionSubscription", entries.into())
+}
+
+// --- roles ---------------------------------------------------------------------------------
+
+fn role_get_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord) -> ApiResult {
+    let role = role_for(state, &mission, caller);
+    require(role, Permission::MissionRead)?;
+    ok("com.bbn.marti.sync.model.MissionRole", role.map(role_json).unwrap_or(Value::Null))
+}
+
+async fn role_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    role_get_impl(&state, &caller, mission)
+}
+
+async fn role_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    role_get_impl(&state, &caller, mission)
+}
+
+/// `setMissionRole`: needs `MISSION_SET_ROLE` and a mission with a
+/// default role; no `role` unsubscribes them.
+fn role_set_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, params: &Params) -> ApiResult {
+    let role = role_for(state, &mission, caller);
+    require(role, Permission::MissionSetRole)?;
+    if mission.default_role.is_none() {
+        return Err(ApiError::BadRequest(String::new()));
+    }
+    let (client_uid, username) = (params.string("clientUid"), params.string("username"));
+    match params.role("role")? {
+        Some(new_role) => {
+            if !may_assign(&mission, role, new_role) {
+                return Err(ApiError::Forbidden(format!("validateRoleAssignment failed! Illegal attempt to assign role {}", new_role.name())));
+            }
+            state.store.set_subscription_role(&mission.guid, &client_uid, &username, new_role)?;
+        }
+        None => {
+            state.store.unsubscribe(&mission.guid, &client_uid, Some(&username))?;
+        }
+    }
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn set_role_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    role_set_impl(&state, &caller, mission, &Params::parse(query)?)
+}
+
+async fn set_role_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    role_set_impl(&state, &caller, mission, &Params::parse(query)?)
+}
+
+// --- invitations -----------------------------------------------------------------------------
+
+fn invite_record(
+    state: &MissionsState,
+    mission: &MissionRecord,
+    invitee: &str,
+    kind: InvitationType,
+    role: Role,
+    creator: &str,
+    now: i64,
+) -> Result<(), ApiError> {
+    let token = state.tokens.create(&random_uuid(), TokenType::Invitation, &mission.name, &mission.guid, now / 1000);
+    state.store.invite(InvitationRecord {
+        mission_guid: mission.guid.clone(),
+        mission_name: mission.name.clone(),
+        invitee: invitee.to_string(),
+        invitation_type: kind,
+        creator_uid: creator.to_string(),
+        create_time_ms: now,
+        token,
+        role,
+    })?;
+    Ok(())
+}
+
+/// Invitations for the caller: by client uid, by username (and, in the
+/// official server, by the live callsign of that client uid).
+fn invitations_for_caller(state: &MissionsState, caller: &Caller, client_uid: &str) -> Vec<InvitationRecord> {
+    let mut found = state.store.invitations_for(client_uid, InvitationType::ClientUid);
+    for i in state.store.invitations_for(&caller.username, InvitationType::UserName) {
+        if !found.contains(&i) {
+            found.push(i);
+        }
+    }
+    found.retain(|i| state.store.by_guid(&i.mission_guid).is_some_and(|m| visible(caller, &m)));
+    found
+}
+
+async fn my_invitations(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let params = Params::parse(query)?;
+    let client_uid = params.get("clientUid").ok_or_else(|| ApiError::BadRequest("Required parameter 'clientUid' is not present.".into()))?;
+    let found: Vec<Value> = invitations_for_caller(&state, &caller, client_uid).iter().map(invitation_json).collect();
+    ok("MissionInvitation", found.into())
+}
+
+async fn all_invitation_names(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let params = Params::parse(query)?;
+    let names: BTreeSet<String> = invitations_for_caller(&state, &caller, &params.string("clientUid")).into_iter().map(|i| i.mission_name).collect();
+    ok("MissionInvitation", json!(names))
+}
+
+fn invitations_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionRead)?;
+    let found: Vec<Value> = state.store.invitations(&mission.guid).iter().map(invitation_json).collect();
+    ok("MissionInvitation", found.into())
+}
+
+async fn invitations_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    invitations_impl(&state, &caller, mission)
+}
+
+async fn invitations_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    invitations_impl(&state, &caller, mission)
+}
+
+fn invite_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, kind: &str, invitee: &str, params: &Params) -> ApiResult {
+    let kind = InvitationType::parse(kind).ok_or_else(|| ApiError::BadRequest(format!("invalid invitation type '{kind}'")))?;
+    let creator = params.get("creatorUid").ok_or_else(|| ApiError::BadRequest("Required parameter 'creatorUid' is not present.".into()))?;
+    let invite_role = params.role("role")?.unwrap_or_else(|| mission.effective_default_role());
+    if !may_assign(&mission, role_for(state, &mission, caller), invite_role) {
+        return Err(ApiError::Forbidden(format!("validateRoleAssignment failed! Illegal attempt to assign role {}", invite_role.name())));
+    }
+    invite_record(state, &mission, invitee, kind, invite_role, creator, now_ms())?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn invite_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((name, kind, invitee)): Path<(String, String, String)>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    invite_impl(&state, &caller, mission, &kind, &invitee, &Params::parse(query)?)
+}
+
+async fn invite_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((guid, kind, invitee)): Path<(String, String, String)>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    invite_impl(&state, &caller, mission, &kind, &invitee, &Params::parse(query)?)
+}
+
+fn uninvite_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord, kind: &str, invitee: &str, params: &Params) -> ApiResult {
+    let kind = InvitationType::parse(kind).ok_or_else(|| ApiError::BadRequest(format!("invalid invitation type '{kind}'")))?;
+    params.get("creatorUid").ok_or_else(|| ApiError::BadRequest("Required parameter 'creatorUid' is not present.".into()))?;
+    let token_role = role_from_token(state, &mission, caller, &[TokenType::Invitation, TokenType::Subscription]);
+    if mission.password_protected() && token_role.is_none() {
+        // The official handler catches its own exceptions and answers 500.
+        return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    state.store.uninvite(&mission.guid, invitee, kind)?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn uninvite_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((name, kind, invitee)): Path<(String, String, String)>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    uninvite_impl(&state, &caller, mission, &kind, &invitee, &Params::parse(query)?)
+}
+
+async fn uninvite_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((guid, kind, invitee)): Path<(String, String, String)>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    uninvite_impl(&state, &caller, mission, &kind, &invitee, &Params::parse(query)?)
+}
+
+// --- log entries ------------------------------------------------------------------------------
+
+fn parse_log_entry(body: &Bytes) -> Result<Value, ApiError> {
+    serde_json::from_slice(body).map_err(|_| ApiError::BadRequest("Invalid Request Body".into()))
+}
+
+fn json_date(v: Option<&Value>) -> Result<Option<i64>, ApiError> {
+    match v.and_then(|v| v.as_str()) {
+        None => Ok(None),
+        Some(s) => time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+            .map(|t| Some((t.unix_timestamp_nanos() / 1_000_000) as i64))
+            .map_err(|_| ApiError::BadRequest("Invalid Request Body".into())),
+    }
+}
+
+fn strings(v: Option<&Value>) -> Vec<String> {
+    v.and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect()).unwrap_or_default()
+}
+
+/// The role check every log endpoint makes on each named mission: a
+/// mission without a role for the caller is skipped, one with a role
+/// lacking `permission` is forbidden.
+fn check_log_missions(state: &MissionsState, caller: &Caller, names: &[String], permission: Permission) -> Result<(), ApiError> {
+    for name in names {
+        let mission = state
+            .store
+            .by_name(name, |m| visible(caller, m))
+            .ok_or_else(|| ApiError::NotFound(format!("Mission named '{}' not found - not deleted", name.trim())))?;
+        if let Some(role) = role_for(state, &mission, caller)
+            && !role.has(permission) {
+                return Err(ApiError::Forbidden("Illegal attempt to access mission!".into()));
+            }
+    }
+    Ok(())
+}
+
+fn log_entry_from(v: &Value, id: String, server_time_ms: i64) -> Result<LogEntryRecord, ApiError> {
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    Ok(LogEntryRecord {
+        id,
+        content: s("content"),
+        creator_uid: s("creatorUid"),
+        entry_uid: s("entryUid"),
+        mission_names: strings(v.get("missionNames")),
+        server_time_ms,
+        dtg_ms: json_date(v.get("dtg"))?,
+        created_ms: json_date(v.get("created"))?,
+        content_hashes: strings(v.get("contentHashes")),
+        keywords: strings(v.get("keywords")),
+    })
+}
+
+async fn post_log_entry(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let v = parse_log_entry(&body)?;
+    if v.get("id").and_then(|i| i.as_str()).is_some_and(|i| !i.is_empty()) {
+        return Err(ApiError::BadRequest("log entry id must not be included for POST".into()));
+    }
+    let entry = log_entry_from(&v, random_uuid(), now_ms())?;
+    check_log_missions(&state, &caller, &entry.mission_names, Permission::MissionWrite)?;
+    let saved = state.store.save_log_entry(entry)?;
+    ok("com.bbn.marti.sync.model.LogEntry", log_json(&saved))
+}
+
+async fn put_log_entry(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let v = parse_log_entry(&body)?;
+    let id = v.get("id").and_then(|i| i.as_str()).filter(|i| !i.is_empty()).map(String::from);
+    let Some(id) = id else {
+        return Err(ApiError::BadRequest("log entry id must be included for PUT".into()));
+    };
+    if v.get("servertime").is_some_and(|s| !s.is_null()) {
+        return Err(ApiError::BadRequest("servertime can't be modified".into()));
+    }
+    let entry = log_entry_from(&v, id.clone(), now_ms())?;
+    check_log_missions(&state, &caller, &entry.mission_names, Permission::MissionWrite)?;
+    if state.store.log_entry(&id).is_none() {
+        return Err(ApiError::BadRequest(format!("Log entry {id} not found")));
+    }
+    let saved = state.store.save_log_entry(entry)?;
+    ok("com.bbn.marti.sync.model.LogEntry", log_json(&saved))
+}
+
+async fn get_log_entry(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let entry = state.store.log_entry(&id).ok_or_else(|| ApiError::NotFound(format!("log entry {id} not found")))?;
+    check_log_missions(&state, &caller, &entry.mission_names, Permission::MissionRead)?;
+    ok("com.bbn.marti.sync.model.LogEntry", json!([log_json(&entry)]))
+}
+
+async fn delete_log_entry(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let entry = state.store.log_entry(&id).ok_or_else(|| ApiError::NotFound(format!("log entry {id} not found")))?;
+    check_log_missions(&state, &caller, &entry.mission_names, Permission::MissionWrite)?;
+    state.store.delete_log_entry(&id)?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn all_logs(State(state): State<MissionsState>, Extension(identity): Extension<PeerIdentity>, headers: HeaderMap) -> ApiResult {
+    if !caller(&state, &identity, &headers).admin {
+        return Err(ApiError::AccessDenied);
+    }
+    ok("com.bbn.marti.sync.model.LogEntry", state.store.all_log_entries().iter().map(log_json).collect())
+}
+
+async fn logs_for_mission(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    require(role_for(&state, &mission, &caller), Permission::MissionRead)?;
+    let window = Params::parse(query)?.window()?;
+    ok("com.bbn.marti.sync.model.LogEntry", state.store.log_entries_for(&mission.name, window).iter().map(log_json).collect())
+}
+
+// --- CoT ------------------------------------------------------------------------------------------
+
+/// `getCachedCotImpl`: the XML header, `<events>`, the latest event of each
+/// mission uid (one per line), `</events>`.
+fn cot_impl(state: &MissionsState, caller: &Caller, mission: MissionRecord) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionRead)?;
+    let mut xml = String::from("<?xml version='1.0' encoding='UTF-8' standalone='yes'?><events>");
+    for add in mission.uids() {
+        if let Content::Uid(uid) = &add.content
+            && let Some(event) = state.latest_cot.get(uid) {
+                xml.push_str(&event.xml);
+                xml.push('\n');
+            }
+    }
+    xml.push_str("</events>");
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/xml")], xml).into_response())
+}
+
+async fn cot_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    cot_impl(&state, &caller, mission)
+}
+
+async fn cot_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    cot_impl(&state, &caller, mission)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode as Status};
-    use crate::missions::MissionChange;
-    use tower::ServiceExt;
-
-    fn app() -> Router {
-        router(Arc::new(MissionStore::in_memory()))
-    }
-
-    /// Real `MtlsHttpServer` usage injects `PeerIdentity` via a
-    /// per-connection router layer (see `super::super::MtlsHttpServer`);
-    /// these module-level tests don't go through a real TLS handshake, so
-    /// they attach the extension directly on the request, simulating "this
-    /// request arrived over a connection authenticated as `identity`."
-    async fn json_request_as(
-        app: &mut Router,
-        identity: &str,
-        method: &str,
-        uri: &str,
-        body: serde_json::Value,
-    ) -> (Status, serde_json::Value) {
-        let request = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .extension(PeerIdentity(identity.to_string()))
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let response = app.clone().oneshot(request).await.unwrap();
-        let status = response.status();
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json = if body_bytes.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::from_slice(&body_bytes).unwrap()
-        };
-        (status, json)
-    }
-
-    async fn get_as(app: &mut Router, identity: &str, uri: &str) -> Response {
-        let request = Request::builder()
-            .uri(uri)
-            .extension(PeerIdentity(identity.to_string()))
-            .body(Body::empty())
-            .unwrap();
-        app.clone().oneshot(request).await.unwrap()
-    }
-
-    /// A mission API with groups Red (red-1, red-2) and Blue (blue-1),
-    /// and "admin" as the admin identity.
-    fn app_with_groups() -> (Router, Arc<GroupStore>, Arc<MissionStore>) {
-        use crate::groups::Membership;
-        let groups = Arc::new(GroupStore::in_memory());
-        groups.create("Red", None, 0).unwrap();
-        groups.create("Blue", None, 0).unwrap();
-        groups.set_member("Red", "red-1", Some(Membership::Both)).unwrap();
-        groups.set_member("Red", "red-2", Some(Membership::Out)).unwrap();
-        groups.set_member("Blue", "blue-1", Some(Membership::Both)).unwrap();
-        let store = Arc::new(MissionStore::in_memory());
-        let app = router_with(MissionsState {
-            store: Arc::clone(&store),
-            groups: Arc::clone(&groups),
-            admin_common_name: Some("admin".into()),
-        });
-        (app, groups, store)
-    }
-
-    async fn status_of(app: &mut Router, identity: &str, method: &str, uri: &str, body: serde_json::Value) -> Status {
-        json_request_as(app, identity, method, uri, body).await.0
-    }
-
-    /// A mission defaults to its creator's groups and is invisible -- 404,
-    /// not 403 -- to anyone outside them; the admin sees everything.
-    #[tokio::test]
-    async fn missions_are_only_visible_within_their_groups() {
-        let (mut app, _, _) = app_with_groups();
-        let (status, body) = json_request_as(&mut app, "red-1", "PUT", "/Marti/api/missions/op", serde_json::json!({"creatorUid": "red-1"})).await;
-        assert_eq!(status, Status::CREATED);
-        assert_eq!(body["groups"], serde_json::json!(["Red"]));
-
-        let listed = |body: serde_json::Value| body.as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
-        let (_, body) = json_request_as(&mut app, "red-2", "GET", "/Marti/api/missions", serde_json::Value::Null).await;
-        assert_eq!(listed(body), vec!["op"], "OUT-only member of Red sees it");
-        let (_, body) = json_request_as(&mut app, "blue-1", "GET", "/Marti/api/missions", serde_json::Value::Null).await;
-        assert!(listed(body).is_empty());
-        let (_, body) = json_request_as(&mut app, "admin", "GET", "/Marti/api/missions", serde_json::Value::Null).await;
-        assert_eq!(listed(body), vec!["op"]);
-
-        for (method, uri, body) in [
-            ("GET", "/Marti/api/missions/op", serde_json::Value::Null),
-            ("GET", "/Marti/api/missions/op/changes", serde_json::Value::Null),
-            ("PUT", "/Marti/api/missions/op/subscription?uid=blue-1", serde_json::Value::Null),
-            ("PUT", "/Marti/api/missions/op/contents", serde_json::json!({"hash": "h", "filename": "f", "creatorUid": "blue-1"})),
-        ] {
-            assert_eq!(status_of(&mut app, "blue-1", method, uri, body).await, Status::NOT_FOUND, "{method} {uri}");
-        }
-    }
-
-    #[tokio::test]
-    async fn creating_a_mission_in_foreign_or_unknown_groups_is_refused() {
-        let (mut app, _, store) = app_with_groups();
-        let create = |groups: serde_json::Value| serde_json::json!({"creatorUid": "red-1", "groups": groups});
-        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/a", create(serde_json::json!(["Blue"]))).await, Status::FORBIDDEN);
-        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/b", create(serde_json::json!(["Nope"]))).await, Status::BAD_REQUEST);
-        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/c", create(serde_json::json!([]))).await, Status::BAD_REQUEST);
-        assert!(store.list().is_empty());
-        // The admin may place a mission in any group.
-        let admin = serde_json::json!({"creatorUid": "admin", "groups": ["Blue"]});
-        assert_eq!(status_of(&mut app, "admin", "PUT", "/Marti/api/missions/d", admin).await, Status::CREATED);
-    }
-
-    /// Official `MISSION_READONLY_SUBSCRIBER`: a mission created with
-    /// `defaultRole` read-only gives subscribers read access only.
-    #[tokio::test]
-    async fn a_readonly_default_role_lets_subscribers_read_but_not_write() {
-        let (mut app, _, store) = app_with_groups();
-        let create = serde_json::json!({"creatorUid": "red-1", "defaultRole": "MISSION_READONLY_SUBSCRIBER"});
-        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/briefing", create).await, Status::CREATED);
-        assert_eq!(status_of(&mut app, "red-2", "PUT", "/Marti/api/missions/briefing/subscription?uid=red-2", serde_json::Value::Null).await, Status::OK);
-        assert_eq!(store.role_of("briefing", "red-2"), Some(MissionRole::ReadOnlySubscriber));
-        let content = serde_json::json!({"hash": "h", "filename": "f", "creatorUid": "red-2"});
-        assert_eq!(status_of(&mut app, "red-2", "PUT", "/Marti/api/missions/briefing/contents", content).await, Status::FORBIDDEN);
-        assert_eq!(status_of(&mut app, "red-2", "GET", "/Marti/api/missions/briefing", serde_json::Value::Null).await, Status::OK);
-
-        // The owner can promote it; the owner can also assign read-only.
-        let promote = serde_json::json!({"uid": "red-2", "role": "MISSION_SUBSCRIBER"});
-        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/briefing/role", promote).await, Status::OK);
-        let content = serde_json::json!({"hash": "h", "filename": "f", "creatorUid": "red-2"});
-        assert_eq!(status_of(&mut app, "red-2", "PUT", "/Marti/api/missions/briefing/contents", content).await, Status::OK);
-        let demote = serde_json::json!({"uid": "red-2", "role": "readonly_subscriber"});
-        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/briefing/role", demote).await, Status::OK);
-        assert_eq!(store.role_of("briefing", "red-2"), Some(MissionRole::ReadOnlySubscriber));
-
-        let owner_default = serde_json::json!({"creatorUid": "red-1", "defaultRole": "owner"});
-        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/x", owner_default).await, Status::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn the_owner_can_move_a_mission_between_its_groups() {
-        use crate::groups::Membership;
-        let (mut app, groups, _) = app_with_groups();
-        groups.set_member("Blue", "red-1", Some(Membership::Both)).unwrap();
-        assert_eq!(status_of(&mut app, "red-1", "PUT", "/Marti/api/missions/op", serde_json::json!({"creatorUid": "red-1", "groups": ["Red"]})).await, Status::CREATED);
-        assert_eq!(status_of(&mut app, "blue-1", "GET", "/Marti/api/missions/op", serde_json::Value::Null).await, Status::NOT_FOUND);
-
-        let (status, body) = json_request_as(&mut app, "red-1", "PATCH", "/Marti/api/missions/op", serde_json::json!({"actorUid": "red-1", "groups": ["Blue"]})).await;
-        assert_eq!(status, Status::OK, "{body}");
-        assert_eq!(status_of(&mut app, "blue-1", "GET", "/Marti/api/missions/op", serde_json::Value::Null).await, Status::OK);
-        assert_eq!(status_of(&mut app, "red-2", "GET", "/Marti/api/missions/op", serde_json::Value::Null).await, Status::NOT_FOUND);
-    }
-
-    /// TC-MARTI-01.
-    #[tokio::test]
-    async fn creates_and_fetches_a_mission_over_http() {
-        let mut app = app();
-        let (status, body) = json_request_as(
-            &mut app,
-            "user-1",
-            "PUT",
-            "/Marti/api/missions/Recon%20Alpha",
-            serde_json::json!({"creatorUid": "user-1", "description": "test"}),
-        )
-        .await;
-        assert_eq!(status, Status::CREATED);
-        assert_eq!(body["name"], "Recon Alpha");
-
-        let response = get_as(&mut app, "user-1", "/Marti/api/missions/Recon%20Alpha").await;
-        assert_eq!(response.status(), Status::OK);
-    }
-
-    /// TC-MARTI-02.
-    #[tokio::test]
-    async fn rejects_duplicate_creation_with_409() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "user-1",
-            "PUT",
-            "/Marti/api/missions/dup",
-            serde_json::json!({"creatorUid": "user-1"}),
-        )
-        .await;
-        let (status, _) = json_request_as(
-            &mut app,
-            "user-1",
-            "PUT",
-            "/Marti/api/missions/dup",
-            serde_json::json!({"creatorUid": "user-1"}),
-        )
-        .await;
-        assert_eq!(status, Status::CONFLICT);
-    }
-
-    /// The residual TC-MARTI-10 gap, closed: a caller claiming a
-    /// `creatorUid` that doesn't match its authenticated identity is
-    /// rejected, not silently trusted.
-    #[tokio::test]
-    async fn rejects_creatoruid_claim_not_matching_authenticated_identity() {
-        let mut app = app();
-        let (status, _) = json_request_as(
-            &mut app,
-            "real-device",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "someone-else"}),
-        )
-        .await;
-        assert_eq!(status, Status::FORBIDDEN);
-
-        // The rejected request must not have created anything.
-        let response = get_as(&mut app, "real-device", "/Marti/api/missions/m").await;
-        assert_eq!(response.status(), Status::NOT_FOUND);
-    }
-
-    /// TC-MARTI-04.
-    #[tokio::test]
-    async fn subscribes_and_unsubscribes_via_query_param() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "user-1",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "user-1"}),
-        )
-        .await;
-
-        let request = Request::builder()
-            .method("PUT")
-            .uri("/Marti/api/missions/m/subscription?uid=device-1")
-            .extension(PeerIdentity("device-1".to_string()))
-            .body(Body::empty())
-            .unwrap();
-        let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), Status::OK);
-
-        let response = get_as(&mut app, "user-1", "/Marti/api/missions/m").await;
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let mission: Mission = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(mission.subscribers, vec!["device-1"]);
-    }
-
-    /// A device can't subscribe claiming to be a *different* uid than its
-    /// own authenticated identity.
-    #[tokio::test]
-    async fn rejects_subscribing_as_a_different_uid() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "user-1",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "user-1"}),
-        )
-        .await;
-
-        let request = Request::builder()
-            .method("PUT")
-            .uri("/Marti/api/missions/m/subscription?uid=someone-else")
-            .extension(PeerIdentity("device-1".to_string()))
-            .body(Body::empty())
-            .unwrap();
-        let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), Status::FORBIDDEN);
-    }
-
-    /// A device can't add content claiming a `creatorUid` other than its own
-    /// authenticated identity -- the same policy `create_mission` and
-    /// `subscribe` already have tests for, but `add_content` didn't (a real
-    /// gap found by this project's own red-team review of its test suite:
-    /// removing this check from `add_content` alone left every other test
-    /// green).
-    #[tokio::test]
-    async fn rejects_add_content_claim_not_matching_authenticated_identity() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "user-1",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "user-1"}),
-        )
-        .await;
-
-        let (status, _) = json_request_as(
-            &mut app,
-            "real-device",
-            "PUT",
-            "/Marti/api/missions/m/contents",
-            serde_json::json!({"hash": "abc123", "filename": "f.kml", "creatorUid": "someone-else"}),
-        )
-        .await;
-        assert_eq!(status, Status::FORBIDDEN);
-
-        // The rejected request must not have added anything.
-        let response = get_as(&mut app, "user-1", "/Marti/api/missions/m").await;
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let mission: Mission = serde_json::from_slice(&body_bytes).unwrap();
-        assert!(mission.contents.is_empty());
-    }
-
-    /// A device can't update a mission claiming an `actorUid` other than its
-    /// own authenticated identity -- another real gap found by the same
-    /// red-team review (removing this check from `update_mission` alone
-    /// left every other test green).
-    #[tokio::test]
-    async fn rejects_update_actoruid_not_matching_authenticated_identity() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "user-1",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "user-1", "description": "original"}),
-        )
-        .await;
-
-        let (status, _) = json_request_as(
-            &mut app,
-            "real-device",
-            "PATCH",
-            "/Marti/api/missions/m",
-            serde_json::json!({"description": "tampered", "actorUid": "someone-else"}),
-        )
-        .await;
-        assert_eq!(status, Status::FORBIDDEN);
-
-        // The rejected request must not have changed anything.
-        let response = get_as(&mut app, "user-1", "/Marti/api/missions/m").await;
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let mission: Mission = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(mission.description.as_deref(), Some("original"));
-    }
-
-    /// A device can't unsubscribe claiming to be a *different* uid than its
-    /// own authenticated identity -- another real gap found by the same
-    /// red-team review (removing this check from `unsubscribe` alone left
-    /// every other test green, including `subscribes_and_unsubscribes_via_
-    /// query_param`, since that test only ever unsubscribes as itself).
-    #[tokio::test]
-    async fn rejects_unsubscribe_as_a_different_uid() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "user-1",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "user-1"}),
-        )
-        .await;
-        let subscribe_request = Request::builder()
-            .method("PUT")
-            .uri("/Marti/api/missions/m/subscription?uid=device-1")
-            .extension(PeerIdentity("device-1".to_string()))
-            .body(Body::empty())
-            .unwrap();
-        app.clone().oneshot(subscribe_request).await.unwrap();
-
-        // device-2 tries to unsubscribe device-1 by simply naming its uid in
-        // the query param.
-        let unsubscribe_request = Request::builder()
-            .method("DELETE")
-            .uri("/Marti/api/missions/m/subscription?uid=device-1")
-            .extension(PeerIdentity("device-2".to_string()))
-            .body(Body::empty())
-            .unwrap();
-        let response = app.clone().oneshot(unsubscribe_request).await.unwrap();
-        assert_eq!(response.status(), Status::FORBIDDEN);
-
-        // device-1 must still be subscribed.
-        let response = get_as(&mut app, "user-1", "/Marti/api/missions/m").await;
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let mission: Mission = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(mission.subscribers, vec!["device-1"]);
-    }
-
-    /// TC-MARTI-05.
-    #[tokio::test]
-    async fn changes_endpoint_reflects_history() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "user-1",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "user-1"}),
-        )
-        .await;
-
-        let response = get_as(&mut app, "user-1", "/Marti/api/missions/m/changes").await;
-        assert_eq!(response.status(), Status::OK);
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let changes: Vec<MissionChange> = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(changes.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn get_on_missing_mission_returns_404() {
-        let mut app = app();
-        let response = get_as(&mut app, "user-1", "/Marti/api/missions/nope").await;
-        assert_eq!(response.status(), Status::NOT_FOUND);
-    }
-
-    /// A device that isn't the mission's Owner can't delete it, even if it
-    /// correctly claims its own identity everywhere -- the real gap this
-    /// project's own red-team review flagged as historically missing on
-    /// this exact handler.
-    #[tokio::test]
-    async fn rejects_delete_from_a_non_owner() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "owner",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "owner"}),
-        )
-        .await;
-
-        let request = Request::builder()
-            .method("DELETE")
-            .uri("/Marti/api/missions/m")
-            .extension(PeerIdentity("someone-else".to_string()))
-            .body(Body::empty())
-            .unwrap();
-        let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), Status::FORBIDDEN);
-
-        // The rejected request must not have deleted anything.
-        let response = get_as(&mut app, "owner", "/Marti/api/missions/m").await;
-        assert_eq!(response.status(), Status::OK);
-    }
-
-    /// The Owner (the creator, by default) can delete their own mission.
-    #[tokio::test]
-    async fn owner_can_delete_their_own_mission() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "owner",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "owner"}),
-        )
-        .await;
-
-        let request = Request::builder()
-            .method("DELETE")
-            .uri("/Marti/api/missions/m")
-            .extension(PeerIdentity("owner".to_string()))
-            .body(Body::empty())
-            .unwrap();
-        let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), Status::NO_CONTENT);
-    }
-
-    /// A non-owner (even one correctly claiming its own actorUid) can't
-    /// update mission metadata.
-    #[tokio::test]
-    async fn rejects_update_from_a_non_owner() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "owner",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "owner", "description": "original"}),
-        )
-        .await;
-
-        let (status, _) = json_request_as(
-            &mut app,
-            "someone-else",
-            "PATCH",
-            "/Marti/api/missions/m",
-            serde_json::json!({"description": "tampered", "actorUid": "someone-else"}),
-        )
-        .await;
-        assert_eq!(status, Status::FORBIDDEN);
-
-        let response = get_as(&mut app, "owner", "/Marti/api/missions/m").await;
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let mission: Mission = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(mission.description.as_deref(), Some("original"));
-    }
-
-    /// A device with no role on the mission at all (never subscribed, not
-    /// the creator) can't add content, even if the identity-claim check
-    /// alone would have let it through.
-    #[tokio::test]
-    async fn rejects_add_content_from_a_device_with_no_role() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "owner",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "owner"}),
-        )
-        .await;
-
-        let (status, _) = json_request_as(
-            &mut app,
-            "uninvolved-device",
-            "PUT",
-            "/Marti/api/missions/m/contents",
-            serde_json::json!({"hash": "abc123", "filename": "f.kml", "creatorUid": "uninvolved-device"}),
-        )
-        .await;
-        assert_eq!(status, Status::FORBIDDEN);
-    }
-
-    /// A Subscriber (not just the Owner) can add content -- real
-    /// collaborative Data Sync usage, not locked to the creator alone.
-    #[tokio::test]
-    async fn subscriber_can_add_content() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "owner",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "owner"}),
-        )
-        .await;
-        let subscribe_request = Request::builder()
-            .method("PUT")
-            .uri("/Marti/api/missions/m/subscription?uid=subscriber-1")
-            .extension(PeerIdentity("subscriber-1".to_string()))
-            .body(Body::empty())
-            .unwrap();
-        app.clone().oneshot(subscribe_request).await.unwrap();
-
-        let (status, _) = json_request_as(
-            &mut app,
-            "subscriber-1",
-            "PUT",
-            "/Marti/api/missions/m/contents",
-            serde_json::json!({"hash": "abc123", "filename": "f.kml", "creatorUid": "subscriber-1"}),
-        )
-        .await;
-        assert_eq!(status, Status::OK);
-    }
-
-    /// The Owner can promote another identity to Owner via the role API.
-    #[tokio::test]
-    async fn owner_can_assign_a_role() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "owner",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "owner"}),
-        )
-        .await;
-
-        let (status, _) = json_request_as(
-            &mut app,
-            "owner",
-            "PUT",
-            "/Marti/api/missions/m/role",
-            serde_json::json!({"uid": "co-owner", "role": "owner"}),
-        )
-        .await;
-        assert_eq!(status, Status::OK);
-
-        let response = get_as(&mut app, "owner", "/Marti/api/missions/m").await;
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let mission: Mission = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(mission.roles.get("co-owner"), Some(&MissionRole::Owner));
-    }
-
-    /// A non-owner can't assign roles to anyone, including themselves.
-    #[tokio::test]
-    async fn non_owner_cannot_assign_roles() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "owner",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "owner"}),
-        )
-        .await;
-
-        let (status, _) = json_request_as(
-            &mut app,
-            "someone-else",
-            "PUT",
-            "/Marti/api/missions/m/role",
-            serde_json::json!({"uid": "someone-else", "role": "owner"}),
-        )
-        .await;
-        assert_eq!(status, Status::FORBIDDEN);
-    }
-
-    /// The Owner can revoke another identity's role, and the last-owner
-    /// protection surfaces as a real, distinguishable 409 through the HTTP
-    /// layer, not just at the store level.
-    #[tokio::test]
-    async fn owner_can_revoke_a_role_but_not_the_last_owner() {
-        let mut app = app();
-        json_request_as(
-            &mut app,
-            "owner",
-            "PUT",
-            "/Marti/api/missions/m",
-            serde_json::json!({"creatorUid": "owner"}),
-        )
-        .await;
-        json_request_as(
-            &mut app,
-            "owner",
-            "PUT",
-            "/Marti/api/missions/m/role",
-            serde_json::json!({"uid": "co-owner", "role": "owner"}),
-        )
-        .await;
-
-        let revoke_request = Request::builder()
-            .method("DELETE")
-            .uri("/Marti/api/missions/m/role/co-owner")
-            .extension(PeerIdentity("owner".to_string()))
-            .body(Body::empty())
-            .unwrap();
-        let response = app.clone().oneshot(revoke_request).await.unwrap();
-        assert_eq!(response.status(), Status::NO_CONTENT);
-
-        let last_owner_request = Request::builder()
-            .method("DELETE")
-            .uri("/Marti/api/missions/m/role/owner")
-            .extension(PeerIdentity("owner".to_string()))
-            .body(Body::empty())
-            .unwrap();
-        let response = app.clone().oneshot(last_owner_request).await.unwrap();
-        assert_eq!(response.status(), Status::CONFLICT);
-    }
-}
+#[path = "missions_tests.rs"]
+mod tests;

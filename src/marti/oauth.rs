@@ -92,7 +92,7 @@ impl JwtSigner {
 
     fn from_pkcs8(der: &[u8]) -> Result<Self, JwtSignerError> {
         let key = ring::signature::RsaKeyPair::from_pkcs8(der).map_err(|e| JwtSignerError::Key(e.to_string()))?;
-        Ok(Self { key, kid: random_uuid() })
+        Ok(Self { key, kid: super::envelope::random_uuid() })
     }
 
     /// DER `RSAPublicKey` (PKCS#1), for verifying.
@@ -116,7 +116,7 @@ impl JwtSigner {
         let claims = format!(
             r#"{{"sub":{username},"aud":{username},"nbf":{now},"exp":{},"iat":{now},"jti":"{}"}}"#,
             now + TOKEN_TTL_SECONDS,
-            random_uuid()
+            super::envelope::random_uuid()
         );
         let encode = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
         let signing_input = format!("{}.{}", encode(&header), encode(&claims));
@@ -133,14 +133,6 @@ impl JwtSigner {
     }
 }
 
-fn random_uuid() -> String {
-    let mut b = [0u8; 16];
-    getrandom::getrandom(&mut b).expect("OS RNG must be available");
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
-}
 
 #[derive(Deserialize)]
 struct TokenRequest {

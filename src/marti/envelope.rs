@@ -35,6 +35,17 @@ fn random_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A random (version 4) UUID, `java.util.UUID.randomUUID().toString()`
+/// style.
+pub fn random_uuid() -> String {
+    let mut b = [0u8; 16];
+    getrandom::getrandom(&mut b).expect("OS RNG must be available");
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
 /// Read `data_dir/server-id`, creating it on first start, and make it this
 /// process's [`server_id`].
 pub fn load_or_create_server_id(data_dir: &Path) -> std::io::Result<String> {

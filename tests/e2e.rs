@@ -356,247 +356,131 @@ async fn e2e_backup_mirrors_live_server_state_to_disk() {
     std::fs::remove_dir_all(&backup_dir).ok();
 }
 
-/// Missions API full lifecycle against the real, running, mTLS-authenticated
-/// Marti HTTP endpoint (TC-MARTI-10): enroll a device via real HTTP first
-/// (the same chain the core mTLS test exercises), then use its cert to
-/// create (409 on a duplicate), subscribe, add content, patch, read back
-/// the change log, and delete a mission.
+/// The official Mission API end to end, over real mTLS: a file uploaded
+/// through Enterprise Sync and a marker relayed over the CoT stream become
+/// mission content; `/cot` and the uid `details` come from the relayed
+/// event; another device subscribes; changes; delete → 410.
 #[tokio::test]
-async fn e2e_missions_api_full_lifecycle() {
+async fn e2e_official_mission_lifecycle() {
     let app = App::bind(test_config()).await.unwrap();
     let enrollment_addr = app.enrollment_addr().unwrap();
     let marti_api_addr = app.marti_api_addr().unwrap();
+    let mtls_addr = app.mtls_addr().unwrap();
     let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
+    let enrollment = format!("https://{enrollment_addr}");
+    let base = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
+    let (cert, key) = enroll(&enrollment, "lead").await;
+    let lead = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
 
-    let enrollment_base_url = format!("https://{enrollment_addr}");
-    let (cert, key) = enroll(&enrollment_base_url, "missions-client").await;
-    let client = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
-
-    let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
-
-    // TC-MARTI-01/02: create, then reject a duplicate.
-    let create_response = client
-        .put(format!("{base_url}/Marti/api/missions/Recon%20Alpha"))
-        .json(&serde_json::json!({"creatorUid": "missions-client", "description": "first pass"}))
+    // A file in Enterprise Sync.
+    let upload = lead
+        .post(format!("{base}/Marti/sync/upload?name=map.png&creatorUid=ANDROID-LEAD"))
+        .header(CONTENT_TYPE, "image/png")
+        .body(b"\x89PNG map".to_vec())
         .send()
         .await
         .unwrap();
-    assert_eq!(create_response.status(), 201);
+    let hash = serde_json::from_str::<serde_json::Value>(&upload.text().await.unwrap()).unwrap()["Hash"].as_str().unwrap().to_string();
 
-    let duplicate_response = client
-        .put(format!("{base_url}/Marti/api/missions/Recon%20Alpha"))
-        .json(&serde_json::json!({"creatorUid": "missions-client"}))
+    // A marker relayed by a device.
+    let (dev_cert, dev_key) = enroll(&enrollment, "device").await;
+    let mut device = connect_mtls(mtls_addr, &ca_cert_pem, &dev_cert, dev_key).await.unwrap();
+    device.write_all(marker_xml("marker-e2e", "ANDROID-DEV").as_bytes()).await.unwrap();
+
+    let created = lead.put(format!("{base}/Marti/api/missions/Recon%20Alpha?creatorUid=ANDROID-LEAD&description=first")).send().await.unwrap();
+    assert_eq!(created.status(), 201);
+    let created: serde_json::Value = created.json().await.unwrap();
+    assert_envelope(&created, "Mission");
+    let token = created["data"][0]["token"].as_str().unwrap().to_string();
+    let auth = format!("Bearer {token}");
+
+    let added = lead
+        .put(format!("{base}/Marti/api/missions/Recon%20Alpha/contents?creatorUid=ANDROID-LEAD"))
+        .header("MissionAuthorization", &auth)
+        .json(&serde_json::json!({ "hashes": [hash], "uids": ["marker-e2e"] }))
         .send()
         .await
         .unwrap();
-    assert_eq!(duplicate_response.status(), 409);
+    assert_eq!(added.status(), 200);
 
-    // TC-MARTI-04: subscribe.
-    let subscribe_response = client
-        .put(format!(
-            "{base_url}/Marti/api/missions/Recon%20Alpha/subscription?uid=missions-client"
-        ))
+    // The relayed marker reaches the latest-CoT store asynchronously.
+    let mut cot = String::new();
+    for _ in 0..50 {
+        cot = lead.get(format!("{base}/Marti/api/missions/Recon%20Alpha/cot")).send().await.unwrap().text().await.unwrap();
+        if cot.contains("marker-e2e") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(cot.starts_with("<?xml version='1.0' encoding='UTF-8' standalone='yes'?><events><event "), "{cot}");
+    assert!(cot.contains(r#"uid="marker-e2e""#) && cot.ends_with("</events>"), "{cot}");
+
+    let mission: serde_json::Value =
+        lead.get(format!("{base}/Marti/api/missions/Recon%20Alpha")).send().await.unwrap().json().await.unwrap();
+    let m = &mission["data"][0];
+    assert_eq!(m["contents"][0]["data"]["hash"], hash.as_str());
+    assert_eq!(m["contents"][0]["data"]["name"], "map.png");
+    assert_eq!(m["uids"][0]["details"]["callsign"], "H.1");
+    assert_eq!(m["uids"][0]["details"]["type"], "a-h-G");
+    assert_eq!(m["uids"][0]["details"]["color"], "-65536");
+
+    // Another device subscribes with the default role.
+    let (cert, key) = enroll(&enrollment, "member").await;
+    let member = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
+    let sub = member
+        .put(format!("{base}/Marti/api/missions/Recon%20Alpha/subscription?uid=ANDROID-MEMBER"))
         .send()
         .await
         .unwrap();
-    assert_eq!(subscribe_response.status(), 200);
+    assert_eq!(sub.status(), 201);
+    let sub: serde_json::Value = sub.json().await.unwrap();
+    assert_eq!(sub["data"]["role"]["type"], "MISSION_SUBSCRIBER");
+    let subscribers: serde_json::Value =
+        member.get(format!("{base}/Marti/api/missions/Recon%20Alpha/subscriptions")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(subscribers["data"], serde_json::json!(["ANDROID-LEAD", "ANDROID-MEMBER"]));
 
-    // Add content, then a partial update (TC-MARTI-12: only description
-    // changes, keywords untouched).
-    let content_response = client
-        .put(format!(
-            "{base_url}/Marti/api/missions/Recon%20Alpha/contents"
-        ))
-        .json(&serde_json::json!({"hash": "abc123", "filename": "map.kml", "creatorUid": "missions-client"}))
+    let changes: serde_json::Value =
+        member.get(format!("{base}/Marti/api/missions/Recon%20Alpha/changes")).send().await.unwrap().json().await.unwrap();
+    assert_envelope(&changes, "MissionChange");
+    assert_eq!(changes["data"].as_array().unwrap().len(), 3, "create + two adds");
+    assert_eq!(changes["data"][2]["type"], "CREATE_MISSION");
+
+    let deleted = lead
+        .delete(format!("{base}/Marti/api/missions/Recon%20Alpha?creatorUid=ANDROID-LEAD"))
+        .header("MissionAuthorization", &auth)
         .send()
         .await
         .unwrap();
-    assert_eq!(content_response.status(), 200);
-
-    let update_response = client
-        .patch(format!("{base_url}/Marti/api/missions/Recon%20Alpha"))
-        .json(&serde_json::json!({"description": "updated", "actorUid": "missions-client"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(update_response.status(), 200);
-    let updated: serde_json::Value = update_response.json().await.unwrap();
-    assert_eq!(updated["description"], "updated");
-    assert_eq!(updated["contents"][0]["hash"], "abc123");
-
-    // TC-MARTI-05: the change log reflects the full history in order.
-    let changes_response = client
-        .get(format!(
-            "{base_url}/Marti/api/missions/Recon%20Alpha/changes"
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(changes_response.status(), 200);
-    let changes: serde_json::Value = changes_response.json().await.unwrap();
-    let change_types: Vec<&str> = changes
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| c["change_type"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        change_types,
-        vec!["Create", "Subscribe", "AddContent", "Update"]
-    );
-
-    // Delete, then confirm it's gone.
-    let delete_response = client
-        .delete(format!("{base_url}/Marti/api/missions/Recon%20Alpha"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(delete_response.status(), 204);
-
-    let get_after_delete = client
-        .get(format!("{base_url}/Marti/api/missions/Recon%20Alpha"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(get_after_delete.status(), 404);
+    assert_eq!(deleted.status(), 200);
+    let gone = member.get(format!("{base}/Marti/api/missions/Recon%20Alpha")).send().await.unwrap();
+    assert_eq!(gone.status(), 410);
 }
 
-/// Mission roles, end-to-end with two real, separately-enrolled devices --
-/// not the identity-claim check alone (already covered above), the actual
-/// Owner/Subscriber authorization layered on top of it. Exercises the real
-/// collaborative-Data-Sync shape: an outsider can't touch the mission at
-/// all, a subscriber can contribute content but not manage it, and only the
-/// owner can update/delete/manage roles -- with the last-owner protection
-/// surfacing as a real 409 through the live server, not just at the store
-/// level.
+/// Roles come from mission tokens, not certificates: a password-protected
+/// mission is closed to a device until it presents the password, which
+/// yields an ACCESS token.
 #[tokio::test]
-async fn e2e_mission_roles_enforce_owner_and_subscriber_authorization() {
-    let app = App::bind(test_config()).await.unwrap();
-    let enrollment_addr = app.enrollment_addr().unwrap();
-    let marti_api_addr = app.marti_api_addr().unwrap();
-    let ca_cert_pem = app.ca_cert_pem.clone();
-    tokio::spawn(app.run());
+async fn e2e_mission_tokens_decide_roles() {
+    let (lead, base, enrollment_addr, ca_cert_pem) = sync_client("lead").await;
+    let created = lead.put(format!("{base}/Marti/api/missions/Secret?creatorUid=ANDROID-LEAD&password=s3cret")).send().await.unwrap();
+    assert_eq!(created.status(), 201);
+    let marti_port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+    let (cert, key) = enroll(&format!("https://{enrollment_addr}"), "visitor").await;
+    let visitor = mtls_reqwest_client(&ca_cert_pem, &cert, key, SocketAddr::from(([127, 0, 0, 1], marti_port)));
 
-    let enrollment_base_url = format!("https://{enrollment_addr}");
-    let (owner_cert, owner_key) = enroll(&enrollment_base_url, "mission-owner").await;
-    let (subscriber_cert, subscriber_key) = enroll(&enrollment_base_url, "mission-subscriber").await;
-    let (outsider_cert, outsider_key) = enroll(&enrollment_base_url, "mission-outsider").await;
-
-    let owner_client = mtls_reqwest_client(&ca_cert_pem, &owner_cert, owner_key, marti_api_addr);
-    let subscriber_client =
-        mtls_reqwest_client(&ca_cert_pem, &subscriber_cert, subscriber_key, marti_api_addr);
-    let outsider_client =
-        mtls_reqwest_client(&ca_cert_pem, &outsider_cert, outsider_key, marti_api_addr);
-    let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
-
-    // The creator gets Owner automatically.
-    let create_response = owner_client
-        .put(format!("{base_url}/Marti/api/missions/Roles%20Test"))
-        .json(&serde_json::json!({"creatorUid": "mission-owner"}))
+    let denied = visitor.get(format!("{base}/Marti/api/missions/Secret/changes")).send().await.unwrap();
+    assert_eq!(denied.status(), 403);
+    let opened: serde_json::Value =
+        visitor.get(format!("{base}/Marti/api/missions/Secret?password=s3cret")).send().await.unwrap().json().await.unwrap();
+    let access = opened["data"][0]["token"].as_str().unwrap().to_string();
+    let allowed = visitor
+        .get(format!("{base}/Marti/api/missions/Secret/changes"))
+        .header("MissionAuthorization", format!("Bearer {access}"))
         .send()
         .await
         .unwrap();
-    assert_eq!(create_response.status(), 201);
-    let mission: serde_json::Value = create_response.json().await.unwrap();
-    assert_eq!(mission["roles"]["mission-owner"], "owner");
-
-    // An outsider (never subscribed) can't add content.
-    let outsider_content = outsider_client
-        .put(format!("{base_url}/Marti/api/missions/Roles%20Test/contents"))
-        .json(&serde_json::json!({"hash": "aaa", "filename": "f.kml", "creatorUid": "mission-outsider"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(outsider_content.status(), 403);
-
-    // Subscribing grants the Subscriber role, which does allow adding content...
-    let subscribe_response = subscriber_client
-        .put(format!(
-            "{base_url}/Marti/api/missions/Roles%20Test/subscription?uid=mission-subscriber"
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(subscribe_response.status(), 200);
-
-    let subscriber_content = subscriber_client
-        .put(format!("{base_url}/Marti/api/missions/Roles%20Test/contents"))
-        .json(&serde_json::json!({"hash": "bbb", "filename": "g.kml", "creatorUid": "mission-subscriber"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(subscriber_content.status(), 200);
-
-    // ...but not updating mission metadata or deleting it.
-    let subscriber_update = subscriber_client
-        .patch(format!("{base_url}/Marti/api/missions/Roles%20Test"))
-        .json(&serde_json::json!({"description": "hijacked", "actorUid": "mission-subscriber"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(subscriber_update.status(), 403);
-
-    let subscriber_delete = subscriber_client
-        .delete(format!("{base_url}/Marti/api/missions/Roles%20Test"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(subscriber_delete.status(), 403);
-
-    // The owner promotes the subscriber to co-owner via the real role API...
-    let promote_response = owner_client
-        .put(format!("{base_url}/Marti/api/missions/Roles%20Test/role"))
-        .json(&serde_json::json!({"uid": "mission-subscriber", "role": "owner"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(promote_response.status(), 200);
-
-    // ...after which the former subscriber can update the mission.
-    let now_owner_update = subscriber_client
-        .patch(format!("{base_url}/Marti/api/missions/Roles%20Test"))
-        .json(&serde_json::json!({"description": "co-owned now", "actorUid": "mission-subscriber"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(now_owner_update.status(), 200);
-
-    // With two owners now, demoting one of them is allowed -- only the
-    // *last* owner is protected.
-    let demote_original_owner = owner_client
-        .put(format!("{base_url}/Marti/api/missions/Roles%20Test/role"))
-        .json(&serde_json::json!({"uid": "mission-owner", "role": "subscriber"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(demote_original_owner.status(), 200);
-
-    // ...but now mission-subscriber is the *only* owner, so demoting/revoking
-    // them is rejected with a real 409 through the live server.
-    let demote_last_owner = subscriber_client
-        .put(format!("{base_url}/Marti/api/missions/Roles%20Test/role"))
-        .json(&serde_json::json!({"uid": "mission-subscriber", "role": "subscriber"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(demote_last_owner.status(), 409);
-
-    // The now-demoted-to-Subscriber original owner can no longer delete the
-    // mission; the remaining (last) owner still can.
-    let former_owner_delete = owner_client
-        .delete(format!("{base_url}/Marti/api/missions/Roles%20Test"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(former_owner_delete.status(), 403);
-
-    let last_owner_delete = subscriber_client
-        .delete(format!("{base_url}/Marti/api/missions/Roles%20Test"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(last_owner_delete.status(), 204);
+    assert_eq!(allowed.status(), 200);
 }
 
 /// A running server with one ordinary enrolled device (Open mode), for the
@@ -829,41 +713,18 @@ async fn e2e_resources_and_metadata_keywords() {
     assert_eq!(resources["data"][0]["hash"], hash.as_str());
 }
 
-/// TC-MARTI-10's residual gap, closed and verified end-to-end: a real,
-/// validly mTLS-authenticated caller still gets rejected if the
-/// `creatorUid` it claims doesn't match its own cert's CN.
+/// `creatorUid` is the client's device uid (ATAK sends `ANDROID-…`), a
+/// free-form parameter the official server records, not an identity claim
+/// checked against the certificate.
 #[tokio::test]
-async fn e2e_missions_api_rejects_creatoruid_not_matching_authenticated_cert() {
-    let app = App::bind(test_config()).await.unwrap();
-    let enrollment_addr = app.enrollment_addr().unwrap();
-    let marti_api_addr = app.marti_api_addr().unwrap();
-    let ca_cert_pem = app.ca_cert_pem.clone();
-    tokio::spawn(app.run());
-
-    let enrollment_base_url = format!("https://{enrollment_addr}");
-    let (cert, key) = enroll(&enrollment_base_url, "real-identity").await;
-    let client = mtls_reqwest_client(&ca_cert_pem, &cert, key, marti_api_addr);
-    let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
-
-    let response = client
-        .put(format!("{base_url}/Marti/api/missions/Spoofed"))
-        .json(&serde_json::json!({"creatorUid": "someone-else"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 403);
-
-    // The rejected request must not have created anything.
-    let get_response = client
-        .get(format!("{base_url}/Marti/api/missions/Spoofed"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(get_response.status(), 404);
+async fn e2e_creator_uid_is_the_device_uid_not_the_certificate() {
+    let (client, base, _, _) = sync_client("jz").await;
+    let created = client.put(format!("{base}/Marti/api/missions/Ops?creatorUid=ANDROID-0123456789abcdef")).send().await.unwrap();
+    assert_eq!(created.status(), 201);
+    let body: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(body["data"][0]["creatorUid"], "ANDROID-0123456789abcdef");
 }
 
-/// TC-MARTI-10, the other half: a request presenting no client cert at all
-/// must fail -- the missions API requires mTLS just like the CoT relay.
 #[tokio::test]
 async fn e2e_missions_api_rejects_requests_with_no_client_cert() {
     let app = App::bind(test_config()).await.unwrap();

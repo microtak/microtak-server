@@ -222,14 +222,14 @@ fn apply_event(users: &mut HashMap<String, UserRecord>, event: &UserEvent) {
     }
 }
 
-fn hash_password(password: &str) -> String {
+pub(crate) fn hash_password(password: &str) -> String {
     Argon2::default()
         .hash_password(password.as_bytes())
         .expect("argon2 hashing should not fail")
         .to_string()
 }
 
-fn verify_password(password: &str, hash: &str) -> bool {
+pub(crate) fn verify_password(password: &str, hash: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(hash) else {
         return false;
     };

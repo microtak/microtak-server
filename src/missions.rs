@@ -1,38 +1,28 @@
-//! Mission (Data Sync) metadata store: create/update/delete missions,
-//! track a change log per mission, and manage subscriptions.
+//! Missions (Data Sync), modelled on the official TAK Server
+//! (`TAK-Product-Center/Server`: `Mission`, `MissionChange`,
+//! `MissionSubscription`, `MissionInvitation`, `LogEntry`,
+//! `MissionServiceDefaultImpl`, `MissionChangeRepository`). The HTTP side
+//! is [`crate::marti::missions`]; the wiki page `Official-Mission-API`
+//! has the full contract this follows.
 //!
-//! Implements the metadata half of `docs/TEST-PLAN.md` §5 — TC-MARTI-01,
-//! 02, 03, 04, 05, 06, 11, and 12. **Not implemented here**: DataSync file
-//! *content* storage (hash-addressed upload/download, TC-MARTI-07/08) —
-//! this module tracks content *references* (a hash + filename a client
-//! claims to have uploaded elsewhere), not the files themselves.
+//! What lives here is the state and its rules, independent of HTTP:
+//! - missions keyed by **guid**; names are not unique (`POST` with
+//!   `allowDupe` makes a second mission of the same name), a name lookup
+//!   takes the newest visible, undeleted one;
+//! - deletion keeps the mission (flagged), so a deleted name answers 410
+//!   and its history stays;
+//! - the change log (`CREATE_MISSION`, `DELETE_MISSION`, `ADD_CONTENT`,
+//!   `REMOVE_CONTENT`), queried full or **squashed** exactly like the
+//!   official SQL (`MissionChangeRepository.MISSION_CHANGES`);
+//! - stored subscriptions (with their token and role), invitations, log
+//!   entries.
 //!
-//! Persisted as an append-only, replayable event log (see
-//! [`crate::eventlog`]) — same design as
-//! [`crate::registry::DeviceRegistry`], for the same reasons (see that
-//! module's doc comment): cheap incremental backup, a full audit trail as
-//! a side effect of the durability mechanism, and replay reconstructs
-//! identical state rather than trusting a single snapshot file wasn't
-//! left mid-write.
-//!
-//! **Concurrency policy (TC-MARTI-06)**: all mutations take the same
-//! process-wide write lock (held across the fsync'd log append), so
-//! concurrent requests are serialized, not interleaved — the second of two
-//! concurrent updates to the same mission simply applies (and durably logs)
-//! after the first completes (last-writer-wins per field), never a
-//! torn/partially-applied write. No field-level conflict detection (e.g.
-//! optimistic locking via a version number) is implemented.
-//!
-//! **Name handling (TC-MARTI-03/11)**: mission names are used verbatim as
-//! an opaque `HashMap` key — no sanitization (HTML-stripping or otherwise)
-//! is applied anywhere, on purpose. A real reference implementation this
-//! project studied sanitized a mission's name on creation but looked it up
-//! unsanitized everywhere else, orphaning any mission whose name contained
-//! sanitizable characters. Never sanitizing avoids that entire bug class by
-//! construction, since names are never rendered as HTML or otherwise
-//! interpreted here — they're just an identifier.
+//! Persisted as an append-only, replayable event log
+//! ([`crate::eventlog`]) in `official-missions.log`. Missions created by
+//! MicroTAK ≤ 0.8 (`missions.log`, a different, non-official model) are not
+//! migrated.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::RwLock;
 
@@ -43,775 +33,868 @@ use crate::eventlog::{EventLog, EventLogError};
 
 #[derive(Debug, Error)]
 pub enum MissionError {
-    #[error("mission '{0}' already exists")]
-    AlreadyExists(String),
-    #[error("no mission found named '{0}'")]
+    #[error("no mission with guid '{0}'")]
     NotFound(String),
-    #[error("cannot remove '{uid}' from mission '{name}': it is the mission's last remaining owner")]
-    CannotRemoveLastOwner { name: String, uid: String },
     #[error("event log error: {0}")]
     EventLog(#[from] EventLogError),
 }
 
-/// A caller's authorization level on one specific mission -- see
-/// `docs/ARCHITECTURE.md`'s "Mission roles" section for the enforcement
-/// policy built on top of this (which handlers require which role; this
-/// module itself only tracks and queries role assignments, it doesn't
-/// enforce anything -- authorization checks live in `marti::missions`,
-/// matching how `require_matching_identity`'s identity-claim checks
-/// already work).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MissionRole {
-    /// Full control: update, delete, add content, and manage other
-    /// identities' roles. Assigned automatically to a mission's creator.
-    /// The official server's `MISSION_OWNER`.
-    #[serde(alias = "MISSION_OWNER")]
+/// `MissionPermission.Permission`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Permission {
+    MissionRead,
+    MissionWrite,
+    MissionDelete,
+    MissionSetRole,
+    MissionSetPassword,
+    MissionUpdateGroups,
+    MissionManageFeeds,
+    MissionManageLayers,
+}
+
+/// `MissionRole.Role`, with the official schema's permissions
+/// (`V33__data_sync_phase3.sql`, `V37`, `V48`, `V73`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Role {
+    #[serde(rename = "MISSION_OWNER")]
     Owner,
-    /// Can add content, but not update mission metadata, delete the
-    /// mission, or manage roles. Assigned automatically on subscribing
-    /// (and removed on unsubscribing) unless the identity already holds
-    /// `Owner`, which subscribing/unsubscribing never changes.
-    /// The official `MISSION_SUBSCRIBER` (read + write).
-    #[serde(alias = "MISSION_SUBSCRIBER")]
+    #[serde(rename = "MISSION_SUBSCRIBER")]
     Subscriber,
-    /// Read only: may see and subscribe to the mission, but not add
-    /// content. The official `MISSION_READONLY_SUBSCRIBER`.
-    #[serde(rename = "readonly_subscriber", alias = "MISSION_READONLY_SUBSCRIBER", alias = "readonly")]
+    #[serde(rename = "MISSION_READONLY_SUBSCRIBER")]
     ReadOnlySubscriber,
 }
 
-impl MissionRole {
-    /// Whether this role may add content (official `MISSION_WRITE`).
-    pub fn can_write(self) -> bool {
-        matches!(self, MissionRole::Owner | MissionRole::Subscriber)
+impl Role {
+    /// `MissionRole.defaultRole`.
+    pub const DEFAULT: Role = Role::Subscriber;
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Owner => "MISSION_OWNER",
+            Role::Subscriber => "MISSION_SUBSCRIBER",
+            Role::ReadOnlySubscriber => "MISSION_READONLY_SUBSCRIBER",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Role> {
+        match s {
+            "MISSION_OWNER" => Some(Role::Owner),
+            "MISSION_SUBSCRIBER" => Some(Role::Subscriber),
+            "MISSION_READONLY_SUBSCRIBER" => Some(Role::ReadOnlySubscriber),
+            _ => None,
+        }
+    }
+
+    pub fn permissions(self) -> &'static [Permission] {
+        use Permission::*;
+        match self {
+            Role::Owner => &[
+                MissionRead,
+                MissionWrite,
+                MissionDelete,
+                MissionSetRole,
+                MissionSetPassword,
+                MissionUpdateGroups,
+                MissionManageFeeds,
+                MissionManageLayers,
+            ],
+            Role::Subscriber => &[MissionRead, MissionWrite],
+            Role::ReadOnlySubscriber => &[MissionRead],
+        }
+    }
+
+    pub fn has(self, permission: Permission) -> bool {
+        self.permissions().contains(&permission)
+    }
+
+    /// `MissionRole.hasAllPermissions`.
+    pub fn has_all(self, other: Role) -> bool {
+        other.permissions().iter().all(|p| self.has(*p))
     }
 }
 
-fn subscriber_role() -> MissionRole {
-    MissionRole::Subscriber
+/// Mission content: an Enterprise Sync resource (by hash) or a CoT uid.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Content {
+    Hash(String),
+    Uid(String),
 }
 
-fn anon_groups() -> Vec<String> {
-    vec![crate::groups::ANON_GROUP.to_string()]
+/// One entry of `Mission.uids` / `Mission.contents` (`Mission.MissionAdd`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContentAdd {
+    pub content: Content,
+    pub timestamp_ms: i64,
+    pub creator_uid: String,
+}
+
+/// The mission's own fields (`Mission`), as created or updated.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MissionFields {
+    pub description: String,
+    pub chat_room: String,
+    pub base_layer: String,
+    pub bbox: String,
+    pub bounding_polygon: String,
+    pub path: String,
+    pub classification: String,
+    /// `Mission.expiration`, -1 = none.
+    pub expiration: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Mission {
+pub struct MissionRecord {
+    pub guid: String,
     pub name: String,
-    pub description: Option<String>,
+    pub fields: MissionFields,
+    pub tool: String,
     pub creator_uid: String,
-    pub created_at_unix: i64,
-    pub keywords: Vec<String>,
-    pub contents: Vec<MissionContentRef>,
-    pub subscribers: Vec<String>,
-    pub roles: HashMap<String, MissionRole>,
-    /// The groups this mission is visible in (`crate::groups`): only an
-    /// identity in one of them (either direction) can see it. Missions
-    /// created before groups existed are in `__ANON__`.
-    #[serde(default = "anon_groups")]
-    pub groups: Vec<String>,
-    /// The role an identity gets when subscribing (official
-    /// `defaultRole`): `Subscriber` unless the mission was created
-    /// read-only for subscribers.
-    #[serde(rename = "defaultRole", default = "subscriber_role")]
-    pub default_role: MissionRole,
+    pub create_time_ms: i64,
+    pub last_edited_ms: i64,
+    pub groups: BTreeSet<String>,
+    /// Argon2 PHC string; the official server uses BCrypt -- never exposed.
+    pub password_hash: Option<String>,
+    pub default_role: Option<Role>,
+    pub invite_only: bool,
+    /// `Mission.keywords`, a sorted set.
+    pub keywords: BTreeSet<String>,
+    /// Keywords per uid / hash (`mission_uid_keyword`,
+    /// `mission_resource_keyword`), kept whether or not the item is in
+    /// the mission, as the official tables are.
+    pub content_keywords: BTreeMap<Content, Vec<String>>,
+    /// Content, each with its latest add, in the order of those adds.
+    pub contents: Vec<ContentAdd>,
+    pub deleted: bool,
 }
 
-/// A reference to Data Package content associated with a mission — just
-/// the hash/filename a client claims, not the file itself (see this
-/// module's doc comment on scope).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MissionContentRef {
-    pub hash: String,
-    pub filename: String,
-    pub added_at_unix: i64,
-    pub creator_uid: String,
+impl MissionRecord {
+    pub fn password_protected(&self) -> bool {
+        self.password_hash.is_some()
+    }
+
+    /// `MissionService.getDefaultRole`.
+    pub fn effective_default_role(&self) -> Role {
+        self.default_role.unwrap_or(Role::DEFAULT)
+    }
+
+    pub fn has(&self, content: &Content) -> bool {
+        self.contents.iter().any(|c| &c.content == content)
+    }
+
+    pub fn uids(&self) -> impl Iterator<Item = &ContentAdd> {
+        self.contents.iter().filter(|c| matches!(c.content, Content::Uid(_)))
+    }
+
+    pub fn hashes(&self) -> impl Iterator<Item = &ContentAdd> {
+        self.contents.iter().filter(|c| matches!(c.content, Content::Hash(_)))
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MissionChange {
-    pub change_type: ChangeType,
-    pub timestamp_unix: i64,
-    pub creator_uid: String,
-    /// Set for `AddContent`/`RemoveContent`; `None` otherwise.
-    pub content_hash: Option<String>,
-}
-
+/// `MissionChangeType` (the subset with an API here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangeType {
-    Create,
-    Update,
+    #[serde(rename = "CREATE_MISSION")]
+    CreateMission,
+    #[serde(rename = "DELETE_MISSION")]
+    DeleteMission,
+    #[serde(rename = "ADD_CONTENT")]
     AddContent,
+    #[serde(rename = "REMOVE_CONTENT")]
     RemoveContent,
-    Subscribe,
-    Unsubscribe,
-    RoleAssigned,
-    RoleRevoked,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct MissionRecord {
-    mission: Option<Mission>,
-    changes: Vec<MissionChange>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeRecord {
+    /// Store-wide increasing id; changes are returned newest id first
+    /// (`MissionChange.compareTo`).
+    pub id: u64,
+    pub change_type: ChangeType,
+    pub mission_guid: String,
+    pub mission_name: String,
+    pub content: Option<Content>,
+    pub creator_uid: String,
+    pub timestamp_ms: i64,
+    pub server_time_ms: i64,
 }
 
-/// Fields an update (`MissionStore::update`) may change; a `None` field is
-/// left as-is, matching PATCH's "only touch what's provided" semantics
-/// (contrast with a reference implementation's `PUT`-as-merge behavior,
-/// documented as a real, confirmed gap in `docs/TEST-PLAN.md` TC-MARTI-12 —
-/// MicroTAK's own `PUT`, by contrast, is strict-create-only; see
-/// `marti::missions`).
-#[derive(Debug, Default)]
-pub struct MissionUpdate {
-    pub description: Option<String>,
-    pub keywords: Option<Vec<String>>,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubscriptionRecord {
+    /// The subscription's own id (`MissionSubscription.uid`, not exposed).
+    pub id: String,
+    pub token: String,
+    pub client_uid: String,
+    pub username: String,
+    pub create_time_ms: i64,
+    pub role: Role,
 }
 
-/// A durable, replayable record of one mission-store mutation. This is the
-/// actual source of truth on disk — [`Mission`]/[`MissionChange`]/the
-/// in-memory `HashMap` are a materialized view rebuilt by replaying these.
-/// Deliberately mirrors the *inputs* to each public mutator method (not the
-/// derived [`MissionChange`] shape, which is lighter and omits payload
-/// `update`/`create` don't need replayed twice) — see [`apply_event`].
+/// `MissionInvitation.Type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InvitationType {
+    ClientUid,
+    Callsign,
+    UserName,
+    Group,
+    Team,
+}
+
+impl InvitationType {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "clientUid" => Some(Self::ClientUid),
+            "callsign" => Some(Self::Callsign),
+            "userName" => Some(Self::UserName),
+            "group" => Some(Self::Group),
+            "team" => Some(Self::Team),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ClientUid => "clientUid",
+            Self::Callsign => "callsign",
+            Self::UserName => "userName",
+            Self::Group => "group",
+            Self::Team => "team",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InvitationRecord {
+    pub mission_guid: String,
+    pub mission_name: String,
+    pub invitee: String,
+    pub invitation_type: InvitationType,
+    pub creator_uid: String,
+    pub create_time_ms: i64,
+    pub token: String,
+    pub role: Role,
+}
+
+/// `LogEntry`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LogEntryRecord {
+    pub id: String,
+    pub content: String,
+    pub creator_uid: String,
+    pub entry_uid: String,
+    pub mission_names: Vec<String>,
+    pub server_time_ms: i64,
+    pub dtg_ms: Option<i64>,
+    pub created_ms: Option<i64>,
+    pub content_hashes: Vec<String>,
+    pub keywords: Vec<String>,
+}
+
+/// A time window over `servertime` (`TimeUtils.validateTimeInterval`).
+#[derive(Debug, Clone, Copy)]
+pub struct Window {
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+impl Window {
+    pub const ALL: Window = Window { start_ms: i64::MIN, end_ms: i64::MAX };
+
+    fn contains(&self, t: i64) -> bool {
+        self.start_ms <= t && t <= self.end_ms
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum MissionEvent {
-    Created {
-        name: String,
-        description: Option<String>,
-        creator_uid: String,
-        keywords: Vec<String>,
-        at_unix: i64,
-        /// Absent in logs written before groups existed (-> `__ANON__`).
-        #[serde(default)]
-        groups: Vec<String>,
-        #[serde(default = "subscriber_role")]
-        default_role: MissionRole,
-    },
-    GroupsSet {
-        name: String,
-        groups: Vec<String>,
-        actor_uid: String,
-        at_unix: i64,
-    },
-    Updated {
-        name: String,
-        description: Option<String>,
-        keywords: Option<Vec<String>>,
-        actor_uid: String,
-        at_unix: i64,
-    },
-    Deleted {
-        name: String,
-    },
-    ContentAdded {
-        name: String,
-        hash: String,
-        filename: String,
-        creator_uid: String,
-        at_unix: i64,
-    },
-    Subscribed {
-        name: String,
-        uid: String,
-        at_unix: i64,
-    },
-    Unsubscribed {
-        name: String,
-        uid: String,
-        at_unix: i64,
-    },
-    RoleAssigned {
-        name: String,
-        uid: String,
-        role: MissionRole,
-        actor_uid: String,
-        at_unix: i64,
-    },
-    RoleRevoked {
-        name: String,
-        uid: String,
-        actor_uid: String,
-        at_unix: i64,
-    },
+enum Event {
+    Created { mission: Box<MissionRecord>, change_id: u64 },
+    FieldsSet { guid: String, fields: MissionFields, at_ms: i64 },
+    PasswordSet { guid: String, password_hash: Option<String>, at_ms: i64 },
+    DefaultRoleSet { guid: String, role: Option<Role>, at_ms: i64 },
+    GroupsSet { guid: String, groups: BTreeSet<String>, at_ms: i64 },
+    KeywordsSet { guid: String, keywords: BTreeSet<String>, at_ms: i64 },
+    ContentKeywordsSet { guid: String, content: Content, keywords: Vec<String> },
+    Deleted { guid: String, creator_uid: String, at_ms: i64, change_id: u64 },
+    ContentAdded { guid: String, content: Content, creator_uid: String, at_ms: i64, change_id: u64 },
+    ContentRemoved { guid: String, content: Content, creator_uid: String, at_ms: i64, change_id: u64 },
+    Subscribed { guid: String, subscription: SubscriptionRecord },
+    SubscriptionRoleSet { guid: String, id: String, role: Role },
+    Unsubscribed { guid: String, id: String },
+    Invited { invitation: InvitationRecord },
+    Uninvited { guid: String, invitee: String, invitation_type: InvitationType },
+    LogEntrySaved { entry: LogEntryRecord },
+    LogEntryDeleted { id: String },
+}
+
+#[derive(Default)]
+struct State {
+    missions: BTreeMap<String, MissionRecord>,
+    changes: Vec<ChangeRecord>,
+    subscriptions: BTreeMap<String, Vec<SubscriptionRecord>>,
+    invitations: Vec<InvitationRecord>,
+    logs: BTreeMap<String, LogEntryRecord>,
+    next_change_id: u64,
+}
+
+fn apply(state: &mut State, event: &Event) {
+    match event.clone() {
+        Event::Created { mission, change_id } => {
+            let mission = *mission;
+            state.changes.push(ChangeRecord {
+                id: change_id,
+                change_type: ChangeType::CreateMission,
+                mission_guid: mission.guid.clone(),
+                mission_name: mission.name.clone(),
+                content: None,
+                creator_uid: mission.creator_uid.clone(),
+                timestamp_ms: mission.create_time_ms,
+                server_time_ms: mission.create_time_ms,
+            });
+            state.next_change_id = state.next_change_id.max(change_id + 1);
+            state.missions.insert(mission.guid.clone(), mission);
+        }
+        Event::FieldsSet { guid, fields, at_ms } => {
+            if let Some(m) = state.missions.get_mut(&guid) {
+                m.fields = fields;
+                m.last_edited_ms = at_ms;
+            }
+        }
+        Event::PasswordSet { guid, password_hash, at_ms } => {
+            if let Some(m) = state.missions.get_mut(&guid) {
+                m.password_hash = password_hash;
+                m.last_edited_ms = at_ms;
+            }
+        }
+        Event::DefaultRoleSet { guid, role, at_ms } => {
+            if let Some(m) = state.missions.get_mut(&guid) {
+                m.default_role = role;
+                m.last_edited_ms = at_ms;
+            }
+        }
+        Event::GroupsSet { guid, groups, at_ms } => {
+            if let Some(m) = state.missions.get_mut(&guid) {
+                m.groups = groups;
+                m.last_edited_ms = at_ms;
+            }
+        }
+        Event::KeywordsSet { guid, keywords, at_ms } => {
+            if let Some(m) = state.missions.get_mut(&guid) {
+                m.keywords = keywords;
+                m.last_edited_ms = at_ms;
+            }
+        }
+        Event::ContentKeywordsSet { guid, content, keywords } => {
+            if let Some(m) = state.missions.get_mut(&guid) {
+                if keywords.is_empty() {
+                    m.content_keywords.remove(&content);
+                } else {
+                    m.content_keywords.insert(content, keywords);
+                }
+            }
+        }
+        Event::Deleted { guid, creator_uid, at_ms, change_id } => {
+            if let Some(m) = state.missions.get_mut(&guid) {
+                m.deleted = true;
+                state.changes.push(ChangeRecord {
+                    id: change_id,
+                    change_type: ChangeType::DeleteMission,
+                    mission_guid: guid.clone(),
+                    mission_name: m.name.clone(),
+                    content: None,
+                    creator_uid,
+                    timestamp_ms: at_ms,
+                    server_time_ms: at_ms,
+                });
+            }
+            state.next_change_id = state.next_change_id.max(change_id + 1);
+        }
+        Event::ContentAdded { guid, content, creator_uid, at_ms, change_id } => {
+            if let Some(m) = state.missions.get_mut(&guid) {
+                // An item shows its latest ADD_CONTENT change, ordered by it.
+                m.contents.retain(|c| c.content != content);
+                m.contents.push(ContentAdd { content: content.clone(), timestamp_ms: at_ms, creator_uid: creator_uid.clone() });
+                state.changes.push(ChangeRecord {
+                    id: change_id,
+                    change_type: ChangeType::AddContent,
+                    mission_guid: guid.clone(),
+                    mission_name: m.name.clone(),
+                    content: Some(content),
+                    creator_uid,
+                    timestamp_ms: at_ms,
+                    server_time_ms: at_ms,
+                });
+            }
+            state.next_change_id = state.next_change_id.max(change_id + 1);
+        }
+        Event::ContentRemoved { guid, content, creator_uid, at_ms, change_id } => {
+            if let Some(m) = state.missions.get_mut(&guid) {
+                m.contents.retain(|c| c.content != content);
+                state.changes.push(ChangeRecord {
+                    id: change_id,
+                    change_type: ChangeType::RemoveContent,
+                    mission_guid: guid.clone(),
+                    mission_name: m.name.clone(),
+                    content: Some(content),
+                    creator_uid,
+                    timestamp_ms: at_ms,
+                    server_time_ms: at_ms,
+                });
+            }
+            state.next_change_id = state.next_change_id.max(change_id + 1);
+        }
+        Event::Subscribed { guid, subscription } => {
+            state.subscriptions.entry(guid).or_default().push(subscription);
+        }
+        Event::SubscriptionRoleSet { guid, id, role } => {
+            if let Some(sub) = state.subscriptions.get_mut(&guid).and_then(|subs| subs.iter_mut().find(|s| s.id == id)) {
+                sub.role = role;
+            }
+        }
+        Event::Unsubscribed { guid, id } => {
+            if let Some(subs) = state.subscriptions.get_mut(&guid) {
+                subs.retain(|s| s.id != id);
+            }
+        }
+        Event::Invited { invitation } => {
+            state.invitations.retain(|i| {
+                !(i.mission_guid == invitation.mission_guid
+                    && i.invitation_type == invitation.invitation_type
+                    && i.invitee.eq_ignore_ascii_case(&invitation.invitee))
+            });
+            state.invitations.push(invitation);
+        }
+        Event::Uninvited { guid, invitee, invitation_type } => {
+            state.invitations.retain(|i| {
+                !(i.mission_guid == guid && i.invitation_type == invitation_type && i.invitee.eq_ignore_ascii_case(&invitee))
+            });
+        }
+        Event::LogEntrySaved { entry } => {
+            state.logs.insert(entry.id.clone(), entry);
+        }
+        Event::LogEntryDeleted { id } => {
+            state.logs.remove(&id);
+        }
+    }
+}
+
+/// What a new mission is created with.
+#[derive(Debug, Clone)]
+pub struct NewMission {
+    pub guid: String,
+    pub name: String,
+    pub fields: MissionFields,
+    pub tool: String,
+    pub creator_uid: String,
+    pub groups: BTreeSet<String>,
+    pub password_hash: Option<String>,
+    pub default_role: Option<Role>,
+    pub invite_only: bool,
 }
 
 pub struct MissionStore {
-    missions: RwLock<HashMap<String, MissionRecord>>,
-    log: Option<EventLog<MissionEvent>>,
+    state: RwLock<State>,
+    log: Option<EventLog<Event>>,
 }
 
 impl MissionStore {
     pub fn in_memory() -> Self {
-        Self {
-            missions: RwLock::new(HashMap::new()),
-            log: None,
-        }
+        Self { state: RwLock::new(State::default()), log: None }
     }
 
-    /// Load an existing store from `path` by replaying its event log, or
-    /// start empty if the file doesn't exist yet. Every subsequent
-    /// mutation appends to this same log.
     pub fn load_or_create(path: impl Into<PathBuf>) -> Result<Self, MissionError> {
-        let mut missions = HashMap::new();
-        let log = EventLog::open_and_replay(path, &mut missions, apply_event)?;
-        Ok(Self {
-            missions: RwLock::new(missions),
-            log: Some(log),
-        })
+        let mut state = State::default();
+        let log = EventLog::open_and_replay(path, &mut state, apply)?;
+        Ok(Self { state: RwLock::new(state), log: Some(log) })
     }
 
-    /// TC-MARTI-01/02: strict create — errors if `name` is already taken.
-    /// Visible in `__ANON__`, subscribers get `Subscriber` -- see
-    /// [`Self::create_with`].
-    pub fn create(
-        &self,
-        name: &str,
-        description: Option<String>,
-        creator_uid: &str,
-        keywords: Vec<String>,
-        now_unix: i64,
-    ) -> Result<Mission, MissionError> {
-        self.create_with(
-            name,
-            description,
-            creator_uid,
-            keywords,
-            anon_groups(),
-            MissionRole::Subscriber,
-            now_unix,
+    fn record(&self, state: &mut State, event: Event) -> Result<(), MissionError> {
+        if let Some(log) = &self.log {
+            log.append(&event)?;
+        }
+        apply(state, &event);
+        Ok(())
+    }
+
+    fn existing<'a>(state: &'a State, guid: &str) -> Result<&'a MissionRecord, MissionError> {
+        state.missions.get(guid).ok_or_else(|| MissionError::NotFound(guid.to_string()))
+    }
+
+    /// `MissionService.createMission`: stores the mission and its
+    /// `CREATE_MISSION` change.
+    pub fn create(&self, new: NewMission, now_ms: i64) -> Result<MissionRecord, MissionError> {
+        let mut state = self.state.write().unwrap();
+        let mission = MissionRecord {
+            guid: new.guid,
+            name: new.name.trim().to_string(),
+            fields: new.fields,
+            tool: new.tool,
+            creator_uid: new.creator_uid,
+            create_time_ms: now_ms,
+            last_edited_ms: now_ms,
+            groups: new.groups,
+            password_hash: new.password_hash,
+            default_role: new.default_role,
+            invite_only: new.invite_only,
+            keywords: BTreeSet::new(),
+            content_keywords: BTreeMap::new(),
+            contents: Vec::new(),
+            deleted: false,
+        };
+        let change_id = state.next_change_id;
+        self.record(&mut state, Event::Created { mission: Box::new(mission.clone()), change_id })?;
+        Ok(mission)
+    }
+
+    pub fn by_guid(&self, guid: &str) -> Option<MissionRecord> {
+        self.state.read().unwrap().missions.get(guid).cloned()
+    }
+
+    /// The newest undeleted mission called `name` (trimmed) among those
+    /// `visible` accepts.
+    pub fn by_name(&self, name: &str, visible: impl Fn(&MissionRecord) -> bool) -> Option<MissionRecord> {
+        let name = name.trim();
+        let state = self.state.read().unwrap();
+        state
+            .missions
+            .values()
+            .filter(|m| !m.deleted && m.name == name && visible(m))
+            .max_by_key(|m| m.create_time_ms)
+            .cloned()
+    }
+
+    /// Whether a mission called `name` was deleted and none of that name
+    /// exists any more (`MissionService.isDeleted`, answered 410).
+    pub fn is_deleted_name(&self, name: &str) -> bool {
+        let name = name.trim();
+        let state = self.state.read().unwrap();
+        let mut same = state.missions.values().filter(|m| m.name == name).peekable();
+        same.peek().is_some() && same.all(|m| m.deleted)
+    }
+
+    /// Every undeleted mission.
+    pub fn list(&self) -> Vec<MissionRecord> {
+        let state = self.state.read().unwrap();
+        let mut missions: Vec<_> = state.missions.values().filter(|m| !m.deleted).cloned().collect();
+        missions.sort_by(|a, b| a.name.cmp(&b.name).then(a.create_time_ms.cmp(&b.create_time_ms)));
+        missions
+    }
+
+    pub fn set_fields(&self, guid: &str, fields: MissionFields, now_ms: i64) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        self.record(&mut state, Event::FieldsSet { guid: guid.into(), fields, at_ms: now_ms })
+    }
+
+    pub fn set_password(&self, guid: &str, password_hash: Option<String>, now_ms: i64) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        self.record(&mut state, Event::PasswordSet { guid: guid.into(), password_hash, at_ms: now_ms })
+    }
+
+    pub fn set_default_role(&self, guid: &str, role: Option<Role>, now_ms: i64) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        self.record(&mut state, Event::DefaultRoleSet { guid: guid.into(), role, at_ms: now_ms })
+    }
+
+    pub fn set_groups(&self, guid: &str, groups: BTreeSet<String>, now_ms: i64) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        self.record(&mut state, Event::GroupsSet { guid: guid.into(), groups, at_ms: now_ms })
+    }
+
+    pub fn set_keywords(&self, guid: &str, keywords: BTreeSet<String>, now_ms: i64) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        self.record(&mut state, Event::KeywordsSet { guid: guid.into(), keywords, at_ms: now_ms })
+    }
+
+    /// Replaces the keywords of one uid or hash (duplicates dropped, as
+    /// the official unique constraint does); empty clears them.
+    pub fn set_content_keywords(&self, guid: &str, content: Content, keywords: Vec<String>) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        let mut unique = Vec::new();
+        for k in keywords {
+            if !unique.contains(&k) {
+                unique.push(k);
+            }
+        }
+        self.record(&mut state, Event::ContentKeywordsSet { guid: guid.into(), content, keywords: unique })
+    }
+
+    /// `MissionService.deleteMission`: flags it deleted, `DELETE_MISSION`.
+    pub fn delete(&self, guid: &str, creator_uid: &str, now_ms: i64) -> Result<MissionRecord, MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        let change_id = state.next_change_id;
+        self.record(
+            &mut state,
+            Event::Deleted { guid: guid.into(), creator_uid: creator_uid.into(), at_ms: now_ms, change_id },
+        )?;
+        Ok(state.missions[guid].clone())
+    }
+
+    /// Adds content (an `ADD_CONTENT` change even if it was already there,
+    /// as the official server records one per request).
+    pub fn add_content(&self, guid: &str, content: Content, creator_uid: &str, now_ms: i64) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        let change_id = state.next_change_id;
+        self.record(
+            &mut state,
+            Event::ContentAdded { guid: guid.into(), content, creator_uid: creator_uid.into(), at_ms: now_ms, change_id },
         )
     }
 
-    /// Like [`Self::create`], choosing the groups the mission is visible
-    /// in and the role subscribers get.
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_with(
-        &self,
-        name: &str,
-        description: Option<String>,
-        creator_uid: &str,
-        keywords: Vec<String>,
-        groups: Vec<String>,
-        default_role: MissionRole,
-        now_unix: i64,
-    ) -> Result<Mission, MissionError> {
-        let mut missions = self.missions.write().unwrap();
-        if missions
-            .get(name)
-            .is_some_and(|record| record.mission.is_some())
-        {
-            return Err(MissionError::AlreadyExists(name.to_string()));
-        }
+    pub fn remove_content(&self, guid: &str, content: Content, creator_uid: &str, now_ms: i64) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        let change_id = state.next_change_id;
+        self.record(
+            &mut state,
+            Event::ContentRemoved { guid: guid.into(), content, creator_uid: creator_uid.into(), at_ms: now_ms, change_id },
+        )
+    }
 
-        let event = MissionEvent::Created {
-            name: name.to_string(),
-            description,
-            creator_uid: creator_uid.to_string(),
-            keywords,
-            at_unix: now_unix,
-            groups,
-            default_role,
+    /// The mission's changes in `window`, newest first. `squashed` follows
+    /// `MissionChangeRepository.MISSION_CHANGES`: creates/deletes since the
+    /// latest create; per (content, creator) only the latest add of content
+    /// still in the mission, or the latest remove of content no longer in
+    /// it -- rows are filtered by the window before squashing, as the SQL's
+    /// `where` runs before its `group by`.
+    pub fn changes(&self, guid: &str, window: Window, squashed: bool) -> Result<Vec<ChangeRecord>, MissionError> {
+        let state = self.state.read().unwrap();
+        let mission = Self::existing(&state, guid)?;
+        let mine = state.changes.iter().filter(|c| c.mission_guid == guid && window.contains(c.server_time_ms));
+        let mut result: Vec<ChangeRecord> = if !squashed {
+            mine.cloned().collect()
+        } else {
+            let latest_create = state
+                .changes
+                .iter()
+                .filter(|c| c.mission_guid == guid && c.change_type == ChangeType::CreateMission)
+                .map(|c| c.timestamp_ms)
+                .max()
+                .unwrap_or(i64::MIN);
+            let mut squashed: BTreeMap<(u8, Content, String), ChangeRecord> = BTreeMap::new();
+            let mut lifecycle = Vec::new();
+            for change in mine {
+                match (&change.change_type, &change.content) {
+                    (ChangeType::CreateMission | ChangeType::DeleteMission, _) => {
+                        if change.timestamp_ms >= latest_create {
+                            lifecycle.push(change.clone());
+                        }
+                    }
+                    (kind, Some(content)) => {
+                        if change.timestamp_ms < mission.create_time_ms {
+                            continue;
+                        }
+                        let present = mission.has(content);
+                        let is_add = *kind == ChangeType::AddContent;
+                        if is_add != present {
+                            continue;
+                        }
+                        let key = (u8::from(is_add), content.clone(), change.creator_uid.clone());
+                        // max(id), max(ts), max(servertime) per group
+                        let entry = squashed.entry(key).or_insert_with(|| change.clone());
+                        entry.id = entry.id.max(change.id);
+                        entry.timestamp_ms = entry.timestamp_ms.max(change.timestamp_ms);
+                        entry.server_time_ms = entry.server_time_ms.max(change.server_time_ms);
+                    }
+                    _ => {}
+                }
+            }
+            lifecycle.into_iter().chain(squashed.into_values()).collect()
         };
-        if let Some(log) = &self.log {
-            log.append(&event)?;
-        }
-        apply_event(&mut missions, &event);
-        Ok(missions.get(name).unwrap().mission.clone().unwrap())
+        result.sort_by_key(|c| std::cmp::Reverse(c.id));
+        Ok(result)
     }
 
-    /// TC-MARTI-12: MicroTAK's own answer — a partial update (only the
-    /// provided fields change), not the full-replace semantics `PUT` would
-    /// otherwise invite ambiguity about.
-    pub fn update(
+    // --- subscriptions --------------------------------------------------
+
+    /// `MissionService.missionSubscribe`: the existing subscription for
+    /// this client uid + username (its role raised to `role` if `role` has
+    /// all of the old one's permissions), or a new one whose token
+    /// `make_token(subscription_id)` mints.
+    pub fn subscribe(
         &self,
-        name: &str,
-        changes: MissionUpdate,
-        actor_uid: &str,
-        now_unix: i64,
-    ) -> Result<Mission, MissionError> {
-        let mut missions = self.missions.write().unwrap();
-        if missions
-            .get(name)
-            .is_none_or(|record| record.mission.is_none())
-        {
-            return Err(MissionError::NotFound(name.to_string()));
+        guid: &str,
+        client_uid: &str,
+        username: &str,
+        role: Role,
+        now_ms: i64,
+        make_token: impl FnOnce(&str) -> String,
+    ) -> Result<SubscriptionRecord, MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        let existing = state
+            .subscriptions
+            .get(guid)
+            .and_then(|subs| subs.iter().find(|s| s.client_uid == client_uid && s.username == username))
+            .cloned();
+        if let Some(mut sub) = existing {
+            if sub.role != role && role.has_all(sub.role) {
+                self.record(&mut state, Event::SubscriptionRoleSet { guid: guid.into(), id: sub.id.clone(), role })?;
+                sub.role = role;
+            }
+            return Ok(sub);
         }
-
-        let event = MissionEvent::Updated {
-            name: name.to_string(),
-            description: changes.description,
-            keywords: changes.keywords,
-            actor_uid: actor_uid.to_string(),
-            at_unix: now_unix,
+        let id = crate::marti::envelope::random_uuid();
+        let subscription = SubscriptionRecord {
+            token: make_token(&id),
+            id,
+            client_uid: client_uid.into(),
+            username: username.into(),
+            create_time_ms: now_ms,
+            role,
         };
-        if let Some(log) = &self.log {
-            log.append(&event)?;
-        }
-        apply_event(&mut missions, &event);
-        Ok(missions.get(name).unwrap().mission.clone().unwrap())
+        self.record(&mut state, Event::Subscribed { guid: guid.into(), subscription: subscription.clone() })?;
+        Ok(subscription)
     }
 
-    /// Replace the groups the mission is visible in.
-    pub fn set_groups(
-        &self,
-        name: &str,
-        groups: Vec<String>,
-        actor_uid: &str,
-        now_unix: i64,
-    ) -> Result<Mission, MissionError> {
-        let mut missions = self.missions.write().unwrap();
-        if missions.get(name).is_none_or(|record| record.mission.is_none()) {
-            return Err(MissionError::NotFound(name.to_string()));
-        }
-        let event = MissionEvent::GroupsSet {
-            name: name.to_string(),
-            groups,
-            actor_uid: actor_uid.to_string(),
-            at_unix: now_unix,
-        };
-        if let Some(log) = &self.log {
-            log.append(&event)?;
-        }
-        apply_event(&mut missions, &event);
-        Ok(missions.get(name).unwrap().mission.clone().unwrap())
+    pub fn subscriptions(&self, guid: &str) -> Vec<SubscriptionRecord> {
+        self.state.read().unwrap().subscriptions.get(guid).cloned().unwrap_or_default()
     }
 
-    pub fn get(&self, name: &str) -> Option<Mission> {
-        self.missions
-            .read()
-            .unwrap()
-            .get(name)
-            .and_then(|r| r.mission.clone())
+    pub fn subscription_by_id(&self, guid: &str, id: &str) -> Option<SubscriptionRecord> {
+        self.subscriptions(guid).into_iter().find(|s| s.id == id)
     }
 
-    pub fn list(&self) -> Vec<Mission> {
-        self.missions
-            .read()
-            .unwrap()
-            .values()
-            .filter_map(|r| r.mission.clone())
+    pub fn find_subscription(&self, guid: &str, client_uid: &str, username: &str) -> Option<SubscriptionRecord> {
+        self.subscriptions(guid).into_iter().find(|s| s.client_uid == client_uid && s.username == username)
+    }
+
+    /// Every stored subscription: (mission guid, mission name, client uid).
+    pub fn all_subscriptions(&self) -> Vec<(String, String, String)> {
+        let state = self.state.read().unwrap();
+        state
+            .subscriptions
+            .iter()
+            .flat_map(|(guid, subs)| {
+                let name = state.missions.get(guid).map(|m| m.name.clone()).unwrap_or_default();
+                subs.iter().map(move |s| (guid.clone(), name.clone(), s.client_uid.clone()))
+            })
             .collect()
     }
 
-    /// Deletes the mission itself but keeps its change log queryable (see
-    /// `apply_event` — no change-log entry is added for a delete, matching
-    /// the pre-event-log behavior this preserves exactly): the mission
-    /// becomes not-found for `get`/`update`, while `changes` still returns
-    /// its history.
-    pub fn delete(&self, name: &str) -> Result<(), MissionError> {
-        let mut missions = self.missions.write().unwrap();
-        if missions
-            .get(name)
-            .is_none_or(|record| record.mission.is_none())
-        {
-            return Err(MissionError::NotFound(name.to_string()));
+    /// `MissionService.setRoleByClientUidOrUsername`: by username if given,
+    /// else by client uid. Returns how many subscriptions changed.
+    pub fn set_subscription_role(&self, guid: &str, client_uid: &str, username: &str, role: Role) -> Result<usize, MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        let ids: Vec<String> = state
+            .subscriptions
+            .get(guid)
+            .map(|subs| {
+                subs.iter()
+                    .filter(|s| if !username.is_empty() { s.username == username } else { s.client_uid == client_uid })
+                    .map(|s| s.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in &ids {
+            self.record(&mut state, Event::SubscriptionRoleSet { guid: guid.into(), id: id.clone(), role })?;
         }
-
-        let event = MissionEvent::Deleted {
-            name: name.to_string(),
-        };
-        if let Some(log) = &self.log {
-            log.append(&event)?;
-        }
-        apply_event(&mut missions, &event);
-        Ok(())
+        Ok(ids.len())
     }
 
-    /// TC-MARTI-05.
-    pub fn changes(&self, name: &str) -> Result<Vec<MissionChange>, MissionError> {
-        self.missions
-            .read()
-            .unwrap()
-            .get(name)
-            .map(|r| r.changes.clone())
-            .ok_or_else(|| MissionError::NotFound(name.to_string()))
+    /// Deletes stored subscriptions (`deleteByMissionGuidAndClientUid…`):
+    /// by client uid and username if a username is given, else by client
+    /// uid alone.
+    pub fn unsubscribe(&self, guid: &str, client_uid: &str, username: Option<&str>) -> Result<usize, MissionError> {
+        let mut state = self.state.write().unwrap();
+        let ids: Vec<String> = state
+            .subscriptions
+            .get(guid)
+            .map(|subs| {
+                subs.iter()
+                    .filter(|s| s.client_uid == client_uid && username.is_none_or(|u| u.is_empty() || s.username == u))
+                    .map(|s| s.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in &ids {
+            self.record(&mut state, Event::Unsubscribed { guid: guid.into(), id: id.clone() })?;
+        }
+        Ok(ids.len())
     }
 
-    pub fn add_content(
-        &self,
-        name: &str,
-        content: MissionContentRef,
-        now_unix: i64,
-    ) -> Result<(), MissionError> {
-        let mut missions = self.missions.write().unwrap();
-        if missions
-            .get(name)
-            .is_none_or(|record| record.mission.is_none())
-        {
-            return Err(MissionError::NotFound(name.to_string()));
-        }
+    // --- invitations ------------------------------------------------------
 
-        let event = MissionEvent::ContentAdded {
-            name: name.to_string(),
-            hash: content.hash,
-            filename: content.filename,
-            creator_uid: content.creator_uid,
-            at_unix: now_unix,
-        };
-        if let Some(log) = &self.log {
-            log.append(&event)?;
-        }
-        apply_event(&mut missions, &event);
-        Ok(())
+    /// `MissionService.missionInvite`: replaces an existing invitation of
+    /// the same invitee and type.
+    pub fn invite(&self, invitation: InvitationRecord) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, &invitation.mission_guid)?;
+        self.record(&mut state, Event::Invited { invitation })
     }
 
-    /// TC-MARTI-04: idempotent -- subscribing an already-subscribed uid is
-    /// a no-op success (and appends no event), not an error.
-    pub fn subscribe(&self, name: &str, uid: &str, now_unix: i64) -> Result<(), MissionError> {
-        let mut missions = self.missions.write().unwrap();
-        let record = missions
-            .get(name)
-            .filter(|r| r.mission.is_some())
-            .ok_or_else(|| MissionError::NotFound(name.to_string()))?;
-        if record
-            .mission
-            .as_ref()
-            .unwrap()
-            .subscribers
+    pub fn uninvite(&self, guid: &str, invitee: &str, invitation_type: InvitationType) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        self.record(&mut state, Event::Uninvited { guid: guid.into(), invitee: invitee.into(), invitation_type })
+    }
+
+    pub fn invitations(&self, guid: &str) -> Vec<InvitationRecord> {
+        let state = self.state.read().unwrap();
+        state.invitations.iter().filter(|i| i.mission_guid == guid).cloned().collect()
+    }
+
+    /// Invitations of `invitation_type` for `invitee` (case-insensitive,
+    /// `findAllMissionInvitationsByInviteeIgnoreCaseAndType`) on missions
+    /// that still exist.
+    pub fn invitations_for(&self, invitee: &str, invitation_type: InvitationType) -> Vec<InvitationRecord> {
+        let state = self.state.read().unwrap();
+        state
+            .invitations
             .iter()
-            .any(|s| s == uid)
-        {
-            return Ok(());
-        }
-
-        let event = MissionEvent::Subscribed {
-            name: name.to_string(),
-            uid: uid.to_string(),
-            at_unix: now_unix,
-        };
-        if let Some(log) = &self.log {
-            log.append(&event)?;
-        }
-        apply_event(&mut missions, &event);
-        Ok(())
+            .filter(|i| {
+                i.invitation_type == invitation_type
+                    && i.invitee.eq_ignore_ascii_case(invitee)
+                    && state.missions.get(&i.mission_guid).is_some_and(|m| !m.deleted)
+            })
+            .cloned()
+            .collect()
     }
 
-    /// TC-MARTI-04. Idempotent in the same sense as `subscribe`.
-    pub fn unsubscribe(&self, name: &str, uid: &str, now_unix: i64) -> Result<(), MissionError> {
-        let mut missions = self.missions.write().unwrap();
-        let record = missions
-            .get(name)
-            .filter(|r| r.mission.is_some())
-            .ok_or_else(|| MissionError::NotFound(name.to_string()))?;
-        if !record
-            .mission
-            .as_ref()
-            .unwrap()
-            .subscribers
-            .iter()
-            .any(|s| s == uid)
-        {
-            return Ok(());
-        }
-
-        let event = MissionEvent::Unsubscribed {
-            name: name.to_string(),
-            uid: uid.to_string(),
-            at_unix: now_unix,
-        };
-        if let Some(log) = &self.log {
-            log.append(&event)?;
-        }
-        apply_event(&mut missions, &event);
-        Ok(())
+    pub fn invitation_by_token(&self, token: &str) -> Option<InvitationRecord> {
+        let state = self.state.read().unwrap();
+        state.invitations.iter().find(|i| i.token == token).cloned()
     }
 
-    /// The role `uid` currently holds on mission `name` -- `None` if the
-    /// mission doesn't exist, or `uid` holds no role on it. This is a pure
-    /// query; `marti::missions` is where a returned role actually gets
-    /// enforced against what a given HTTP action requires.
-    pub fn role_of(&self, name: &str, uid: &str) -> Option<MissionRole> {
-        self.missions
-            .read()
-            .unwrap()
-            .get(name)
-            .and_then(|r| r.mission.as_ref())
-            .and_then(|m| m.roles.get(uid).copied())
+    // --- log entries ----------------------------------------------------------
+
+    pub fn save_log_entry(&self, entry: LogEntryRecord) -> Result<LogEntryRecord, MissionError> {
+        let mut state = self.state.write().unwrap();
+        self.record(&mut state, Event::LogEntrySaved { entry: entry.clone() })?;
+        Ok(entry)
     }
 
-    /// Assign (or overwrite) `uid`'s role on `name`. Rejects demoting the
-    /// mission's *last* `Owner` to `Subscriber` -- a mission with zero
-    /// owners can never have its roles managed again, a permanent lockout
-    /// this guards against by construction rather than trusting every
-    /// caller to check first.
-    pub fn assign_role(
-        &self,
-        name: &str,
-        uid: &str,
-        role: MissionRole,
-        actor_uid: &str,
-        now_unix: i64,
-    ) -> Result<(), MissionError> {
-        let mut missions = self.missions.write().unwrap();
-        let mission = missions
-            .get(name)
-            .and_then(|r| r.mission.as_ref())
-            .ok_or_else(|| MissionError::NotFound(name.to_string()))?;
-
-        if role != MissionRole::Owner
-            && mission.roles.get(uid) == Some(&MissionRole::Owner)
-            && count_owners(mission) <= 1
-        {
-            return Err(MissionError::CannotRemoveLastOwner {
-                name: name.to_string(),
-                uid: uid.to_string(),
-            });
-        }
-
-        let event = MissionEvent::RoleAssigned {
-            name: name.to_string(),
-            uid: uid.to_string(),
-            role,
-            actor_uid: actor_uid.to_string(),
-            at_unix: now_unix,
-        };
-        if let Some(log) = &self.log {
-            log.append(&event)?;
-        }
-        apply_event(&mut missions, &event);
-        Ok(())
+    pub fn delete_log_entry(&self, id: &str) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        self.record(&mut state, Event::LogEntryDeleted { id: id.into() })
     }
 
-    /// Revoke `uid`'s role on `name` entirely (they keep no access at all
-    /// afterward). Same last-owner protection as [`Self::assign_role`].
-    pub fn revoke_role(
-        &self,
-        name: &str,
-        uid: &str,
-        actor_uid: &str,
-        now_unix: i64,
-    ) -> Result<(), MissionError> {
-        let mut missions = self.missions.write().unwrap();
-        let mission = missions
-            .get(name)
-            .and_then(|r| r.mission.as_ref())
-            .ok_or_else(|| MissionError::NotFound(name.to_string()))?;
-
-        if mission.roles.get(uid) == Some(&MissionRole::Owner) && count_owners(mission) <= 1 {
-            return Err(MissionError::CannotRemoveLastOwner {
-                name: name.to_string(),
-                uid: uid.to_string(),
-            });
-        }
-
-        let event = MissionEvent::RoleRevoked {
-            name: name.to_string(),
-            uid: uid.to_string(),
-            actor_uid: actor_uid.to_string(),
-            at_unix: now_unix,
-        };
-        if let Some(log) = &self.log {
-            log.append(&event)?;
-        }
-        apply_event(&mut missions, &event);
-        Ok(())
+    pub fn log_entry(&self, id: &str) -> Option<LogEntryRecord> {
+        self.state.read().unwrap().logs.get(id).cloned()
     }
-}
 
-fn count_owners(mission: &Mission) -> usize {
-    mission
-        .roles
-        .values()
-        .filter(|r| **r == MissionRole::Owner)
-        .count()
-}
+    pub fn all_log_entries(&self) -> Vec<LogEntryRecord> {
+        self.state.read().unwrap().logs.values().cloned().collect()
+    }
 
-/// The reducer: apply one durable event to in-memory state. Used both for
-/// live mutations and for replaying the log on startup. Trusts its input —
-/// idempotency/existence checks happen in the public methods *before* an
-/// event is constructed and logged, so an event reaching here always
-/// represents a genuine, already-validated state transition.
-fn apply_event(missions: &mut HashMap<String, MissionRecord>, event: &MissionEvent) {
-    match event {
-        MissionEvent::Created {
-            name,
-            description,
-            creator_uid,
-            keywords,
-            at_unix,
-            groups,
-            default_role,
-        } => {
-            let mut roles = HashMap::new();
-            roles.insert(creator_uid.clone(), MissionRole::Owner);
-            let mission = Mission {
-                name: name.clone(),
-                description: description.clone(),
-                creator_uid: creator_uid.clone(),
-                created_at_unix: *at_unix,
-                keywords: keywords.clone(),
-                contents: Vec::new(),
-                subscribers: Vec::new(),
-                roles,
-                groups: if groups.is_empty() { anon_groups() } else { groups.clone() },
-                default_role: *default_role,
-            };
-            let record = missions.entry(name.clone()).or_default();
-            record.mission = Some(mission);
-            record.changes.push(MissionChange {
-                change_type: ChangeType::Create,
-                timestamp_unix: *at_unix,
-                creator_uid: creator_uid.clone(),
-                content_hash: None,
-            });
-        }
-        MissionEvent::GroupsSet {
-            name,
-            groups,
-            actor_uid,
-            at_unix,
-        } => {
-            if let Some(record) = missions.get_mut(name) {
-                if let Some(mission) = record.mission.as_mut() {
-                    mission.groups = groups.clone();
-                }
-                record.changes.push(MissionChange {
-                    change_type: ChangeType::Update,
-                    timestamp_unix: *at_unix,
-                    creator_uid: actor_uid.clone(),
-                    content_hash: None,
-                });
-            }
-        }
-        MissionEvent::Updated {
-            name,
-            description,
-            keywords,
-            actor_uid,
-            at_unix,
-        } => {
-            if let Some(record) = missions.get_mut(name) {
-                if let Some(mission) = record.mission.as_mut() {
-                    if let Some(description) = description {
-                        mission.description = Some(description.clone());
-                    }
-                    if let Some(keywords) = keywords {
-                        mission.keywords = keywords.clone();
-                    }
-                }
-                record.changes.push(MissionChange {
-                    change_type: ChangeType::Update,
-                    timestamp_unix: *at_unix,
-                    creator_uid: actor_uid.clone(),
-                    content_hash: None,
-                });
-            }
-        }
-        MissionEvent::Deleted { name } => {
-            if let Some(record) = missions.get_mut(name) {
-                record.mission = None;
-            }
-        }
-        MissionEvent::ContentAdded {
-            name,
-            hash,
-            filename,
-            creator_uid,
-            at_unix,
-        } => {
-            if let Some(record) = missions.get_mut(name) {
-                // Matches the pre-event-log behavior exactly: the change
-                // log entry's creator_uid is the *mission's* creator, not
-                // necessarily the uploader's -- preserved as-is rather than
-                // silently changed by this refactor.
-                let mission_creator_uid = record
-                    .mission
-                    .as_ref()
-                    .map(|m| m.creator_uid.clone())
-                    .unwrap_or_else(|| creator_uid.clone());
-                if let Some(mission) = record.mission.as_mut() {
-                    mission.contents.push(MissionContentRef {
-                        hash: hash.clone(),
-                        filename: filename.clone(),
-                        added_at_unix: *at_unix,
-                        creator_uid: creator_uid.clone(),
-                    });
-                }
-                record.changes.push(MissionChange {
-                    change_type: ChangeType::AddContent,
-                    timestamp_unix: *at_unix,
-                    creator_uid: mission_creator_uid,
-                    content_hash: Some(hash.clone()),
-                });
-            }
-        }
-        MissionEvent::Subscribed { name, uid, at_unix } => {
-            if let Some(record) = missions.get_mut(name) {
-                if let Some(mission) = record.mission.as_mut() {
-                    mission.subscribers.push(uid.clone());
-                    // Subscribing never demotes an existing Owner -- only
-                    // grants Subscriber to an identity with no role yet.
-                    let default_role = mission.default_role;
-                    mission.roles.entry(uid.clone()).or_insert(default_role);
-                }
-                record.changes.push(MissionChange {
-                    change_type: ChangeType::Subscribe,
-                    timestamp_unix: *at_unix,
-                    creator_uid: uid.clone(),
-                    content_hash: None,
-                });
-            }
-        }
-        MissionEvent::Unsubscribed { name, uid, at_unix } => {
-            if let Some(record) = missions.get_mut(name) {
-                if let Some(mission) = record.mission.as_mut() {
-                    mission.subscribers.retain(|s| s != uid);
-                    // Unsubscribing only ever removes a Subscriber role --
-                    // an Owner who unsubscribes keeps their Owner role.
-                    if matches!(
-                        mission.roles.get(uid),
-                        Some(MissionRole::Subscriber | MissionRole::ReadOnlySubscriber)
-                    ) {
-                        mission.roles.remove(uid);
-                    }
-                }
-                record.changes.push(MissionChange {
-                    change_type: ChangeType::Unsubscribe,
-                    timestamp_unix: *at_unix,
-                    creator_uid: uid.clone(),
-                    content_hash: None,
-                });
-            }
-        }
-        MissionEvent::RoleAssigned {
-            name,
-            uid,
-            role,
-            actor_uid,
-            at_unix,
-        } => {
-            if let Some(record) = missions.get_mut(name) {
-                if let Some(mission) = record.mission.as_mut() {
-                    mission.roles.insert(uid.clone(), *role);
-                }
-                record.changes.push(MissionChange {
-                    change_type: ChangeType::RoleAssigned,
-                    timestamp_unix: *at_unix,
-                    creator_uid: actor_uid.clone(),
-                    content_hash: None,
-                });
-            }
-        }
-        MissionEvent::RoleRevoked {
-            name,
-            uid,
-            actor_uid,
-            at_unix,
-        } => {
-            if let Some(record) = missions.get_mut(name) {
-                if let Some(mission) = record.mission.as_mut() {
-                    mission.roles.remove(uid);
-                }
-                record.changes.push(MissionChange {
-                    change_type: ChangeType::RoleRevoked,
-                    timestamp_unix: *at_unix,
-                    creator_uid: actor_uid.clone(),
-                    content_hash: None,
-                });
-            }
-        }
+    /// Log entries naming `mission_name` with `servertime` in `window`,
+    /// oldest first.
+    pub fn log_entries_for(&self, mission_name: &str, window: Window) -> Vec<LogEntryRecord> {
+        let state = self.state.read().unwrap();
+        let mut entries: Vec<_> = state
+            .logs
+            .values()
+            .filter(|e| e.mission_names.iter().any(|n| n == mission_name) && window.contains(e.server_time_ms))
+            .cloned()
+            .collect();
+        entries.sort_by_key(|e| e.server_time_ms);
+        entries
     }
 }
 
@@ -819,390 +902,191 @@ fn apply_event(missions: &mut HashMap<String, MissionRecord>, event: &MissionEve
 mod tests {
     use super::*;
 
-    #[test]
-    fn subscribing_gives_the_missions_default_role_and_unsubscribing_removes_it() {
-        let store = MissionStore::in_memory();
-        store
-            .create_with("m", None, "owner", vec![], vec!["Red".into()], MissionRole::ReadOnlySubscriber, 1)
-            .unwrap();
-        store.subscribe("m", "reader", 2).unwrap();
-        assert_eq!(store.role_of("m", "reader"), Some(MissionRole::ReadOnlySubscriber));
-        store.unsubscribe("m", "reader", 3).unwrap();
-        assert_eq!(store.role_of("m", "reader"), None);
-        assert_eq!(store.get("m").unwrap().groups, vec!["Red".to_string()]);
-    }
-
-    /// Missions logged before groups existed load into `__ANON__` with a
-    /// `Subscriber` default role -- unchanged behaviour for old data.
-    #[test]
-    fn missions_from_before_groups_load_as_anonymous() {
-        let dir = std::env::temp_dir().join(format!("microtak-missions-legacy-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("missions.log");
-        std::fs::write(
-            &path,
-            "{\"type\":\"Created\",\"name\":\"old\",\"description\":null,\"creator_uid\":\"u\",\"keywords\":[],\"at_unix\":1}\n",
-        )
-        .unwrap();
-        let store = MissionStore::load_or_create(&path).unwrap();
-        let mission = store.get("old").unwrap();
-        assert_eq!(mission.groups, vec![crate::groups::ANON_GROUP.to_string()]);
-        assert_eq!(mission.default_role, MissionRole::Subscriber);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn roles_accept_the_official_names() {
-        for (json, role) in [
-            ("\"MISSION_OWNER\"", MissionRole::Owner),
-            ("\"MISSION_SUBSCRIBER\"", MissionRole::Subscriber),
-            ("\"MISSION_READONLY_SUBSCRIBER\"", MissionRole::ReadOnlySubscriber),
-            ("\"readonly_subscriber\"", MissionRole::ReadOnlySubscriber),
-            ("\"owner\"", MissionRole::Owner),
-        ] {
-            assert_eq!(serde_json::from_str::<MissionRole>(json).unwrap(), role, "{json}");
-        }
-        assert!(!MissionRole::ReadOnlySubscriber.can_write());
-    }
-
-    #[test]
-    fn tc_marti_01_creates_gets_and_deletes_a_mission() {
-        let store = MissionStore::in_memory();
-        let created = store
-            .create("Recon Alpha", Some("desc".into()), "user-1", vec![], 1_000)
-            .unwrap();
-        assert_eq!(created.name, "Recon Alpha");
-
-        let fetched = store.get("Recon Alpha").unwrap();
-        assert_eq!(fetched, created);
-
-        store.delete("Recon Alpha").unwrap();
-        assert!(store.get("Recon Alpha").is_none());
-    }
-
-    #[test]
-    fn tc_marti_02_rejects_creating_a_duplicate_name() {
-        let store = MissionStore::in_memory();
-        store.create("dup", None, "user-1", vec![], 1_000).unwrap();
-        let result = store.create("dup", None, "user-1", vec![], 2_000);
-        assert!(matches!(result, Err(MissionError::AlreadyExists(_))));
-    }
-
-    #[test]
-    fn tc_marti_03_names_with_url_reserved_characters_round_trip() {
-        let store = MissionStore::in_memory();
-        let name = "Recon Reppenstedt & Buchholz/Nord 50%";
-        store.create(name, None, "user-1", vec![], 1_000).unwrap();
-        assert!(store.get(name).is_some());
-        assert_eq!(store.list().len(), 1);
-    }
-
-    #[test]
-    fn tc_marti_12_update_only_changes_provided_fields() {
-        let store = MissionStore::in_memory();
+    fn new_mission(store: &MissionStore, name: &str, now_ms: i64) -> MissionRecord {
         store
             .create(
-                "m",
-                Some("original".into()),
-                "user-1",
-                vec!["k1".into()],
-                1_000,
-            )
-            .unwrap();
-
-        let updated = store
-            .update(
-                "m",
-                MissionUpdate {
-                    description: Some("new".into()),
-                    keywords: None,
+                NewMission {
+                    guid: crate::marti::envelope::random_uuid(),
+                    name: name.into(),
+                    fields: MissionFields { expiration: -1, ..Default::default() },
+                    tool: "public".into(),
+                    creator_uid: "ANDROID-1".into(),
+                    groups: BTreeSet::from(["__ANON__".to_string()]),
+                    password_hash: None,
+                    default_role: None,
+                    invite_only: false,
                 },
-                "user-2",
-                2_000,
+                now_ms,
             )
-            .unwrap();
-
-        assert_eq!(updated.description.as_deref(), Some("new"));
-        assert_eq!(updated.keywords, vec!["k1".to_string()]); // untouched
+            .unwrap()
     }
 
     #[test]
-    fn update_on_missing_mission_errors() {
+    fn the_official_roles_have_the_official_permissions() {
+        assert_eq!(Role::Owner.permissions().len(), 8);
+        assert_eq!(Role::Subscriber.permissions(), &[Permission::MissionRead, Permission::MissionWrite]);
+        assert_eq!(Role::ReadOnlySubscriber.permissions(), &[Permission::MissionRead]);
+        assert!(Role::Owner.has_all(Role::Subscriber));
+        assert!(!Role::Subscriber.has_all(Role::Owner));
+        assert!(Role::Subscriber.has_all(Role::ReadOnlySubscriber));
+        assert_eq!(Role::DEFAULT, Role::Subscriber);
+    }
+
+    #[test]
+    fn names_are_trimmed_and_the_newest_visible_mission_wins() {
         let store = MissionStore::in_memory();
-        let result = store.update("nope", MissionUpdate::default(), "user-1", 1_000);
-        assert!(matches!(result, Err(MissionError::NotFound(_))));
+        let first = new_mission(&store, "  Ops ", 1_000);
+        assert_eq!(first.name, "Ops");
+        let second = new_mission(&store, "Ops", 2_000);
+        assert_eq!(store.by_name(" Ops", |_| true).unwrap().guid, second.guid);
+        assert_eq!(store.by_name("Ops", |m| m.guid == first.guid).unwrap().guid, first.guid);
+        assert!(store.by_name("Ops", |_| false).is_none());
     }
 
     #[test]
-    fn tc_marti_05_changes_reflect_full_history() {
+    fn a_deleted_mission_is_gone_by_name_but_answers_deleted() {
         let store = MissionStore::in_memory();
-        store.create("m", None, "user-1", vec![], 1_000).unwrap();
-        store
-            .update(
-                "m",
-                MissionUpdate {
-                    description: Some("d".into()),
-                    keywords: None,
-                },
-                "user-1",
-                2_000,
-            )
-            .unwrap();
-        store
-            .add_content(
-                "m",
-                MissionContentRef {
-                    hash: "abc123".into(),
-                    filename: "map.kml".into(),
-                    added_at_unix: 3_000,
-                    creator_uid: "user-1".into(),
-                },
-                3_000,
-            )
-            .unwrap();
-        store.subscribe("m", "user-2", 4_000).unwrap();
-
-        let changes = store.changes("m").unwrap();
-        assert_eq!(changes.len(), 4);
-        assert_eq!(changes[0].change_type, ChangeType::Create);
-        assert_eq!(changes[1].change_type, ChangeType::Update);
-        assert_eq!(changes[2].change_type, ChangeType::AddContent);
-        assert_eq!(changes[2].content_hash.as_deref(), Some("abc123"));
-        assert_eq!(changes[3].change_type, ChangeType::Subscribe);
+        let m = new_mission(&store, "Ops", 1_000);
+        assert!(!store.is_deleted_name("Ops"));
+        store.delete(&m.guid, "ANDROID-1", 2_000).unwrap();
+        assert!(store.by_name("Ops", |_| true).is_none());
+        assert!(store.is_deleted_name("Ops"));
+        assert!(!store.is_deleted_name("Never"));
+        assert!(store.list().is_empty());
+        assert!(store.by_guid(&m.guid).unwrap().deleted);
     }
 
+    fn summary(changes: &[ChangeRecord]) -> Vec<(ChangeType, Option<Content>, String)> {
+        changes.iter().map(|c| (c.change_type, c.content.clone(), c.creator_uid.clone())).collect()
+    }
+
+    /// The official squashed view (`MISSION_CHANGES`): per content and
+    /// creator only the latest add of what's still there or remove of
+    /// what's gone, newest first; the full history keeps everything.
     #[test]
-    fn tc_marti_04_subscribe_and_unsubscribe_are_idempotent() {
+    fn changes_squash_like_the_official_sql() {
         let store = MissionStore::in_memory();
-        store.create("m", None, "user-1", vec![], 1_000).unwrap();
+        let m = new_mission(&store, "Ops", 1_000);
+        let hash = Content::Hash("a".repeat(64));
+        let uid = Content::Uid("marker-1".into());
+        store.add_content(&m.guid, hash.clone(), "A", 2_000).unwrap();
+        store.add_content(&m.guid, hash.clone(), "A", 3_000).unwrap();
+        store.add_content(&m.guid, uid.clone(), "A", 4_000).unwrap();
+        store.remove_content(&m.guid, uid.clone(), "B", 5_000).unwrap();
 
-        store.subscribe("m", "user-2", 2_000).unwrap();
-        store.subscribe("m", "user-2", 3_000).unwrap(); // no-op, no error
-        assert_eq!(store.get("m").unwrap().subscribers, vec!["user-2"]);
-
-        store.unsubscribe("m", "user-2", 4_000).unwrap();
-        store.unsubscribe("m", "user-2", 5_000).unwrap(); // no-op, no error
-        assert!(store.get("m").unwrap().subscribers.is_empty());
-    }
-
-    #[test]
-    fn tc_marti_06_concurrent_updates_serialize_without_corruption() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let store = Arc::new(MissionStore::in_memory());
-        store.create("m", None, "user-1", vec![], 1_000).unwrap();
-
-        let mut handles = Vec::new();
-        for i in 0..20 {
-            let store = Arc::clone(&store);
-            handles.push(thread::spawn(move || {
-                store
-                    .update(
-                        "m",
-                        MissionUpdate {
-                            description: Some(format!("update-{i}")),
-                            keywords: None,
-                        },
-                        "user-1",
-                        1_000 + i,
-                    )
-                    .unwrap();
-            }));
-        }
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // Not corrupted: exactly one well-formed description survives (one
-        // of the 20 writers', not a torn/partial value), and the full
-        // change history has one Create + 20 Update entries.
-        let final_mission = store.get("m").unwrap();
-        assert!(final_mission
-            .description
-            .as_deref()
-            .is_some_and(|d| d.starts_with("update-")));
-        assert_eq!(store.changes("m").unwrap().len(), 21);
-    }
-
-    #[test]
-    fn creator_gets_owner_role_automatically() {
-        let store = MissionStore::in_memory();
-        store.create("m", None, "user-1", vec![], 1_000).unwrap();
-        assert_eq!(store.role_of("m", "user-1"), Some(MissionRole::Owner));
-        assert_eq!(store.role_of("m", "user-2"), None);
-    }
-
-    #[test]
-    fn subscribing_grants_subscriber_role_and_unsubscribing_removes_it() {
-        let store = MissionStore::in_memory();
-        store.create("m", None, "user-1", vec![], 1_000).unwrap();
-        store.subscribe("m", "user-2", 2_000).unwrap();
-        assert_eq!(store.role_of("m", "user-2"), Some(MissionRole::Subscriber));
-
-        store.unsubscribe("m", "user-2", 3_000).unwrap();
-        assert_eq!(store.role_of("m", "user-2"), None);
-    }
-
-    /// The creator subscribing to their own mission (a real thing a client
-    /// might do) must not demote them from Owner to Subscriber.
-    #[test]
-    fn owner_subscribing_to_their_own_mission_keeps_owner_role() {
-        let store = MissionStore::in_memory();
-        store.create("m", None, "user-1", vec![], 1_000).unwrap();
-        store.subscribe("m", "user-1", 2_000).unwrap();
-        assert_eq!(store.role_of("m", "user-1"), Some(MissionRole::Owner));
-
-        // ...and unsubscribing afterward must not remove it either.
-        store.unsubscribe("m", "user-1", 3_000).unwrap();
-        assert_eq!(store.role_of("m", "user-1"), Some(MissionRole::Owner));
-    }
-
-    #[test]
-    fn owner_can_assign_and_revoke_roles() {
-        let store = MissionStore::in_memory();
-        store.create("m", None, "user-1", vec![], 1_000).unwrap();
-
-        store
-            .assign_role("m", "user-2", MissionRole::Owner, "user-1", 2_000)
-            .unwrap();
-        assert_eq!(store.role_of("m", "user-2"), Some(MissionRole::Owner));
-
-        store.revoke_role("m", "user-2", "user-1", 3_000).unwrap();
-        assert_eq!(store.role_of("m", "user-2"), None);
-    }
-
-    /// The core safety invariant: a mission can never end up with zero
-    /// owners, whether by demotion or outright revocation -- either would
-    /// permanently lock the mission out of ever being managed again.
-    #[test]
-    fn cannot_demote_or_revoke_the_last_owner() {
-        let store = MissionStore::in_memory();
-        store.create("m", None, "user-1", vec![], 1_000).unwrap();
-
-        let demote = store.assign_role("m", "user-1", MissionRole::Subscriber, "user-1", 2_000);
-        assert!(matches!(
-            demote,
-            Err(MissionError::CannotRemoveLastOwner { .. })
-        ));
-        assert_eq!(store.role_of("m", "user-1"), Some(MissionRole::Owner));
-
-        let revoke = store.revoke_role("m", "user-1", "user-1", 2_000);
-        assert!(matches!(
-            revoke,
-            Err(MissionError::CannotRemoveLastOwner { .. })
-        ));
-        assert_eq!(store.role_of("m", "user-1"), Some(MissionRole::Owner));
-    }
-
-    /// With *two* owners, demoting/revoking one is fine -- the mission
-    /// still has an owner left.
-    #[test]
-    fn demoting_one_of_two_owners_is_allowed() {
-        let store = MissionStore::in_memory();
-        store.create("m", None, "user-1", vec![], 1_000).unwrap();
-        store
-            .assign_role("m", "user-2", MissionRole::Owner, "user-1", 2_000)
-            .unwrap();
-
-        store
-            .assign_role("m", "user-1", MissionRole::Subscriber, "user-2", 3_000)
-            .unwrap();
-        assert_eq!(store.role_of("m", "user-1"), Some(MissionRole::Subscriber));
-        assert_eq!(store.role_of("m", "user-2"), Some(MissionRole::Owner));
-    }
-
-    #[test]
-    fn persists_across_reload() {
-        let dir = std::env::temp_dir().join(format!("microtak-missions-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("missions.log");
-
-        {
-            let store = MissionStore::load_or_create(&path).unwrap();
-            store.create("m", Some("d".into()), "user-1", vec![], 1_000).unwrap();
-        }
-
-        let reloaded = MissionStore::load_or_create(&path).unwrap();
-        let mission = reloaded.get("m").unwrap();
-        assert_eq!(mission.description.as_deref(), Some("d"));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The whole point: replaying the log reproduces identical state,
-    /// including a delete (no change-log entry, verified via `changes`
-    /// still returning history for a now-deleted mission) and idempotent
-    /// operations that deliberately appended no event.
-    #[test]
-    fn replay_reconstructs_a_realistic_mutation_sequence_exactly() {
-        let dir = std::env::temp_dir().join(format!("microtak-missions-replay-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("missions.log");
-
-        {
-            let store = MissionStore::load_or_create(&path).unwrap();
-            store.create("m1", None, "user-1", vec![], 1_000).unwrap();
-            store.create("m2", Some("keep".into()), "user-2", vec![], 1_100).unwrap();
-            store.subscribe("m1", "device-a", 1_200).unwrap();
-            store.subscribe("m1", "device-a", 1_300).unwrap(); // idempotent, no event
-            store
-                .update(
-                    "m2",
-                    MissionUpdate { description: Some("updated".into()), keywords: None },
-                    "user-2",
-                    1_400,
-                )
-                .unwrap();
-            store.delete("m1").unwrap();
-        }
-
-        let replayed = MissionStore::load_or_create(&path).unwrap();
-        assert!(replayed.get("m1").is_none(), "m1 was deleted");
+        let squashed = store.changes(&m.guid, Window::ALL, true).unwrap();
         assert_eq!(
-            replayed.changes("m1").unwrap().len(),
-            2,
-            "m1's history (create + subscribe) survives even though the mission itself is gone"
+            summary(&squashed),
+            vec![
+                (ChangeType::RemoveContent, Some(uid.clone()), "B".into()),
+                (ChangeType::AddContent, Some(hash.clone()), "A".into()),
+                (ChangeType::CreateMission, None, "ANDROID-1".into()),
+            ]
         );
-        let m2 = replayed.get("m2").unwrap();
-        assert_eq!(m2.description.as_deref(), Some("updated"));
+        let add = &squashed[1];
+        assert_eq!(add.timestamp_ms, 3_000, "max(ts) of the squashed adds");
 
-        std::fs::remove_dir_all(&dir).ok();
+        let full = store.changes(&m.guid, Window::ALL, false).unwrap();
+        assert_eq!(full.len(), 5);
+        assert!(full.windows(2).all(|w| w[0].id > w[1].id), "newest first");
+
+        let window = Window { start_ms: 4_500, end_ms: i64::MAX };
+        assert_eq!(
+            summary(&store.changes(&m.guid, window, true).unwrap()),
+            vec![(ChangeType::RemoveContent, Some(uid), "B".into())],
+            "window filters rows before squashing"
+        );
     }
 
-    /// Role state (auto-assigned Owner/Subscriber *and* explicit
-    /// assign/revoke calls) survives a reload exactly -- roles aren't
-    /// stored as their own field in the event log, they're deterministically
-    /// re-derived by the reducer on every replay from the same
-    /// Created/Subscribed/Unsubscribed/RoleAssigned/RoleRevoked events that
-    /// already existed for other reasons, so this also confirms that
-    /// derivation is itself replay-safe, not just correct on a live store.
+    /// `missionSubscribe`: one subscription per client uid + username; a
+    /// higher role upgrades it, a lower one doesn't downgrade.
     #[test]
-    fn role_assignments_survive_a_reload() {
-        let dir = std::env::temp_dir().join(format!(
-            "microtak-missions-roles-replay-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("missions.log");
+    fn subscribing_again_reuses_and_only_upgrades() {
+        let store = MissionStore::in_memory();
+        let m = new_mission(&store, "Ops", 1_000);
+        let first = store.subscribe(&m.guid, "ANDROID-1", "jz", Role::ReadOnlySubscriber, 2_000, |id| format!("t-{id}")).unwrap();
+        assert_eq!(first.token, format!("t-{}", first.id));
+        let again = store.subscribe(&m.guid, "ANDROID-1", "jz", Role::Subscriber, 3_000, |_| unreachable!()).unwrap();
+        assert_eq!((again.id.clone(), again.role), (first.id.clone(), Role::Subscriber));
+        let lower = store.subscribe(&m.guid, "ANDROID-1", "jz", Role::ReadOnlySubscriber, 4_000, |_| unreachable!()).unwrap();
+        assert_eq!(lower.role, Role::Subscriber);
+        let other_user = store.subscribe(&m.guid, "ANDROID-1", "other", Role::Subscriber, 5_000, |id| id.to_string()).unwrap();
+        assert_ne!(other_user.id, first.id);
+        assert_eq!(store.subscriptions(&m.guid).len(), 2);
 
-        {
+        assert_eq!(store.unsubscribe(&m.guid, "ANDROID-1", Some("jz")).unwrap(), 1);
+        assert_eq!(store.subscriptions(&m.guid).len(), 1);
+        assert_eq!(store.unsubscribe(&m.guid, "ANDROID-1", None).unwrap(), 1);
+        assert!(store.subscriptions(&m.guid).is_empty());
+    }
+
+    /// `hydrateMission`: each item carries its latest ADD_CONTENT
+    /// change's time and creator, items ordered by those changes.
+    #[test]
+    fn re_adding_content_updates_it_and_moves_it_last() {
+        let store = MissionStore::in_memory();
+        let m = new_mission(&store, "Ops", 1_000);
+        let (a, b) = (Content::Uid("a".into()), Content::Uid("b".into()));
+        store.add_content(&m.guid, a.clone(), "X", 2_000).unwrap();
+        store.add_content(&m.guid, b.clone(), "X", 3_000).unwrap();
+        store.add_content(&m.guid, a.clone(), "Y", 4_000).unwrap();
+        let contents = store.by_guid(&m.guid).unwrap().contents;
+        assert_eq!(contents.iter().map(|c| c.content.clone()).collect::<Vec<_>>(), vec![b, a]);
+        assert_eq!((contents[1].timestamp_ms, contents[1].creator_uid.as_str()), (4_000, "Y"));
+    }
+
+    #[test]
+    fn invitations_replace_and_match_case_insensitively() {
+        let store = MissionStore::in_memory();
+        let m = new_mission(&store, "Ops", 1_000);
+        let invite = |role| InvitationRecord {
+            mission_guid: m.guid.clone(),
+            mission_name: m.name.clone(),
+            invitee: "Alpha".into(),
+            invitation_type: InvitationType::Callsign,
+            creator_uid: "ANDROID-1".into(),
+            create_time_ms: 2_000,
+            token: format!("{role:?}"),
+            role,
+        };
+        store.invite(invite(Role::ReadOnlySubscriber)).unwrap();
+        store.invite(invite(Role::Subscriber)).unwrap();
+        let found = store.invitations_for("ALPHA", InvitationType::Callsign);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].role, Role::Subscriber);
+        assert!(store.invitations_for("Alpha", InvitationType::UserName).is_empty());
+        store.uninvite(&m.guid, "alpha", InvitationType::Callsign).unwrap();
+        assert!(store.invitations(&m.guid).is_empty());
+    }
+
+    #[test]
+    fn everything_survives_a_restart() {
+        let path = std::env::temp_dir().join(format!("microtak-official-missions-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (guid, sub) = {
             let store = MissionStore::load_or_create(&path).unwrap();
-            store.create("m", None, "user-1", vec![], 1_000).unwrap();
-            store.subscribe("m", "user-2", 2_000).unwrap();
+            let m = new_mission(&store, "Ops", 1_000);
+            store.add_content(&m.guid, Content::Uid("u".into()), "A", 2_000).unwrap();
+            store.set_keywords(&m.guid, BTreeSet::from(["k".to_string()]), 3_000).unwrap();
+            store.set_content_keywords(&m.guid, Content::Uid("not-in-mission".into()), vec!["x".into(), "x".into()]).unwrap();
+            let sub = store.subscribe(&m.guid, "ANDROID-1", "jz", Role::Owner, 4_000, |id| id.into()).unwrap();
             store
-                .assign_role("m", "user-3", MissionRole::Owner, "user-1", 3_000)
+                .save_log_entry(LogEntryRecord { id: "log-1".into(), mission_names: vec!["Ops".into()], ..Default::default() })
                 .unwrap();
-            store.subscribe("m", "user-4", 4_000).unwrap();
-            store.unsubscribe("m", "user-4", 5_000).unwrap();
-        }
-
-        let replayed = MissionStore::load_or_create(&path).unwrap();
-        assert_eq!(replayed.role_of("m", "user-1"), Some(MissionRole::Owner));
-        assert_eq!(replayed.role_of("m", "user-2"), Some(MissionRole::Subscriber));
-        assert_eq!(replayed.role_of("m", "user-3"), Some(MissionRole::Owner));
-        assert_eq!(replayed.role_of("m", "user-4"), None);
-
-        std::fs::remove_dir_all(&dir).ok();
+            (m.guid, sub)
+        };
+        let store = MissionStore::load_or_create(&path).unwrap();
+        let m = store.by_guid(&guid).unwrap();
+        assert_eq!(m.keywords, BTreeSet::from(["k".to_string()]));
+        assert_eq!(m.content_keywords[&Content::Uid("not-in-mission".into())], vec!["x".to_string()]);
+        assert!(m.has(&Content::Uid("u".into())));
+        assert_eq!(store.subscription_by_id(&guid, &sub.id), Some(sub));
+        assert_eq!(store.log_entries_for("Ops", Window::ALL).len(), 1);
+        assert_eq!(store.changes(&guid, Window::ALL, false).unwrap().len(), 2);
+        // new changes continue the id sequence
+        store.add_content(&guid, Content::Uid("v".into()), "A", 5_000).unwrap();
+        let ids: Vec<u64> = store.changes(&guid, Window::ALL, false).unwrap().iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![2, 1, 0]);
+        std::fs::remove_file(&path).ok();
     }
 }
