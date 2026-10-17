@@ -135,6 +135,19 @@ async fn handle_client(
                         for item in items {
                             match item {
                                 DecodedItem::Event { event, xml } => {
+                                    // Control messages are consumed, never
+                                    // relayed; a ping gets the official pong.
+                                    if event.is_control() {
+                                        if event.is_ping()
+                                            && let Err(error) = writer
+                                                .write_all(crate::cot::pong_xml(crate::cot::now_unix_millis()).as_bytes())
+                                                .await
+                                        {
+                                            warn!(%peer, %error, "write error, disconnecting client");
+                                            return;
+                                        }
+                                        continue;
+                                    }
                                     let dest_uids = event
                                         .addressed_uids()
                                         .map(|uids| uids.into_iter().map(String::from).collect::<Vec<_>>().into());
@@ -280,6 +293,41 @@ mod tests {
             echoed.is_err(),
             "sender should not receive its own broadcast event back"
         );
+    }
+
+    /// Plain TCP answers pings the same way and never relays them.
+    #[tokio::test]
+    async fn pings_get_a_pong_and_are_not_relayed() {
+        let relay = TcpRelay::bind("127.0.0.1:0".parse().unwrap(), RelayHub::new(), ConnectedClients::new())
+            .await
+            .unwrap();
+        let addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+
+        let mut client_a = TcpStream::connect(addr).await.unwrap();
+        let mut client_b = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        client_a
+            .write_all(br#"<event version="2.0" uid="ANDROID-x-ping" type="t-x-c-t" how="h-g-i-g-o" time="2026-10-17T20:00:00Z" start="2026-10-17T20:00:00Z" stale="2026-10-17T20:00:20Z"><point lat="0" lon="0" hae="0" ce="9999999" le="9999999"/><detail/></event>"#)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = timeout(Duration::from_secs(2), client_a.read(&mut buf))
+            .await
+            .expect("timed out waiting for the pong")
+            .unwrap();
+        let pong = String::from_utf8_lossy(&buf[..n]);
+        assert!(pong.contains(r#"uid="takPong" type="t-x-c-t-r""#), "got: {pong}");
+
+        client_a.write_all(event_xml("AFTER-PING").as_bytes()).await.unwrap();
+        let n = timeout(Duration::from_secs(2), client_b.read(&mut buf))
+            .await
+            .expect("timed out waiting for the relayed event")
+            .unwrap();
+        let received = String::from_utf8_lossy(&buf[..n]);
+        assert!(received.contains("AFTER-PING"), "got: {received}");
+        assert!(!received.contains("t-x-c-t"), "the ping was relayed: {received}");
     }
 
     /// TC-STREAM-04: a stream-level syntax error disconnects the client.

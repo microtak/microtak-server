@@ -191,6 +191,45 @@ pub struct Remarks {
 /// `<marti><dest>` only and leaves room filtering to clients).
 pub const ALL_CHAT_ROOMS: &str = "All Chat Rooms";
 
+/// `SubmissionService.controlMsgTypes` of the official server.
+const CONTROL_TYPES: [&str; 11] = [
+    "t-b", "t-b-a", "t-b-c", "t-b-q", "t-x-c-f", "t-x-c-t", "t-x-c-t-r", "t-x-takp-q", "t-x-c-m", "t-x-c-i-e",
+    "t-x-c-i-d",
+];
+
+/// The official server's answer to a ping (`SubmissionService.sendPong`),
+/// as dom4j serializes it: uid `takPong`, times in `DateUtil.toCotTime`
+/// (`yyyy-MM-dd'T'HH:mm:ss'Z'`), stale 20 seconds later.
+pub fn pong_xml(now_unix_millis: i64) -> String {
+    let now = cot_time(now_unix_millis);
+    let stale = cot_time(now_unix_millis + 20_000);
+    format!(
+        r#"<event version="2.0" uid="takPong" type="t-x-c-t-r" how="h-g-i-g-o" time="{now}" start="{now}" stale="{stale}"> <point ce="9999999" le="9999999" hae="0" lat="0" lon="0"/></event>"#
+    )
+}
+
+fn cot_time(unix_millis: i64) -> String {
+    let dt = time::OffsetDateTime::from_unix_timestamp(unix_millis.div_euclid(1000))
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        dt.year(),
+        dt.month() as u8,
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
+    )
+}
+
+/// Now, in Unix milliseconds.
+pub fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 impl Event {
     /// Parse a single `<event>...</event>` XML document.
     ///
@@ -206,12 +245,23 @@ impl Event {
         Ok(quick_xml::se::to_string(self)?)
     }
 
-    /// True for GeoChat events. Real ATAK/OmniTAK GeoChat is type `b-t-f`
-    /// (uid `GeoChat.<sender>.<room>.<id>`, confirmed from OmniTAK-iOS's
-    /// source); the `t-x-c-t` family is kept for compatibility with what
-    /// this module originally assumed.
+    /// True for GeoChat events: type `b-t-f` (uid
+    /// `GeoChat.<sender>.<room>.<id>`, as ATAK and OmniTAK send it).
     pub fn is_chat(&self) -> bool {
-        self.cot_type == "b-t-f" || self.cot_type.starts_with("b-t-f-") || self.cot_type.starts_with("t-x-c-t")
+        self.cot_type == "b-t-f" || self.cot_type.starts_with("b-t-f-")
+    }
+
+    /// Control messages, which the official server consumes instead of
+    /// brokering or storing (`SubmissionService.controlMsgTypes`, matched
+    /// lowercased): subscription, filter, ping (`t-x-c-t`) and pong,
+    /// protocol negotiation, metrics and incognito messages.
+    pub fn is_control(&self) -> bool {
+        CONTROL_TYPES.contains(&self.cot_type.to_ascii_lowercase().as_str())
+    }
+
+    /// A TAK ping, answered with [`pong_xml`].
+    pub fn is_ping(&self) -> bool {
+        self.cot_type.eq_ignore_ascii_case("t-x-c-t")
     }
 
     /// Whether this is a device's own situational-awareness report (its
@@ -306,7 +356,7 @@ pub(crate) mod tests {
 
     #[test]
     fn round_trips_detail_with_contact_and_chat() {
-        let xml = r#"<event version="2.0" uid="TEST-UID-3" type="t-x-c-t" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><contact callsign="ALPHA-1"/><__chat id="chat1" chatroom="All Chat Rooms" senderCallsign="ALPHA-1"><chatgrp id="chat1" uid0="UID-A" uid1="UID-B"/></__chat><remarks>hello</remarks></detail></event>"#;
+        let xml = r#"<event version="2.0" uid="TEST-UID-3" type="b-t-f" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><contact callsign="ALPHA-1"/><__chat id="chat1" chatroom="All Chat Rooms" senderCallsign="ALPHA-1"><chatgrp id="chat1" uid0="UID-A" uid1="UID-B"/></__chat><remarks>hello</remarks></detail></event>"#;
         let event = Event::from_xml(xml).expect("should parse");
         let xml2 = event.to_xml().expect("should serialize");
         let reparsed = Event::from_xml(&xml2).expect("should reparse own output");
@@ -320,14 +370,38 @@ pub(crate) mod tests {
         assert_eq!(members, vec!["UID-A", "UID-B"]);
     }
 
+    /// `t-x-c-t` is the TAK ping, not chat (official
+    /// `SubmissionService.controlMsgTypes`); GeoChat is `b-t-f`.
     #[test]
-    fn is_chat_matches_t_x_c_t_family_types() {
+    fn pings_are_control_messages_not_chat() {
         let mut event = Event::from_xml(MINIMAL_EVENT).unwrap();
-        assert!(!event.is_chat());
-        event.cot_type = "t-x-c-t".to_string();
-        assert!(event.is_chat());
-        event.cot_type = "t-x-c-t-r".to_string(); // a subtype, still chat
-        assert!(event.is_chat());
+        assert!(!event.is_control());
+        for control in [
+            "t-b", "t-b-a", "t-b-c", "t-b-q", "t-x-c-f", "t-x-c-t", "t-x-c-t-r", "t-x-takp-q", "t-x-c-m",
+            "t-x-c-i-e", "t-x-c-i-d",
+        ] {
+            event.cot_type = control.to_string();
+            assert!(event.is_control(), "{control}");
+            assert!(!event.is_chat(), "{control}");
+        }
+        event.cot_type = "T-X-C-T".to_string();
+        assert!(event.is_control(), "matched case-insensitively, as official");
+        event.cot_type = "t-x-c-t-x".to_string();
+        assert!(!event.is_control(), "exact types only");
+        event.cot_type = "t-x-takp-v".to_string();
+        assert!(!event.is_control(), "the server's own version announcement is not in the set");
+    }
+
+    /// The official pong (`SubmissionService.sendPong`): uid `takPong`,
+    /// times in `DateUtil.toCotTime` (whole seconds), stale 20 s later.
+    #[test]
+    fn the_pong_is_the_official_one() {
+        assert_eq!(
+            pong_xml(1_760_716_800_689),
+            r#"<event version="2.0" uid="takPong" type="t-x-c-t-r" how="h-g-i-g-o" time="2025-10-17T16:00:00Z" start="2025-10-17T16:00:00Z" stale="2025-10-17T16:00:20Z"> <point ce="9999999" le="9999999" hae="0" lat="0" lon="0"/></event>"#
+        );
+        let pong = Event::from_xml(&pong_xml(0)).unwrap();
+        assert_eq!(pong.cot_type, "t-x-c-t-r");
     }
 
     /// Real client traffic, shaped like ATAK/OmniTAK sends it.
@@ -357,7 +431,7 @@ pub(crate) mod tests {
 
     #[test]
     fn addressed_uids_unions_marti_dest_and_chatgrp() {
-        let xml = r#"<event version="2.0" uid="u" type="t-x-c-t" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><marti><dest uid="UID-DIRECT"/></marti><__chat id="c" chatroom="Team"><chatgrp id="c" uid0="UID-TEAM-A"/></__chat></detail></event>"#;
+        let xml = r#"<event version="2.0" uid="u" type="b-t-f" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><marti><dest uid="UID-DIRECT"/></marti><__chat id="c" chatroom="Team"><chatgrp id="c" uid0="UID-TEAM-A"/></__chat></detail></event>"#;
         let event = Event::from_xml(xml).unwrap();
         let mut uids = event.addressed_uids().unwrap();
         uids.sort();
@@ -381,7 +455,7 @@ pub(crate) mod tests {
     /// known to send this -- must still parse cleanly.
     #[test]
     fn parses_chat_missing_remarks() {
-        let xml = r#"<event version="2.0" uid="u" type="t-x-c-t" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><__chat id="c" chatroom="All Chat Rooms"/></detail></event>"#;
+        let xml = r#"<event version="2.0" uid="u" type="b-t-f" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><__chat id="c" chatroom="All Chat Rooms"/></detail></event>"#;
         let event = Event::from_xml(xml).expect("should parse even without remarks");
         assert!(event.detail.unwrap().remarks.is_none());
     }

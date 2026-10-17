@@ -298,6 +298,19 @@ async fn handle_client(
                         for item in items {
                             match item {
                                 DecodedItem::Event { event, xml } => {
+                                    // Control messages are consumed, never
+                                    // relayed; a ping gets the official pong.
+                                    if event.is_control() {
+                                        if event.is_ping()
+                                            && let Err(error) = writer
+                                                .write_all(crate::cot::pong_xml(crate::cot::now_unix_millis()).as_bytes())
+                                                .await
+                                        {
+                                            warn!(%peer, %error, "write error, disconnecting client");
+                                            return;
+                                        }
+                                        continue;
+                                    }
                                     // TC-TLS-04: see `super::identity`.
                                     match identity::authorize(&registry, &cn, &event) {
                                         Verdict::Relay => {}
@@ -706,6 +719,51 @@ mod tests {
         assert!(received.contains("FROM-A-MTLS"), "got: {received}");
     }
 
+    /// A node-cot / ATAK ping (`t-x-c-t`, any uid -- node-cot uses a random
+    /// one) is answered with the official pong to the sender only and is
+    /// never relayed (official: control messages are consumed). CloudTAK's
+    /// connection only counts as live once a pong arrives.
+    #[tokio::test]
+    async fn pings_get_a_pong_and_are_not_relayed() {
+        let fixture = build_fixture();
+        let relay = TlsRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.server_config.clone(),
+            RelayHub::new(),
+            fixture.registry.clone(),
+            ConnectedClients::new(),
+        )
+        .await
+        .unwrap();
+        let addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+
+        let mut tls_a = connect_client(addr, &fixture, "device-a").await;
+        let mut tls_b = connect_client(addr, &fixture, "device-b").await;
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+
+        tls_a.write_all(PING.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = timeout(StdDuration::from_secs(2), tls_a.read(&mut buf))
+            .await
+            .expect("timed out waiting for the pong")
+            .unwrap();
+        let pong = String::from_utf8_lossy(&buf[..n]);
+        assert!(pong.contains(r#"uid="takPong" type="t-x-c-t-r""#), "got: {pong}");
+
+        tls_a.write_all(event_xml("AFTER-PING").as_bytes()).await.unwrap();
+        let n = timeout(StdDuration::from_secs(2), tls_b.read(&mut buf))
+            .await
+            .expect("timed out waiting for the relayed event")
+            .unwrap();
+        let received = String::from_utf8_lossy(&buf[..n]);
+        assert!(received.contains("AFTER-PING"), "got: {received}");
+        assert!(!received.contains("t-x-c-t"), "the ping was relayed: {received}");
+    }
+
+    /// node-cot's `CoT.ping()`, as CloudTAK (node-tak) sends it every 5 s.
+    const PING: &str = r#"<event version="2.0" uid="0b6c5f3e-4a52-4d3f-9a0e-1f2e3d4c5b6a" type="t-x-c-t" how="h-g-i-g-o" time="2026-10-17T20:00:00.000Z" start="2026-10-17T20:00:00.000Z" stale="2026-10-17T20:00:20.000Z"><point lat="0.000000" lon="0.000000" hae="0.0" ce="9999999.0" le="9999999.0"/><detail/></event>"#;
+
     /// TC-TLS-02: a client presenting a cert NOT signed by the configured
     /// CA is rejected -- either the handshake itself fails, or (TLS 1.3
     /// allows a client to consider its handshake "done" locally once it
@@ -867,7 +925,7 @@ mod tests {
 
     fn individual_chat_xml(sender_uid: &str, dest_uid: &str, message: &str) -> String {
         format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?><event version="2.0" uid="{sender_uid}" type="t-x-c-t" how="h-g-i-g-o" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><marti><dest uid="{dest_uid}"/></marti><__chat id="c1" chatroom="{dest_uid}"/><remarks>{message}</remarks></detail></event>"#
+            r#"<?xml version="1.0" encoding="UTF-8"?><event version="2.0" uid="{sender_uid}" type="b-t-f" how="h-g-i-g-o" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><marti><dest uid="{dest_uid}"/></marti><__chat id="c1" chatroom="{dest_uid}"/><remarks>{message}</remarks></detail></event>"#
         )
     }
 
@@ -878,7 +936,7 @@ mod tests {
             .map(|(i, uid)| format!(r#" uid{i}="{uid}""#))
             .collect();
         format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?><event version="2.0" uid="{sender_uid}" type="t-x-c-t" how="h-g-i-g-o" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><__chat id="c1" chatroom="Team"><chatgrp id="c1"{chatgrp_attrs}/></__chat><remarks>{message}</remarks></detail></event>"#
+            r#"<?xml version="1.0" encoding="UTF-8"?><event version="2.0" uid="{sender_uid}" type="b-t-f" how="h-g-i-g-o" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><__chat id="c1" chatroom="Team"><chatgrp id="c1"{chatgrp_attrs}/></__chat><remarks>{message}</remarks></detail></event>"#
         )
     }
 
