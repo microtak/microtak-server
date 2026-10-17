@@ -54,6 +54,8 @@ pub struct MissionsState {
     pub latest_cot: Arc<LatestCot>,
     pub notifier: Arc<MissionNotifier>,
     pub clients: ConnectedClients,
+    /// File bytes, for mission packages.
+    pub content: Arc<crate::content_store::ContentStore>,
 }
 
 impl MissionsState {
@@ -84,6 +86,10 @@ impl MissionsState {
             latest_cot,
             notifier,
             clients: ConnectedClients::new(),
+            content: Arc::new(
+                crate::content_store::ContentStore::open(std::env::temp_dir().join(format!("microtak-mission-content-{}", random_uuid())))
+                    .expect("temp content store"),
+            ),
         }
     }
 }
@@ -141,6 +147,8 @@ pub fn router_with(state: MissionsState) -> Router {
         .route("/Marti/api/missions/guid/:guid/layers/:layer", get(layer_by_guid))
         .route("/Marti/api/missions/:name/layers/:layer/name", put(rename_layer_by_name))
         .route("/Marti/api/missions/guid/:guid/layers/:layer/name", put(rename_layer_by_guid))
+        .route("/Marti/api/missions/:name/archive", get(archive_mission))
+        .route("/Marti/api/missions/:name/contents/missionpackage", put(add_mission_package))
         .route("/Marti/api/missions/:name/password", put(set_password_by_name).delete(remove_password_by_name))
         .route("/Marti/api/missions/guid/:guid/password", put(set_password_by_guid).delete(remove_password_by_guid))
         .route("/Marti/api/missions/:name/expiration", put(set_expiration_by_name))
@@ -1620,6 +1628,147 @@ async fn rename_layer_by_guid(
     let caller = caller(&state, &identity, &headers);
     let mission = existing(&state, &caller, Key::Guid(&guid))?;
     rename_layer_impl(&state, &caller, mission, &layer, &Params::parse(query)?)
+}
+
+// --- mission packages --------------------------------------------------------------------------
+
+/// `getMissionArchive` (`archiveMission`): the mission as a data package --
+/// the latest CoT of each uid under `cot/`, the files under `contents/`.
+async fn archive_mission(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult {
+    use super::mission_package as mp;
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    require(role_for(&state, &mission, &caller), Permission::MissionRead)?;
+    // `request.getServerName()`: the Host header without its port.
+    let server_name = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.rsplit_once(':').map(|(host, _)| host).unwrap_or(h).to_string())
+        .unwrap_or_default();
+    let mut files = Vec::new();
+    for add in mission.uids() {
+        if let Content::Uid(uid) = &add.content {
+            // Unknown uids are skipped ("Unable to add cot to mission archive").
+            if let Some(event) = state.latest_cot.get(uid) {
+                files.push(mp::ArchiveFile {
+                    zip_entry: format!("cot/{uid}.cot"),
+                    bytes: event.xml.into_bytes(),
+                    attributes: Vec::new(),
+                    uid_parameter: Some(uid.clone()),
+                });
+            }
+        }
+    }
+    let mut ndx = 0;
+    for add in mission.hashes() {
+        let Content::Hash(hash) = &add.content else { continue };
+        let Some(record) = state.resources.by_hash(hash, None).into_iter().next() else { continue };
+        let Ok(Some(bytes)) = state.content.get(hash) else { continue };
+        let resource = record.resource_json();
+        let filename = match resource.get("name").and_then(|n| n.as_str()) {
+            Some(name) => {
+                let f = format!("{ndx}_{name}");
+                ndx += 1;
+                f
+            }
+            None => hash.clone(),
+        };
+        files.push(mp::ArchiveFile { zip_entry: format!("contents/{filename}"), bytes, attributes: mp::content_attributes(&resource), uid_parameter: None });
+    }
+    let groups: Vec<String> = mission.groups.iter().cloned().collect();
+    let role = mission.default_role.map(|r| {
+        let permissions = r.permissions().iter().map(|p| serde_json::to_value(p).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()).collect();
+        (r.name(), permissions)
+    });
+    let manifest = mp::manifest_xml(&mp::archive_parameters(&mission, &server_name), &files, &groups, role);
+    let zip = mp::build_archive(&manifest, &files);
+    let encoded: String = url_encode_form(&name);
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            // As the official handler writes it: the quote before `.zip`.
+            (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{encoded}\".zip")),
+        ],
+        zip,
+    )
+        .into_response())
+}
+
+/// `URLEncoder` (form encoding, as ESAPI's `URLEncoder.DEFAULT.encode`).
+fn url_encode_form(s: &str) -> String {
+    serde_urlencoded::to_string([("", s)]).map(|e| e.trim_start_matches('=').to_string()).unwrap_or_default()
+}
+
+/// `addMissionPackage` without `changes.json`: CoT files become uid
+/// content (and reach the live subscribers), other files become Enterprise
+/// Sync resources in the mission. Answers the (empty) conflict list.
+async fn add_mission_package(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> ApiResult {
+    use super::mission_package as mp;
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    require(role_for(&state, &mission, &caller), Permission::MissionWrite)?;
+    let creator = required(&Params::parse(query)?, "creatorUid")?.to_string();
+    let Ok(files) = mp::extract(&body) else {
+        return Ok((StatusCode::INTERNAL_SERVER_ERROR, api_response("MissionChange", json!([]))).into_response());
+    };
+    if files.iter().any(|(n, _)| n == "changes.json") {
+        tracing::warn!(mission = %mission.name, "mission package with offline changes (changes.json) not supported yet");
+        return Ok((StatusCode::INTERNAL_SERVER_ERROR, api_response("MissionChange", json!([]))).into_response());
+    }
+    for (filename, bytes) in files {
+        if filename.to_lowercase().contains("manifest.xml") {
+            continue;
+        }
+        let now = now_ms();
+        if filename.ends_with(".cot") {
+            let xml = String::from_utf8_lossy(&bytes).to_string();
+            let Some(uid) = mp::cot_uid(&xml) else { continue };
+            let xml = mp::trim_bom(&xml).to_string();
+            state.latest_cot.record(&uid, &xml, now);
+            state.store.add_content(&mission.guid, Content::Uid(uid), &creator, now)?;
+            announce_latest_changes(&state, &mission, 1, &creator)?;
+            let start = xml.find("<event").unwrap_or(0);
+            let subscribers: Vec<String> = state.notifier.live_subscribers(&mission.guid).into_iter().filter(|u| u != &creator).collect();
+            if !subscribers.is_empty() {
+                state.notifier.send_event(subscribers, xml[start..].to_string());
+            }
+        } else {
+            let filename = filename.rsplit('/').next().unwrap_or(&filename).to_string();
+            let hash = state.content.put(&bytes, None).map_err(|_| ApiError::Internal)?;
+            state
+                .resources
+                .insert(
+                    crate::sync::NewResource {
+                        uid: random_uuid(),
+                        name: Some(filename.clone()),
+                        download_path: Some(filename),
+                        tool: Some("public".into()),
+                        submission_user: caller.username.clone(),
+                        visible_in: mission.groups.iter().cloned().collect(),
+                        ..Default::default()
+                    },
+                    &hash,
+                    bytes.len() as u64,
+                    now,
+                )
+                .map_err(|_| ApiError::Internal)?;
+            state.store.add_content(&mission.guid, Content::Hash(hash), &creator, now)?;
+            announce_latest_changes(&state, &mission, 1, &creator)?;
+        }
+    }
+    ok("MissionChange", json!([]))
 }
 
 // --- token / password / expiration ---------------------------------------------------------

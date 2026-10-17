@@ -63,6 +63,7 @@ pub mod enrollment;
 pub mod envelope;
 pub mod groups;
 pub mod mission_notify;
+pub mod mission_package;
 pub mod mission_token;
 pub mod missions;
 pub mod oauth;

@@ -771,3 +771,66 @@ async fn layers_like_cloudtak_uses_them() {
     let types: Vec<String> = drain(&mut rx).iter().map(|m| cot_type(&m.xml)).collect();
     assert_eq!(types, ["t-x-m-c", "t-x-m-c", "t-x-m-c-h"], "two removals, then the layer");
 }
+
+// --- mission packages -------------------------------------------------------------------------
+
+/// `archiveMission`: the latest CoT of each uid under `cot/`, files under
+/// `contents/`, the manifest with the mission's parameters, groups, role.
+#[tokio::test]
+async fn a_mission_exports_as_a_data_package() {
+    let h = harness();
+    h.create("Ops", "jz", "&defaultRole=MISSION_SUBSCRIBER").await;
+    let hash = h.state.content.put(b"map bytes", None).unwrap();
+    h.state
+        .resources
+        .insert(crate::sync::NewResource { uid: "r".into(), name: Some("map.png".into()), submission_user: "jz".into(), keywords: vec!["a".into(), "b".into()], ..Default::default() }, &hash, 9, 1)
+        .unwrap();
+    h.state.latest_cot.record("pin-1", r#"<event version="2.0" uid="pin-1" type="a-u-G" how="h-e" time="t" start="t" stale="t"><point lat="1" lon="2" hae="0" ce="0" le="0"/><detail/></event>"#, 1);
+    h.call("PUT", "/Marti/api/missions/Ops/contents?creatorUid=A", "jz", &[], &format!(r#"{{"hashes":["{hash}"],"uids":["pin-1"]}}"#)).await;
+
+    let reply = h.call("GET", "/Marti/api/missions/Ops/archive", "jz", &[("host", "ops.example:8443")], "").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let files = super::super::mission_package::extract(&reply.body).unwrap();
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["cot/pin-1.cot", "contents/0_map.png", "MANIFEST/manifest.xml"]);
+    assert_eq!(files[1].1, b"map bytes");
+    let manifest = String::from_utf8(files[2].1.clone()).unwrap();
+    assert!(manifest.contains(r#"<Parameter name="mission_uid" value="ops.example-8443-ssl-Ops"/>"#), "{manifest}");
+    assert!(manifest.contains(r#"<Parameter name="mission_server" value="ops.example:8443:ssl"/>"#));
+    assert!(manifest.contains(r#"<Content zipEntry="cot/pin-1.cot" ignore="false">"#));
+    assert!(manifest.contains(r#"<Content zipEntry="contents/0_map.png" ignore="false" keywords="a,b" name="map.png" submitter="jz" uid="r" size="9""#), "{manifest}");
+    assert!(manifest.contains(r#"<Role name="MISSION_SUBSCRIBER">"#));
+}
+
+/// `addMissionPackage` (no `changes.json`): CoT files become uids, other
+/// files Enterprise Sync resources in the mission.
+#[tokio::test]
+async fn a_data_package_imports_into_a_mission() {
+    let h = harness();
+    h.create("Ops", "jz", "").await;
+    let cot = r#"<?xml version="1.0"?><event version="2.0" uid="pin-7" type="a-u-G" how="h-e" time="t" start="t" stale="t"><point lat="1" lon="2" hae="0" ce="0" le="0"/><detail><contact callsign="Seven"/></detail></event>"#;
+    let package = crate::zip::stored(&[
+        ("MANIFEST/manifest.xml".into(), b"<MissionPackageManifest/>".to_vec()),
+        ("abc/pin-7.cot".into(), cot.as_bytes().to_vec()),
+        ("files/photo.jpg".into(), b"jpeg".to_vec()),
+    ]);
+    let mut request = Request::builder()
+        .method("PUT")
+        .uri("/Marti/api/missions/Ops/contents/missionpackage?creatorUid=ANDROID-1")
+        .body(Body::from(package))
+        .unwrap();
+    request.extensions_mut().insert(PeerIdentity("jz".into()));
+    let response = h.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let m = h.get("/Marti/api/missions/Ops", "jz").await.data()[0].clone();
+    assert_eq!(m["uids"][0]["data"], "pin-7");
+    assert_eq!(m["uids"][0]["details"]["callsign"], "Seven");
+    assert_eq!(m["contents"][0]["data"]["name"], "photo.jpg");
+    let hash = m["contents"][0]["data"]["hash"].as_str().unwrap();
+    assert_eq!(h.state.content.get(hash).unwrap().unwrap(), b"jpeg");
+    assert_eq!(
+        h.call("PUT", "/Marti/api/missions/Ops/contents/missionpackage", "jz", &[], "x").await.status,
+        StatusCode::BAD_REQUEST,
+        "creatorUid is required"
+    );
+}

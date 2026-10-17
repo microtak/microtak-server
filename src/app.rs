@@ -452,6 +452,7 @@ impl App {
             latest_cot,
             notifier: Arc::clone(&mission_notifier),
             clients: clients.clone(),
+            content: Arc::clone(&content_store),
         })
             .merge(client_endpoints::router(clients.clone()))
             .merge(content_api::router(content_api::SyncState {

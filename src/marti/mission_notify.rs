@@ -235,6 +235,12 @@ impl MissionNotifier {
         }
     }
 
+    /// A CoT event to these clients (mission content from an imported
+    /// package).
+    pub fn send_event(&self, uids: Vec<String>, xml: String) {
+        self.send_to(uids, xml);
+    }
+
     /// One change as the official `commonUtil.toXml(new MissionChanges(change))`.
     pub fn change_xml(&self, change: &ChangeRecord) -> String {
         let mut xml = String::from("<MissionChanges><MissionChange>");
