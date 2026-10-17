@@ -19,6 +19,7 @@ pub mod enrollment_tokens;
 pub mod eventlog;
 pub mod groups;
 pub mod marti;
+pub mod metrics;
 pub mod missions;
 pub mod pki;
 pub mod ratelimit;

@@ -262,6 +262,11 @@ impl DeviceRegistry {
         Access::Allowed
     }
 
+    /// How many certificates are revoked (for metrics).
+    pub fn revoked_cert_count(&self) -> usize {
+        self.state.read().unwrap().revoked_certs.len()
+    }
+
     /// Whether the certificate with this fingerprint (any format accepted by
     /// [`crate::pki::normalize_fingerprint`]) is revoked.
     pub fn is_cert_revoked(&self, fingerprint: &str) -> bool {

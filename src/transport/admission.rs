@@ -115,6 +115,7 @@ impl Admission {
         match self.admit(client.ip()) {
             Some(permit) => Some((client, permit)),
             None => {
+                crate::metrics::inc(&crate::metrics::COUNTERS.connections_refused);
                 tracing::warn!(%client, "connection limit reached, refusing connection");
                 None
             }

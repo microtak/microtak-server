@@ -182,9 +182,56 @@ impl ContentStore {
         }
     }
 
+    /// File count (images vs. everything else) and total size, for metrics.
+    /// Scans the directory -- fine at this project's scale.
+    pub fn stats(&self) -> ContentStats {
+        let mut stats = ContentStats::default();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return stats;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with(".tmp-") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else { continue };
+            if !metadata.is_file() {
+                continue;
+            }
+            stats.bytes += metadata.len();
+            let mut head = [0u8; 12];
+            let read = std::fs::File::open(entry.path())
+                .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+                .unwrap_or(0);
+            if is_image(&head[..read]) {
+                stats.images += 1;
+            } else {
+                stats.others += 1;
+            }
+        }
+        stats
+    }
+
     fn path_for(&self, hash: &str) -> PathBuf {
         self.dir.join(hash)
     }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ContentStats {
+    pub images: u64,
+    pub others: u64,
+    pub bytes: u64,
+}
+
+/// JPEG, PNG, GIF, WebP or HEIF/HEIC (what phone cameras produce).
+fn is_image(head: &[u8]) -> bool {
+    head.starts_with(&[0xff, 0xd8, 0xff])
+        || head.starts_with(b"\x89PNG\r\n\x1a\n")
+        || head.starts_with(b"GIF8")
+        || (head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP"))
+        || (head.get(4..8) == Some(b"ftyp")
+            && matches!(head.get(8..12), Some(b"heic" | b"heix" | b"mif1" | b"msf1" | b"avif")))
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -288,6 +335,24 @@ mod tests {
         let (_file, len) = store.open_file(&hash).await.unwrap().unwrap();
         assert_eq!(len, 12);
         assert!(store.open_file(&"b".repeat(64)).await.unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DataSync stores bytes by hash, without a type; images are told apart
+    /// by their first bytes for the "pictures" count.
+    #[test]
+    fn stats_count_images_by_their_magic_bytes() {
+        let dir = temp_dir("stats");
+        let store = ContentStore::open(dir.clone()).unwrap();
+        store.put(b"\xff\xd8\xff\xe0 jpeg", None).unwrap();
+        store.put(b"\x89PNG\r\n\x1a\n png", None).unwrap();
+        store.put(b"RIFF\x00\x00\x00\x00WEBPVP8 ", None).unwrap();
+        store.put(b"\x00\x00\x00\x18ftypheic....", None).unwrap();
+        store.put(b"PK\x03\x04 a data package", None).unwrap();
+        let stats = store.stats();
+        assert_eq!(stats.images, 4);
+        assert_eq!(stats.others, 1);
+        assert!(stats.bytes > 40);
         std::fs::remove_dir_all(&dir).ok();
     }
 

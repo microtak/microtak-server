@@ -1843,3 +1843,88 @@ async fn e2e_revoking_a_user_account_revokes_its_certificate() {
     assert_eq!(response.status(), 204);
     assert!(!server.api_works(&cert, &key).await);
 }
+
+// ---------------------------------------------------------------------
+// Prometheus metrics
+// ---------------------------------------------------------------------
+
+/// The value of the sample `name` (exact series, labels included) in a
+/// Prometheus text exposition.
+fn sample(exposition: &str, series: &str) -> Option<f64> {
+    exposition
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.trim().parse().ok())
+}
+
+/// `/metrics` reports what the server actually holds and does: devices,
+/// connections, events, missions, stored files (images counted apart).
+#[tokio::test]
+async fn e2e_metrics_report_what_the_server_holds() {
+    let config = AppConfig {
+        metrics_addr: Some("127.0.0.1:0".parse().unwrap()),
+        ..test_config()
+    };
+    let app = App::bind(config).await.unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let mtls_addr = app.mtls_addr().unwrap();
+    let metrics_addr = app.metrics_addr().expect("metrics listener configured");
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    tokio::spawn(app.run());
+
+    let (cert, key) = enroll(&format!("https://{enrollment_addr}"), "metrics-device").await;
+    let api_key = rcgen::KeyPair::from_pem(&key.serialize_pem()).unwrap();
+    let mut stream = connect_mtls(mtls_addr, &ca_cert_pem, &cert, key).await.unwrap();
+    stream.write_all(event_xml("METRICS-UID").as_bytes()).await.unwrap();
+
+    let client = mtls_reqwest_client(&ca_cert_pem, &cert, api_key, marti_api_addr);
+    let base_url = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
+    let png = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0u8; 64]].concat();
+    for body in [png, b"plain text, not a picture".to_vec()] {
+        let status = client
+            .post(format!("{base_url}/Marti/api/sync/missionupload"))
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 200);
+    }
+    let status = client
+        .put(format!("{base_url}/Marti/api/missions/Metrics%20Test"))
+        .json(&serde_json::json!({"creatorUid": "metrics-device"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 201);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{metrics_addr}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.headers()["content-type"].to_str().unwrap().starts_with("text/plain"));
+    let text = response.text().await.unwrap();
+
+    assert_eq!(sample(&text, "microtak_devices"), Some(1.0), "{text}");
+    assert_eq!(sample(&text, "microtak_devices_blocked"), Some(0.0));
+    assert_eq!(sample(&text, "microtak_connected_clients{transport=\"tls\"}"), Some(1.0));
+    assert!(sample(&text, "microtak_cot_events_received_total{transport=\"tls\"}").unwrap() >= 1.0);
+    assert_eq!(sample(&text, "microtak_missions"), Some(1.0));
+    assert_eq!(sample(&text, "microtak_content_files{kind=\"image\"}"), Some(1.0));
+    assert_eq!(sample(&text, "microtak_content_files{kind=\"other\"}"), Some(1.0));
+    assert!(sample(&text, "microtak_content_bytes").unwrap() > 64.0);
+    assert!(sample(&text, "microtak_enrollments_total").unwrap() >= 1.0);
+    assert!(sample(&text, "microtak_data_dir_bytes").unwrap() > 0.0);
+    assert!(text.contains("microtak_build_info{version=\""));
+    for gauge in ["microtak_password_accounts", "microtak_groups", "microtak_enrollment_tokens_active", "microtak_certificates_revoked"] {
+        assert!(sample(&text, gauge).is_some(), "{gauge} missing");
+    }
+}

@@ -82,6 +82,9 @@ pub struct Config {
     pub http_header_timeout_seconds: u64,
     /// Largest DataSync upload accepted, in MB (default 100).
     pub max_upload_mb: u64,
+    /// Serve Prometheus metrics on this port (on `bind_host`, plain HTTP,
+    /// unauthenticated -- keep it private). Unset: no metrics listener.
+    pub metrics_port: Option<u16>,
 }
 
 impl Default for Config {
@@ -115,6 +118,7 @@ impl Default for Config {
             handshake_timeout_seconds: defaults.admission.handshake_timeout.as_secs(),
             http_header_timeout_seconds: defaults.admission.http_header_timeout.as_secs(),
             max_upload_mb: defaults.max_upload_bytes / (1024 * 1024),
+            metrics_port: None,
         }
     }
 }
@@ -220,6 +224,7 @@ impl Config {
                 max_connections_per_ip: self.max_connections_per_ip.max(1),
             },
             max_upload_bytes: self.max_upload_mb.max(1) * 1024 * 1024,
+            metrics_addr: self.metrics_port.map(|port| SocketAddr::new(bind_ip, port)),
         })
     }
 }

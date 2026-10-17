@@ -369,6 +369,7 @@ async fn sign_client_v2(
     }
 
     info!(common_name, "device enrolled");
+    crate::metrics::inc(&crate::metrics::COUNTERS.enrollments);
     shaped_success_response(&headers, &signed.cert_pem, &state.ca.ca_cert_pem())
 }
 

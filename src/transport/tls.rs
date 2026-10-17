@@ -302,6 +302,7 @@ async fn handle_client(
                                     match identity::authorize(&registry, &cn, &event) {
                                         Verdict::Relay => {}
                                         Verdict::Drop(reason) => {
+                                            crate::metrics::inc(&crate::metrics::COUNTERS.cot_events_dropped);
                                             warn!(%peer, cn, uid = %event.uid, reason, "dropping event that impersonates another device");
                                             continue;
                                         }
@@ -317,6 +318,7 @@ async fn handle_client(
                                     let dest_uids = event
                                         .addressed_uids()
                                         .map(|uids| uids.into_iter().map(String::from).collect::<Vec<_>>().into());
+                                    crate::metrics::inc(&crate::metrics::COUNTERS.cot_events_tls);
                                     // Relay the event as received (see `DecodedItem::Event`).
                                     let _ = tx.send(Outbound {
                                         sender: peer,

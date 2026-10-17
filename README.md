@@ -172,6 +172,12 @@ have it send the PROXY protocol header (v1 or v2): limits, logs and the
 connected-clients list then see real client addresses. Headers from any
 other peer are ignored.
 
+Set `metrics_port` (e.g. `9101`) for Prometheus metrics at `/metrics`:
+enrolled devices, password accounts, connected clients, CoT events, missions,
+stored files (pictures counted apart), data size, CPU and memory. Plain HTTP
+without authentication -- counts, no content -- so keep that port on a
+private network.
+
 Uploads (photos, data packages) are streamed to disk and may be up to
 100 MB; change with `max_upload_mb`.
 

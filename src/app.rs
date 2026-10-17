@@ -27,6 +27,7 @@ use crate::ratelimit::AuthLimiter;
 use crate::content_store::ContentStore;
 use crate::enrollment_tokens::{EnrollmentTokenError, EnrollmentTokenStore};
 use crate::marti::admin::AdminState;
+use crate::metrics;
 use crate::marti::enrollment::EnrollmentState;
 use crate::marti::{
     admin, client_endpoints, contacts, content as content_api, discovery, enrollment, groups,
@@ -117,6 +118,10 @@ pub struct AppConfig {
     /// Largest DataSync upload accepted, in bytes (uploads are streamed to
     /// disk, never buffered whole).
     pub max_upload_bytes: u64,
+    /// Where to serve Prometheus metrics (plain HTTP, unauthenticated --
+    /// keep it on a private network). `None`: no metrics listener. See
+    /// [`crate::metrics`].
+    pub metrics_addr: Option<SocketAddr>,
 }
 
 /// Whether `/Marti/api/tls/signClient/v2` requires a valid enrollment
@@ -195,6 +200,7 @@ impl Default for AppConfig {
             enrollment_mode: EnrollmentMode::default(),
             admission: AdmissionLimits::default(),
             max_upload_bytes: content_api::DEFAULT_MAX_UPLOAD_BYTES,
+            metrics_addr: None,
         }
     }
 }
@@ -252,6 +258,8 @@ pub struct App {
     enrollment_cert_watch: Option<(Arc<SwappableCert>, PathBuf, PathBuf)>,
     /// Set when `server_names_from_interfaces` is on.
     interface_watch: Option<InterfaceWatch>,
+    /// Set when `metrics_addr` is.
+    metrics: Option<(tokio::net::TcpListener, metrics::Sources)>,
 }
 
 /// What the background task re-issuing the server cert on address changes
@@ -387,6 +395,23 @@ impl App {
         )
         .await?
         .with_admission(admission.clone());
+        let metrics = match config.metrics_addr {
+            Some(addr) => Some((
+                metrics::bind(addr).await?,
+                metrics::Sources {
+                    registry: Arc::clone(&registry),
+                    users: Arc::clone(&users),
+                    missions: Arc::clone(&missions),
+                    groups: Arc::clone(&groups),
+                    tokens: Arc::clone(&enrollment_tokens),
+                    clients: clients.clone(),
+                    content: Arc::clone(&content_store),
+                    admission: admission.clone(),
+                    data_dir: config.data_dir.clone(),
+                },
+            )),
+            None => None,
+        };
         let admin_state = AdminState {
             tokens: enrollment_tokens,
             users,
@@ -453,6 +478,7 @@ impl App {
             bootstrap,
             enrollment_cert_watch,
             interface_watch,
+            metrics,
         })
     }
 
@@ -489,6 +515,11 @@ impl App {
         self.tls.local_addr()
     }
 
+    /// The metrics listener's address, if one is configured.
+    pub fn metrics_addr(&self) -> Option<SocketAddr> {
+        self.metrics.as_ref().and_then(|(listener, _)| listener.local_addr().ok())
+    }
+
     /// Run every listener concurrently until one of them hits a fatal
     /// error (a healthy server runs this forever).
     pub async fn run(self) -> std::io::Result<()> {
@@ -499,8 +530,16 @@ impl App {
             tls,
             enrollment_cert_watch,
             interface_watch,
+            metrics,
             ..
         } = self;
+        if let Some((listener, sources)) = metrics {
+            tokio::spawn(async move {
+                if let Err(error) = metrics::serve(listener, sources).await {
+                    tracing::warn!(%error, "metrics listener stopped");
+                }
+            });
+        }
         if let Some(watch) = interface_watch {
             tokio::spawn(servernames::watch_interfaces(
                 watch.ca,

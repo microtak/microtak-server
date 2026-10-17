@@ -142,6 +142,7 @@ async fn handle_client(
                                     // `DecodedItem::Event`). A closed
                                     // broadcast channel (no subscribers at
                                     // all) is not an error for the sender.
+                                    crate::metrics::inc(&crate::metrics::COUNTERS.cot_events_tcp);
                                     let _ = tx.send(Outbound {
                                         sender: peer,
                                         xml: xml.into(),
