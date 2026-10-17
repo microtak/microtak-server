@@ -1,7 +1,7 @@
 # Default values for the microtak-server chart.
 
 image:
-  repository: microtak-server
+  repository: ghcr.io/microtak/microtak-server
   # Defaults to .Chart.AppVersion when unset.
   tag: ""
   pullPolicy: IfNotPresent
@@ -65,9 +65,26 @@ config:
   # Reverse proxies / ingress controllers whose X-Forwarded-For is trusted
   # for rate limiting (IPs or CIDRs), e.g. the ingress controller's pod CIDR.
   trustedProxies: []
+  # TCP proxies / load balancers whose PROXY protocol header is believed
+  # (IPs or CIDRs), e.g. an ingress controller doing TLS passthrough to the
+  # mTLS ports. Without it, everything behind such a proxy shares its address.
+  proxyProtocolFrom: []
   # The plain-TCP CoT relay is unauthenticated cleartext -- off unless you
   # run a trusted local bridge that needs it.
   plainTcpEnabled: false
+  # The admin device's Common Name; it enrolls once with the bootstrap token
+  # written to the data volume (data/bootstrap-token) on first start.
+  adminCommonName: "admin"
+  # "auto" (locked from the start: invite token or password account needed)
+  # or "open" (any new identity may enroll -- only on a trusted network).
+  enrollmentMode: "auto"
+  # Largest Data Sync upload (photos, data packages), in MB.
+  maxUploadMb: 100
+  limits:
+    maxConnections: 1024
+    maxConnectionsPerIp: 64
+    handshakeTimeoutSeconds: 10
+    httpHeaderTimeoutSeconds: 10
   backup:
     enabled: false
     intervalSeconds: 3600
@@ -77,6 +94,25 @@ config:
     # provided by this chart -- add one via `extraVolumes`/`extraVolumeMounts`
     # below if you need offsite shipping.
     offsiteCommand: []
+
+# A publicly trusted certificate for the enrollment port (devices have no
+# CA yet when they enroll), e.g. the Secret cert-manager writes for a
+# Certificate. Mounted read-only; the server picks up renewals without a
+# restart. Empty: a certificate from MicroTAK's own CA.
+enrollmentCert:
+  existingSecret: ""
+
+# Prometheus metrics (/metrics, plain HTTP, no auth -- cluster-internal
+# only; the port is added to the Service). See the README.
+metrics:
+  enabled: false
+  port: 9101
+  serviceMonitor:
+    # Needs the Prometheus Operator CRDs (e.g. kube-prometheus-stack).
+    enabled: false
+    interval: 30s
+    # Extra labels, e.g. the release label your Prometheus selects on.
+    labels: {}
 
 extraVolumes: []
 extraVolumeMounts: []

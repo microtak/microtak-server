@@ -25,3 +25,9 @@ spec:
       port: {{ .Values.service.ports.mtls }}
       targetPort: mtls
       protocol: TCP
+    {{- if .Values.metrics.enabled }}
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+    {{- end }}

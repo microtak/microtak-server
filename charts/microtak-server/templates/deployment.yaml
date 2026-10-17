@@ -55,6 +55,10 @@ spec:
               containerPort: {{ .Values.service.ports.plainTcp }}
             - name: mtls
               containerPort: {{ .Values.service.ports.mtls }}
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+            {{- end }}
           # The enrollment endpoint is HTTPS without client-cert auth (a
           # device has no cert yet) -- GET /Marti/api/tls/config is a real,
           # cheap, always-available route on it, so it doubles as a health
@@ -77,6 +81,11 @@ spec:
             - name: config
               mountPath: /etc/microtak
               readOnly: true
+            {{- if .Values.enrollmentCert.existingSecret }}
+            - name: enrollment-tls
+              mountPath: /etc/microtak/enrollment-tls
+              readOnly: true
+            {{- end }}
             - name: data
               mountPath: /var/lib/microtak-server/data
             {{- if .Values.persistence.backup.enabled }}
@@ -92,6 +101,11 @@ spec:
         - name: config
           configMap:
             name: {{ include "microtak-server.fullname" . }}-config
+        {{- if .Values.enrollmentCert.existingSecret }}
+        - name: enrollment-tls
+          secret:
+            secretName: {{ .Values.enrollmentCert.existingSecret }}
+        {{- end }}
         - name: data
           {{- if .Values.persistence.data.enabled }}
           persistentVolumeClaim:

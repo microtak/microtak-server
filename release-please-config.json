@@ -7,7 +7,11 @@
   "draft": true,
   "force-tag-creation": true,
   "packages": {
-    ".": {}
+    ".": {
+      "extra-files": [
+        "charts/microtak-server/Chart.yaml"
+      ]
+    }
   },
   "changelog-sections": [
     {
