@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/microtak/microtak-server/compare/v0.8.1...v0.8.2) (2026-10-17)
+
+
+### Bug Fixes
+
+* **cot:** answer pings and consume control messages ([daa24fa](https://github.com/microtak/microtak-server/commit/daa24fa3320197abdb9b6a64f33d9d844cbf7e8f))
+
 ## [0.8.1](https://github.com/microtak/microtak-server/compare/v0.8.0...v0.8.1) (2026-10-17)
 
 
