@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.8.0](https://github.com/microtak/microtak-server/compare/v0.7.0...v0.8.0) (2026-10-17)
+
+
+### Features
+
+* **chart:** new server settings, enrollment certificate, metrics ([778c602](https://github.com/microtak/microtak-server/commit/778c6020a075ba806333455ae2a56421a4da97d7))
+* Prometheus metrics endpoint ([ca8eaaf](https://github.com/microtak/microtak-server/commit/ca8eaaf5eecb99f7ba69a57468cf01b24904f1ea))
+* PROXY protocol from trusted TCP proxies ([9e15789](https://github.com/microtak/microtak-server/commit/9e157893a92e09d398a332cd6269a72cf7bf07dc))
+* revoke device certificates and block identities ([ac48ac5](https://github.com/microtak/microtak-server/commit/ac48ac54f6d625eb91f6da2f515bb946b10f3380))
+* stream DataSync uploads and downloads, 100 MB upload limit ([3148622](https://github.com/microtak/microtak-server/commit/31486225908a162316c6f9361437b1bb0b7f1641))
+
+
+### Bug Fixes
+
+* **deps:** bump quick-xml to 0.41 and rustls to 0.23.46 ([1135017](https://github.com/microtak/microtak-server/commit/1135017083fd8f69825cdaaf35e0e96d81ec77ea))
+* groups responses carry the official envelope's nodeId ([02ac30e](https://github.com/microtak/microtak-server/commit/02ac30ef6596cfc10730fac805ecb7a9d8379744))
+* official certificate admin API instead of own device routes ([62a330a](https://github.com/microtak/microtak-server/commit/62a330a29b7ddfffb19ad50db0127db5e2e2536a))
+* **transport:** handshake timeouts and connection limits on every listener ([9b59b8e](https://github.com/microtak/microtak-server/commit/9b59b8ea1a659026a2b55ba14dd0e271b7eaaa0b))
+* **transport:** resume the terminator scan instead of rescanning the buffer ([26542cd](https://github.com/microtak/microtak-server/commit/26542cd4d48a5f20f951cbcfba31dbd536bc6410))
+* write the CA private key owner-only ([6338e37](https://github.com/microtak/microtak-server/commit/6338e3749084be85885de5f770313c7d88074b59))
+
 ## [0.7.0](https://github.com/microtak/microtak-server/compare/v0.6.0...v0.7.0) (2026-09-29)
 
 
