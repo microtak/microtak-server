@@ -45,6 +45,8 @@ pub struct SyncState {
     pub groups: Arc<GroupStore>,
     pub admin_common_name: Option<String>,
     pub max_upload_bytes: u64,
+    /// For counting a mission's files (`getResourceCountByMission`).
+    pub missions: Arc<crate::missions::MissionStore>,
 }
 
 pub fn router(state: SyncState) -> Router {
@@ -62,6 +64,8 @@ pub fn router(state: SyncState) -> Router {
         )
         .route("/Marti/api/sync/search", get(search_api))
         .route("/Marti/api/resources/:hash", get(get_resource))
+        .route("/Marti/api/files/:hash", axum::routing::delete(file_manager_delete))
+        .route("/Marti/api/files/metadata/count", get(file_manager_count))
         .route("/Marti/api/sync/metadata/:hash/keywords", put(set_keywords))
         .route("/Marti/api/sync/metadata/:hash/expiration", put(set_expiration))
         // Bodies are streamed to disk; the configured upload limit applies.
@@ -580,6 +584,48 @@ async fn delete_servlet(
         ),
     )
         .into_response()
+}
+
+/// `FileManagerApi.deleteFile`: deletes what the caller's groups can see
+/// under `hash`; always answers 200 without a body (errors are swallowed).
+async fn file_manager_delete(
+    State(state): State<SyncState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path(hash): Path<String>,
+) -> Response {
+    let groups = viewer_groups(&state, &identity);
+    let hash = hash.to_ascii_lowercase();
+    if !hash.is_empty() && state.resources.delete_hash(&hash, groups.as_ref()).is_ok() && !state.resources.hash_in_use(&hash) {
+        state.content.remove(&hash);
+    }
+    StatusCode::OK.into_response()
+}
+
+/// `FileManagerApi.getFileCount`: every resource (`resourceRepository.count()`,
+/// not group-filtered) unless a mission or packages are asked for.
+async fn file_manager_count(State(state): State<SyncState>, RawQuery(raw): RawQuery) -> Response {
+    let pairs = query_pairs(raw.as_deref());
+    let get = |k: &str| pairs.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str()).unwrap_or("");
+    let all = state.resources.all();
+    let mission = get("mission");
+    let count = if mission.trim().is_empty() && get("missionPackage") != "true" {
+        all.len()
+    } else if mission.trim().is_empty() {
+        // `getPackageResourceCount`: `'missionpackage' = ANY(keywords)`.
+        all.iter().filter(|r| r.keywords.iter().any(|k| k == "missionpackage")).count()
+    } else {
+        // `getResourceCountByMission`: resources joined to the contents of
+        // every mission of that name.
+        let hashes: BTreeSet<String> = state
+            .missions
+            .list()
+            .into_iter()
+            .filter(|m| m.name == mission)
+            .flat_map(|m| m.hashes().filter_map(|c| match &c.content { crate::missions::Content::Hash(h) => Some(h.clone()), _ => None }).collect::<Vec<_>>())
+            .collect();
+        all.iter().filter(|r| hashes.contains(&r.hash)).count()
+    };
+    crate::marti::envelope::api_response("Count", serde_json::json!(count)).into_response()
 }
 
 async fn get_resource(

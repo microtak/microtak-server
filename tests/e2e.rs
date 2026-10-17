@@ -457,6 +457,36 @@ async fn e2e_official_mission_lifecycle() {
     assert_eq!(gone.status(), 410);
 }
 
+/// Official FileManagerApi: `DELETE /Marti/api/files/{hash}` (what
+/// CloudTAK uses to delete packages) deletes what the caller's groups can
+/// see and always answers 200; the count envelope.
+#[tokio::test]
+async fn e2e_file_manager_delete_and_count() {
+    let (client, base, _, _) = sync_client("files-user").await;
+    let upload = |name: &'static str, query: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            let r = client.post(format!("{base}/Marti/sync/upload?name={name}{query}")).body(name.as_bytes().to_vec()).send().await.unwrap();
+            serde_json::from_str::<serde_json::Value>(&r.text().await.unwrap()).unwrap()["Hash"].as_str().unwrap().to_string()
+        }
+    };
+    let plain = upload("plain.txt", "").await;
+    upload("pkg.zip", "&keywords=missionpackage").await;
+    let count: serde_json::Value = client.get(format!("{base}/Marti/api/files/metadata/count")).send().await.unwrap().json().await.unwrap();
+    assert_envelope(&count, "Count");
+    assert_eq!(count["data"], 2);
+    let packages: serde_json::Value =
+        client.get(format!("{base}/Marti/api/files/metadata/count?missionPackage=true")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(packages["data"], 1);
+
+    let deleted = client.delete(format!("{base}/Marti/api/files/{plain}")).send().await.unwrap();
+    assert_eq!(deleted.status(), 200);
+    assert_eq!(client.get(format!("{base}/Marti/sync/content?hash={plain}")).send().await.unwrap().status(), 404);
+    let again = client.delete(format!("{base}/Marti/api/files/{plain}")).send().await.unwrap();
+    assert_eq!(again.status(), 200, "nothing there: still 200");
+}
+
 /// One enrolled device used like ATAK uses it: the same certificate for
 /// its CoT stream (after a position report binds its uid) and the Marti API.
 async fn device(enrollment: &str, cn: &str, uid: &str, mtls_addr: SocketAddr, marti_api_addr: SocketAddr, ca_cert_pem: &str) -> (TlsStream<TcpStream>, reqwest::Client) {
