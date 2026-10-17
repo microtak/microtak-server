@@ -471,6 +471,12 @@ impl App {
                 groups: Arc::clone(&groups),
                 admin_common_name: config.admin_common_name.clone(),
             }))
+            .merge(crate::marti::subscriptions::router(contacts::ContactsState {
+                clients: clients.clone(),
+                latest_cot: Arc::clone(&latest_cot),
+                groups: Arc::clone(&groups),
+                admin_common_name: config.admin_common_name.clone(),
+            }))
             .merge(groups::router(GroupsState {
                 groups: Arc::clone(&groups),
                 admin_common_name: config.admin_common_name.clone(),

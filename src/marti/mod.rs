@@ -67,6 +67,7 @@ pub mod mission_package;
 pub mod mission_token;
 pub mod missions;
 pub mod oauth;
+pub mod subscriptions;
 
 /// The authenticated identity of an mTLS-connected caller — the connecting
 /// client certificate's Common Name. Injected as a request extension by

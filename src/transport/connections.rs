@@ -39,6 +39,10 @@ pub struct ClientEndpoint {
 #[derive(Clone, Default)]
 pub struct ConnectedClients {
     clients: Arc<RwLock<HashMap<SocketAddr, ClientEndpoint>>>,
+    /// Each connection's subscription number, `streamingUidGen` style
+    /// (from 1, per process).
+    numbers: Arc<RwLock<HashMap<SocketAddr, u64>>>,
+    next_number: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ConnectedClients {
@@ -47,6 +51,8 @@ impl ConnectedClients {
     }
 
     pub fn register(&self, endpoint: ClientEndpoint) {
+        let number = self.next_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.numbers.write().unwrap().insert(endpoint.remote_addr, number);
         self.clients
             .write()
             .unwrap()
@@ -55,6 +61,17 @@ impl ConnectedClients {
 
     pub fn unregister(&self, remote_addr: SocketAddr) {
         self.clients.write().unwrap().remove(&remote_addr);
+        self.numbers.write().unwrap().remove(&remote_addr);
+    }
+
+    /// The official subscription uid of a connection: `tls:<n>` / `tcp:<n>`.
+    pub fn subscription_uid(&self, endpoint: &ClientEndpoint) -> String {
+        let number = self.numbers.read().unwrap().get(&endpoint.remote_addr).copied().unwrap_or(0);
+        let protocol = match endpoint.transport {
+            Transport::Tls => "tls",
+            Transport::Tcp => "tcp",
+        };
+        format!("{protocol}:{number}")
     }
 
     /// Update the bound `uid` for an already-registered connection (e.g.
