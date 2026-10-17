@@ -20,8 +20,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum CotError {
-    #[error("CoT XML (de)serialization failed: {0}")]
+    #[error("CoT XML deserialization failed: {0}")]
     Xml(#[from] quick_xml::DeError),
+    #[error("CoT XML serialization failed: {0}")]
+    XmlSerialize(#[from] quick_xml::SeError),
     #[error("invalid timestamp {field}: {value}")]
     InvalidTimestamp { field: &'static str, value: String },
 }
