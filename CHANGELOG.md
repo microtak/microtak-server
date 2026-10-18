@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.11.0](https://github.com/microtak/microtak-server/compare/v0.10.0...v0.11.0) (2026-10-18)
+
+
+### Features
+
+* **cot:** GET /Marti/api/cot/xml/{uid} ([1126d01](https://github.com/microtak/microtak-server/commit/1126d01bc8cb4053eb48c6c0509a384375275fc0))
+* **missions:** external mission data ([4c6827a](https://github.com/microtak/microtak-server/commit/4c6827ac532368043bcb92f604ee52aa20ebbcc2))
+* **missions:** mission copy ([f287967](https://github.com/microtak/microtak-server/commit/f287967412fe2a831ef49869614546953f4d17a3))
+* **missions:** mission map layers ([17c19ae](https://github.com/microtak/microtak-server/commit/17c19aea90fe7fc99c2c890da7f928d08addb714))
+* **missions:** offline changes (changes.json) in package import ([3572135](https://github.com/microtak/microtak-server/commit/3572135418e50e70a3fe83792bfe38865e7419b0))
+* **missions:** pagedmissions and missioncount ([d338d1d](https://github.com/microtak/microtak-server/commit/d338d1d5ebf7d8677c5faf99960969e4b07179f4))
+* **missions:** send a mission to contacts ([79260e8](https://github.com/microtak/microtak-server/commit/79260e852a1746c7e7061e4437d99ca490301560))
+* **security:** GET /Marti/api/security/isSecure ([48384cc](https://github.com/microtak/microtak-server/commit/48384cce1e5c54b4158533c85e4253be1c43a108))
+* **transport:** TAK Protocol (streaming protobuf) ([4ff8bb9](https://github.com/microtak/microtak-server/commit/4ff8bb9fd589bd1565fe9ccdd8c10770e00f667a))
+
+
+### Documentation
+
+* roadmap after map layers, copy, send, offline changes ([6c6f186](https://github.com/microtak/microtak-server/commit/6c6f18675a88dc0dbff251949bae074987c8b496))
+* roadmap: TAK Protocol done ([e488ec0](https://github.com/microtak/microtak-server/commit/e488ec0a4555d2aa1627a9175d0249593846144f))
+* ROADMAP.md ([43f8410](https://github.com/microtak/microtak-server/commit/43f841036de01fe28b7fc97801325236dc55eec6))
+
 ## [0.10.0](https://github.com/microtak/microtak-server/compare/v0.9.0...v0.10.0) (2026-10-17)
 
 
