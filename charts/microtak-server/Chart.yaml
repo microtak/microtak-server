@@ -2,8 +2,8 @@ apiVersion: v2
 name: microtak-server
 description: A lightweight, mesh-federated TAK (Team Awareness Kit) server
 type: application
-version: 0.11.3
-appVersion: 0.11.3
+version: 0.11.4
+appVersion: 0.11.4
 keywords:
   - tak
   - cot
