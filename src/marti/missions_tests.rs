@@ -107,6 +107,16 @@ fn is_pad_millis(s: &Value) -> bool {
         && s[20..23].chars().all(|c| c.is_ascii_digit())
 }
 
+/// `COT_DATE_FORMAT` (`yyyy-MM-dd'T'HH:mm:ss.S'Z'`, milliseconds unpadded).
+fn is_cot_date(s: &Value) -> bool {
+    let s = s.as_str().unwrap_or("");
+    let (head, frac) = s.split_once('.').unwrap_or(("", ""));
+    head.len() == 19
+        && frac.ends_with('Z')
+        && (2..=4).contains(&frac.len())
+        && frac[..frac.len() - 1].chars().all(|c| c.is_ascii_digit())
+}
+
 // --- create / get ------------------------------------------------------------------
 
 /// `createMission` → `doInternalCreateMission`: 201, the official
@@ -2303,4 +2313,193 @@ async fn unreadable_bodies_have_the_official_message() {
         assert_eq!(reply.json()["message"], "Invalid Request Body", "{uri}");
         assert_eq!(reply.json()["code"], 2);
     }
+}
+
+/// Mission map layers (`createMapLayer` / `updateMapLayer` and the
+/// service behind them): a generated uid (UUID without dashes), create and
+/// modified times, only `defaultLayer` on one layer, an ADD_CONTENT change
+/// with the hydrated `mapLayer` and a `t-x-m-c` (the MAP_LAYER change type
+/// has no CoT type of its own). Update touches name, description, type,
+/// url, creatorUid, enabled, defaultLayer only, records no change, and an
+/// unknown uid is a TakException (500). The two DELETE routes are
+/// ambiguous to Spring, so DELETE is a 500 that changes nothing.
+#[tokio::test]
+async fn mission_map_layers() {
+    let (h, mut rx) = harness_with_hub();
+    h.create("Ops", "jz", "").await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/subscription?uid=ANDROID-B",
+        "bee",
+        &[],
+        "",
+    )
+    .await;
+    drain(&mut rx);
+    let reply = h
+        .call("POST", "/Marti/api/missions/Ops/maplayers?creatorUid=ANDROID-jz", "jz", &[], r#"{"name":"OSM","url":"https://tile/{z}/{x}/{y}.png","defaultLayer":true,"enabled":true,"minZoom":2,"opacity":80}"#)
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json()["type"], "MapLayer");
+    let layer = reply.data().clone();
+    let uid = layer["uid"].as_str().unwrap().to_string();
+    assert_eq!(uid.len(), 32, "UUID without dashes");
+    assert_eq!(
+        (
+            layer["name"].as_str(),
+            layer["type"].as_str(),
+            layer["minZoom"].as_i64(),
+            layer["opacity"].as_i64()
+        ),
+        (Some("OSM"), Some("MapTile"), Some(2), Some(80))
+    );
+    assert_eq!(
+        (
+            layer["defaultLayer"].as_bool(),
+            layer["enabled"].as_bool(),
+            layer["ignoreErrors"].as_bool()
+        ),
+        (Some(true), Some(true), Some(false))
+    );
+    assert!(
+        layer.get("creatorUid").is_none(),
+        "creatorUid comes from the body, not the query"
+    );
+    assert!(is_cot_date(&layer["createTime"]) && is_cot_date(&layer["modifiedTime"]));
+    assert!(layer.get("maxZoom").is_none(), "NON_NULL");
+    let mission = h.get("/Marti/api/missions/Ops", "jz").await.data()[0].clone();
+    assert_eq!(mission["mapLayers"], json!([layer.clone()]));
+
+    let sent = drain(&mut rx);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(cot_type(&sent[0].xml), "t-x-m-c");
+    assert!(
+        sent[0]
+            .xml
+            .contains("<isFederatedChange>false</isFederatedChange><mapLayer><createTime>"),
+        "{}",
+        sent[0].xml
+    );
+    assert!(sent[0].xml.contains(&format!("<type>MapTile</type><uid>{uid}</uid><url>https://tile/{{z}}/{{x}}/{{y}}.png</url></mapLayer><missionGuid>")), "{}", sent[0].xml);
+
+    // A second default layer takes the flag.
+    let second = h
+        .call(
+            "POST",
+            "/Marti/api/missions/Ops/maplayers?creatorUid=ANDROID-jz",
+            "jz",
+            &[],
+            r#"{"name":"Topo","url":"https://topo","defaultLayer":true}"#,
+        )
+        .await;
+    let second_uid = second.data()["uid"].as_str().unwrap().to_string();
+    let layers = h.get("/Marti/api/missions/Ops", "jz").await.data()[0]["mapLayers"].clone();
+    let flag = |u: &str| {
+        layers
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["uid"] == u)
+            .unwrap()["defaultLayer"]
+            .clone()
+    };
+    assert_eq!((flag(&uid), flag(&second_uid)), (json!(false), json!(true)));
+
+    assert_eq!(drain(&mut rx).len(), 1, "the second create");
+
+    // Update: only the listed fields.
+    let update = format!(
+        r#"{{"uid":"{uid}","name":"OSM 2","url":"https://new","type":"WMS","minZoom":9,"enabled":false,"creatorUid":"ANDROID-x"}}"#
+    );
+    let updated = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/maplayers?creatorUid=ANDROID-jz",
+            "jz",
+            &[],
+            &update,
+        )
+        .await;
+    assert_eq!(updated.status, StatusCode::OK, "{}", updated.text());
+    let u = updated.data().clone();
+    assert_eq!(
+        (
+            u["name"].as_str(),
+            u["url"].as_str(),
+            u["type"].as_str(),
+            u["creatorUid"].as_str(),
+            u["enabled"].as_bool()
+        ),
+        (
+            Some("OSM 2"),
+            Some("https://new"),
+            Some("WMS"),
+            Some("ANDROID-x"),
+            Some(false)
+        )
+    );
+    assert_eq!(u["minZoom"], 2, "minZoom is not updated");
+    assert!(drain(&mut rx).is_empty(), "no change, no notification");
+    let missing = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/maplayers?creatorUid=X",
+            "jz",
+            &[],
+            r#"{"uid":"nope","name":"x","url":"y"}"#,
+        )
+        .await;
+    assert_eq!(missing.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let deleted = h
+        .call(
+            "DELETE",
+            &format!("/Marti/api/missions/Ops/maplayers/{uid}?creatorUid=ANDROID-jz"),
+            "jz",
+            &[],
+            "",
+        )
+        .await;
+    assert_eq!(
+        deleted.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "ambiguous handler methods"
+    );
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops", "jz").await.data()[0]["mapLayers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Changes: every map layer add, never squashed.
+    let changes = h.get("/Marti/api/missions/Ops/changes", "jz").await;
+    let adds: Vec<Value> = changes
+        .data()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get("mapLayer").is_some())
+        .cloned()
+        .collect();
+    assert_eq!(adds.len(), 2);
+    assert_eq!(
+        adds[1]["mapLayer"]["name"], "OSM 2",
+        "hydrated with the current layer"
+    );
+    assert_eq!(adds[0]["type"], "ADD_CONTENT");
+    assert_eq!(
+        h.call(
+            "POST",
+            "/Marti/api/missions/Ops/maplayers?creatorUid=X",
+            "jz",
+            &[],
+            "{}"
+        )
+        .await
+        .status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "name and url are NOT NULL"
+    );
 }

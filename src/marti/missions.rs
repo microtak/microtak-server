@@ -20,7 +20,7 @@
 //! Changes are announced to subscribers as the official server does
 //! ([`super::mission_notify`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -105,6 +105,21 @@ pub fn router_with(state: MissionsState) -> Router {
             get(list_missions).delete(delete_mission_by_guid),
         )
         .route("/Marti/api/pagedmissions", get(paged_missions))
+        .route(
+            "/Marti/api/missions/:name/maplayers",
+            post(add_map_layer_by_name).put(update_map_layer_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/maplayers",
+            post(add_map_layer_by_guid).put(update_map_layer_by_guid),
+        )
+        // `/missions/{missionName:.+}/maplayers/{uid}` and
+        // `/missions/{missionGuid:.+}/maplayers/{uid}` are equally specific
+        // to Spring: every DELETE is "Ambiguous handler methods" (500).
+        .route(
+            "/Marti/api/missions/:name/maplayers/:uid",
+            axum::routing::delete(|| async { ApiError::Internal }),
+        )
         .route(
             "/Marti/api/missions/:name/externaldata",
             post(set_external_by_name),
@@ -765,7 +780,13 @@ fn mission_json(
         .collect();
     put("externalData", external.into());
     put("feeds", json!([]));
-    put("mapLayers", json!([]));
+    let layers: Vec<Value> = state
+        .store
+        .map_layers_of(&m.guid)
+        .iter()
+        .map(map_layer_json)
+        .collect();
+    put("mapLayers", layers.into());
     if let Some(role) = m.default_role {
         put("defaultRole", role_json(role));
     }
@@ -832,6 +853,14 @@ fn change_json(state: &MissionsState, c: &ChangeRecord) -> Value {
             out.insert("contentResource".into(), resource);
         }
         None => {}
+    }
+    if let Some(uid) = &c.map_layer_uid {
+        // findMapLayer: the current layer, or one with just the uid.
+        let layer = match state.store.map_layer(uid) {
+            Some(l) => map_layer_json(&l),
+            None => Value::Object(map_layer_placeholder(uid).into_iter().collect()),
+        };
+        out.insert("mapLayer".into(), layer);
     }
     if let Some(ext) = &c.external_data {
         let record = state.store.external_data(&ext.uid);
@@ -1791,6 +1820,278 @@ async fn remove_content_by_guid(
     remove_content_impl(&state, &caller, mission, &Params::parse(query)?)
 }
 
+// --- mission map layers ------------------------------------------------------
+
+/// `MapLayer` bean properties and their JSON types.
+const MAP_LAYER_INTS: &[&str] = &["maxZoom", "minZoom", "opacity"];
+const MAP_LAYER_DOUBLES: &[&str] = &["east", "north", "south", "west"];
+const MAP_LAYER_STRINGS: &[&str] = &[
+    "additionalParameters",
+    "after",
+    "backgroundColor",
+    "coordinateSystem",
+    "creatorUid",
+    "description",
+    "layers",
+    "name",
+    "path",
+    "serverParts",
+    "tileType",
+    "tileUpdate",
+    "type",
+    "url",
+    "version",
+];
+const MAP_LAYER_BOOLS: &[&str] = &[
+    "defaultLayer",
+    "enabled",
+    "ignoreErrors",
+    "invertYCoordinate",
+];
+
+/// A `MapLayer` as Jackson binds the request body: unknown and `null`
+/// properties left out, `type` defaulting to `MapTile`, booleans `false`.
+fn map_layer_props(v: &Value) -> BTreeMap<String, Value> {
+    let mut props = BTreeMap::new();
+    props.insert("type".to_string(), Value::from("MapTile"));
+    for k in MAP_LAYER_BOOLS {
+        props.insert(
+            k.to_string(),
+            Value::Bool(v.get(*k).and_then(|b| b.as_bool()).unwrap_or(false)),
+        );
+    }
+    for (k, val) in v.as_object().into_iter().flatten() {
+        let k = k.as_str();
+        if val.is_null() {
+            if MAP_LAYER_STRINGS.contains(&k)
+                || MAP_LAYER_INTS.contains(&k)
+                || MAP_LAYER_DOUBLES.contains(&k)
+            {
+                props.remove(k);
+            }
+            continue;
+        }
+        if MAP_LAYER_STRINGS.contains(&k) {
+            let s = val
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| val.to_string());
+            props.insert(k.into(), Value::from(s));
+        } else if MAP_LAYER_INTS.contains(&k) {
+            if let Some(n) = val.as_i64().or_else(|| val.as_f64().map(|f| f as i64)) {
+                props.insert(k.into(), n.into());
+            }
+        } else if MAP_LAYER_DOUBLES.contains(&k) {
+            if let Some(f) = val.as_f64() {
+                props.insert(k.into(), json!(f));
+            }
+        }
+    }
+    props
+}
+
+/// JAXB's `java.util.Date`: `yyyy-MM-ddTHH:mm:ss[.SSS]Z`, no fraction at 0 ms.
+fn jaxb_date(ms: i64) -> String {
+    let full = pad_millis(ms);
+    if ms.rem_euclid(1000) == 0 {
+        format!("{}Z", &full[..19])
+    } else {
+        full
+    }
+}
+
+fn map_layer_json(l: &crate::missions::MapLayerRecord) -> Value {
+    let mut out: serde_json::Map<String, Value> = l.props.clone().into_iter().collect();
+    out.insert("uid".into(), l.uid.clone().into());
+    out.insert(
+        "createTime".into(),
+        cot_date_millis(l.create_time_ms).into(),
+    );
+    out.insert(
+        "modifiedTime".into(),
+        cot_date_millis(l.modified_time_ms).into(),
+    );
+    Value::Object(out)
+}
+
+/// `findMapLayer`'s placeholder: `new MapLayer()` with only the uid.
+fn map_layer_placeholder(uid: &str) -> BTreeMap<String, Value> {
+    let mut props = BTreeMap::new();
+    props.insert("uid".to_string(), Value::from(uid));
+    props.insert("type".to_string(), Value::from("MapTile"));
+    for k in MAP_LAYER_BOOLS {
+        props.insert(k.to_string(), Value::Bool(false));
+    }
+    props
+}
+
+/// `<mapLayer>` as JAXB writes a `MapLayer`: properties in name order.
+fn map_layer_xml(l: Option<&crate::missions::MapLayerRecord>, uid: &str) -> String {
+    let mut props: BTreeMap<String, String> = BTreeMap::new();
+    let text = |v: &Value| match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) if n.is_f64() => format!("{:?}", n.as_f64().unwrap_or(0.0)),
+        other => other.to_string(),
+    };
+    match l {
+        Some(l) => {
+            for (k, v) in &l.props {
+                props.insert(k.clone(), text(v));
+            }
+            props.insert("uid".into(), l.uid.clone());
+            props.insert("createTime".into(), jaxb_date(l.create_time_ms));
+            props.insert("modifiedTime".into(), jaxb_date(l.modified_time_ms));
+        }
+        None => {
+            for (k, v) in map_layer_placeholder(uid) {
+                props.insert(k, text(&v));
+            }
+        }
+    }
+    let inner: String = props
+        .iter()
+        .map(|(k, v)| format!("<{k}>{}</{k}>", super::mission_notify::escape(v)))
+        .collect();
+    format!("<mapLayer>{inner}</mapLayer>")
+}
+
+fn add_map_layer_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+    body: &Bytes,
+) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionWrite)?;
+    let creator = params
+        .get("creatorUid")
+        .ok_or_else(|| ApiError::BadRequest(String::new()))?
+        .to_string();
+    let v: Value = serde_json::from_slice(body).map_err(|_| ApiError::InvalidBody)?;
+    let props = map_layer_props(&v);
+    // name, type and url are NOT NULL: the save fails (TakException).
+    if ["name", "type", "url"]
+        .iter()
+        .any(|k| !props.contains_key(*k))
+    {
+        return Err(ApiError::Internal);
+    }
+    let now = now_ms();
+    let layer = crate::missions::MapLayerRecord {
+        uid: random_uuid().replace('-', ""),
+        mission_guid: mission.guid.clone(),
+        create_time_ms: now,
+        modified_time_ms: now,
+        props,
+    };
+    let change = state
+        .store
+        .add_map_layer(&mission.guid, layer.clone(), &creator)?;
+    let layer_xml = map_layer_xml(Some(&layer), &layer.uid);
+    let xml = state
+        .notifier
+        .change_xml_with(&change, None, Some(&layer_xml));
+    state
+        .notifier
+        .announce(&mission, ChangeKind::Content, &creator, Some(&xml));
+    ok("MapLayer", map_layer_json(&layer))
+}
+
+/// `MapLayerService.updateMapLayer`: creatorUid, name, description, type,
+/// url, defaultLayer and enabled; an unknown uid is a TakException (500).
+fn update_map_layer_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+    body: &Bytes,
+) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionWrite)?;
+    params
+        .get("creatorUid")
+        .ok_or_else(|| ApiError::BadRequest(String::new()))?;
+    let v: Value = serde_json::from_slice(body).map_err(|_| ApiError::InvalidBody)?;
+    let uid = v.get("uid").and_then(|u| u.as_str()).unwrap_or("");
+    let mut record = state.store.map_layer(uid).ok_or(ApiError::Internal)?;
+    let given = map_layer_props(&v);
+    for k in [
+        "creatorUid",
+        "name",
+        "description",
+        "type",
+        "url",
+        "defaultLayer",
+        "enabled",
+    ] {
+        match given.get(k) {
+            Some(val) => record.props.insert(k.into(), val.clone()),
+            None => record.props.remove(k),
+        };
+    }
+    if ["name", "type", "url"]
+        .iter()
+        .any(|k| !record.props.contains_key(*k))
+    {
+        return Err(ApiError::Internal);
+    }
+    record.modified_time_ms = now_ms();
+    state.store.update_map_layer(record.clone())?;
+    let current = state.store.map_layer(uid).unwrap_or(record);
+    ok("MapLayer", map_layer_json(&current))
+}
+
+async fn add_map_layer_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    add_map_layer_impl(&state, &caller, mission, &Params::parse(query)?, &body)
+}
+
+async fn add_map_layer_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    add_map_layer_impl(&state, &caller, mission, &Params::parse(query)?, &body)
+}
+
+async fn update_map_layer_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    update_map_layer_impl(&state, &caller, mission, &Params::parse(query)?, &body)
+}
+
+async fn update_map_layer_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    update_map_layer_impl(&state, &caller, mission, &Params::parse(query)?, &body)
+}
+
 // --- external mission data ---------------------------------------------------
 
 /// `ExternalMissionData` JSON (`@JsonInclude(NON_NULL)`).
@@ -1834,7 +2135,7 @@ fn announce_external(
         .external_data
         .as_ref()
         .map(|c| external_change_json(record, c));
-    let xml = state.notifier.change_xml_with(change, ext.as_ref());
+    let xml = state.notifier.change_xml_with(change, ext.as_ref(), None);
     state
         .notifier
         .announce(mission, ChangeKind::ExternalData, creator, Some(&xml));

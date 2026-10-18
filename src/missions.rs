@@ -225,6 +225,18 @@ pub struct ExternalDataRecord {
     pub mission_guid: String,
 }
 
+/// A mission map layer (`maplayer`). `props` holds the `MapLayer` bean
+/// properties by their names (strings, numbers, booleans), so JSON and the
+/// JAXB XML both come out in property order; times are kept apart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MapLayerRecord {
+    pub uid: String,
+    pub mission_guid: String,
+    pub create_time_ms: i64,
+    pub modified_time_ms: i64,
+    pub props: BTreeMap<String, serde_json::Value>,
+}
+
 /// What happens to an external data record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalDataAction {
@@ -258,6 +270,9 @@ pub struct ChangeRecord {
     pub server_time_ms: i64,
     #[serde(default)]
     pub external_data: Option<ExternalDataChange>,
+    /// `mission_change.map_layer_uid`.
+    #[serde(default)]
+    pub map_layer_uid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -397,6 +412,15 @@ impl Window {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Event {
+    /// `addMapLayerToMission` (with its ADD_CONTENT change) or
+    /// `updateMapLayer` (`change_id` none); `defaultLayer` clears the flag
+    /// on every other layer (`unsetDefault`).
+    MapLayerSaved {
+        guid: String,
+        layer: MapLayerRecord,
+        creator_uid: String,
+        change_id: Option<u64>,
+    },
     /// `setExternalMissionData`: the record (created or moved/updated) and
     /// its ADD_CONTENT change on `guid`.
     ExternalDataSet {
@@ -534,6 +558,7 @@ struct State {
     next_change_id: u64,
     next_mission_id: u64,
     external_data: BTreeMap<String, ExternalDataRecord>,
+    map_layers: BTreeMap<String, MapLayerRecord>,
 }
 
 fn apply(state: &mut State, event: &Event) {
@@ -559,10 +584,46 @@ fn apply(state: &mut State, event: &Event) {
             timestamp_ms: at_ms,
             server_time_ms: at_ms,
             external_data: Some(ext),
+            map_layer_uid: None,
         });
         state.next_change_id = state.next_change_id.max(change_id + 1);
     };
     match event.clone() {
+        Event::MapLayerSaved {
+            guid,
+            layer,
+            creator_uid,
+            change_id,
+        } => {
+            if layer.props.get("defaultLayer") == Some(&serde_json::Value::Bool(true)) {
+                for other in state.map_layers.values_mut() {
+                    other.props.insert("defaultLayer".into(), false.into());
+                }
+            }
+            let uid = layer.uid.clone();
+            let at_ms = layer.modified_time_ms;
+            state.map_layers.insert(uid.clone(), layer);
+            if let Some(change_id) = change_id {
+                let mission_name = state
+                    .missions
+                    .get(&guid)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_default();
+                state.changes.push(ChangeRecord {
+                    id: change_id,
+                    change_type: ChangeType::AddContent,
+                    mission_guid: guid,
+                    mission_name,
+                    content: None,
+                    creator_uid,
+                    timestamp_ms: at_ms,
+                    server_time_ms: at_ms,
+                    external_data: None,
+                    map_layer_uid: Some(uid),
+                });
+                state.next_change_id = state.next_change_id.max(change_id + 1);
+            }
+        }
         Event::ExternalDataSet {
             guid,
             record,
@@ -625,6 +686,7 @@ fn apply(state: &mut State, event: &Event) {
                 timestamp_ms: mission.create_time_ms,
                 server_time_ms: mission.create_time_ms,
                 external_data: None,
+                map_layer_uid: None,
             });
             state.next_change_id = state.next_change_id.max(change_id + 1);
             state.missions.insert(mission.guid.clone(), mission);
@@ -706,6 +768,7 @@ fn apply(state: &mut State, event: &Event) {
                     timestamp_ms: at_ms,
                     server_time_ms: at_ms,
                     external_data: None,
+                    map_layer_uid: None,
                 });
             }
             state.next_change_id = state.next_change_id.max(change_id + 1);
@@ -735,6 +798,7 @@ fn apply(state: &mut State, event: &Event) {
                     timestamp_ms: at_ms,
                     server_time_ms: at_ms,
                     external_data: None,
+                    map_layer_uid: None,
                 });
             }
             state.next_change_id = state.next_change_id.max(change_id + 1);
@@ -758,6 +822,7 @@ fn apply(state: &mut State, event: &Event) {
                     timestamp_ms: at_ms,
                     server_time_ms: at_ms,
                     external_data: None,
+                    map_layer_uid: None,
                 });
             }
             state.next_change_id = state.next_change_id.max(change_id + 1);
@@ -1271,6 +1336,12 @@ impl MissionStore {
                             lifecycle.push(change.clone());
                         }
                     }
+                    (_, None) if change.map_layer_uid.is_some() => {
+                        // MAP_LAYERS: every row, never squashed.
+                        if change.timestamp_ms >= mission.create_time_ms {
+                            lifecycle.push(change.clone());
+                        }
+                    }
                     (kind, None) if change.external_data.is_some() => {
                         if change.timestamp_ms < mission.create_time_ms {
                             continue;
@@ -1316,6 +1387,62 @@ impl MissionStore {
         };
         result.sort_by_key(|c| std::cmp::Reverse(c.id));
         Ok(result)
+    }
+
+    // --- mission map layers ------------------------------------------------
+
+    pub fn map_layer(&self, uid: &str) -> Option<MapLayerRecord> {
+        self.state.read().unwrap().map_layers.get(uid).cloned()
+    }
+
+    /// `Mission.mapLayers`, by uid.
+    pub fn map_layers_of(&self, guid: &str) -> Vec<MapLayerRecord> {
+        self.state
+            .read()
+            .unwrap()
+            .map_layers
+            .values()
+            .filter(|l| l.mission_guid == guid)
+            .cloned()
+            .collect()
+    }
+
+    /// `addMapLayerToMission`: the change it records.
+    pub fn add_map_layer(
+        &self,
+        guid: &str,
+        mut layer: MapLayerRecord,
+        creator_uid: &str,
+    ) -> Result<ChangeRecord, MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        layer.mission_guid = guid.to_string();
+        let change_id = state.next_change_id;
+        self.record(
+            &mut state,
+            Event::MapLayerSaved {
+                guid: guid.into(),
+                layer,
+                creator_uid: creator_uid.into(),
+                change_id: Some(change_id),
+            },
+        )?;
+        Ok(state.changes.last().cloned().expect("just recorded"))
+    }
+
+    /// `MapLayerService.updateMapLayer`: no change is recorded.
+    pub fn update_map_layer(&self, layer: MapLayerRecord) -> Result<(), MissionError> {
+        let mut state = self.state.write().unwrap();
+        let guid = layer.mission_guid.clone();
+        self.record(
+            &mut state,
+            Event::MapLayerSaved {
+                guid,
+                layer,
+                creator_uid: String::new(),
+                change_id: None,
+            },
+        )
     }
 
     // --- external mission data ---------------------------------------------

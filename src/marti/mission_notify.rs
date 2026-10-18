@@ -83,7 +83,7 @@ pub struct MissionNotifier {
     live: RwLock<HashMap<String, BTreeSet<String>>>,
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -281,7 +281,7 @@ impl MissionNotifier {
 
     /// One change as the official `commonUtil.toXml(new MissionChanges(change))`.
     pub fn change_xml(&self, change: &ChangeRecord) -> String {
-        self.change_xml_with(change, None)
+        self.change_xml_with(change, None, None)
     }
 
     /// [`Self::change_xml`] with the hydrated `externalData` (JAXB orders it
@@ -290,6 +290,7 @@ impl MissionNotifier {
         &self,
         change: &ChangeRecord,
         external: Option<&serde_json::Value>,
+        map_layer_xml: Option<&str>,
     ) -> String {
         let mut xml = String::from("<MissionChanges><MissionChange>");
         if let Some(Content::Hash(hash)) = &change.content {
@@ -328,6 +329,9 @@ impl MissionNotifier {
             xml.push_str("</externalData>");
         }
         xml.push_str("<isFederatedChange>false</isFederatedChange>");
+        if let Some(layer) = map_layer_xml {
+            xml.push_str(layer);
+        }
         xml.push_str(&format!(
             "<missionGuid>{}</missionGuid>",
             escape(&change.mission_guid)
