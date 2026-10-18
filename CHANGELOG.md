@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.2](https://github.com/microtak/microtak-server/compare/v0.11.1...v0.11.2) (2026-10-18)
+
+
+### Bug Fixes
+
+* **enrollment:** signClient/v2 XML response as the official server sends it ([30a310f](https://github.com/microtak/microtak-server/commit/30a310f2e1fbba91a0e6583fa0f4244cc667d256))
+
 ## [0.11.1](https://github.com/microtak/microtak-server/compare/v0.11.0...v0.11.1) (2026-10-18)
 
 
