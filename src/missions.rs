@@ -145,6 +145,10 @@ pub struct MissionFields {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MissionRecord {
+    /// The official `mission.id`: creation order (0 for missions stored
+    /// before it was recorded).
+    #[serde(default)]
+    pub id: u64,
     pub guid: String,
     pub name: String,
     pub fields: MissionFields,
@@ -475,12 +479,14 @@ struct State {
     /// mission guid → layers, in insertion order.
     layers: BTreeMap<String, Vec<LayerRecord>>,
     next_change_id: u64,
+    next_mission_id: u64,
 }
 
 fn apply(state: &mut State, event: &Event) {
     match event.clone() {
         Event::Created { mission, change_id } => {
             let mission = *mission;
+            state.next_mission_id = state.next_mission_id.max(mission.id + 1);
             state.changes.push(ChangeRecord {
                 id: change_id,
                 change_type: ChangeType::CreateMission,
@@ -829,6 +835,7 @@ impl MissionStore {
     pub fn create(&self, new: NewMission, now_ms: i64) -> Result<MissionRecord, MissionError> {
         let mut state = self.state.write().unwrap();
         let mission = MissionRecord {
+            id: state.next_mission_id.max(1),
             guid: new.guid,
             name: new.name.trim().to_string(),
             fields: new.fields,

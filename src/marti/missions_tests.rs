@@ -1942,3 +1942,146 @@ async fn mission_contacts_are_a_bare_list() {
     assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
     assert_eq!(list[0]["uid"], "ANDROID-9");
 }
+
+/// `getPagedMissions` (`getMissionsFiltered`): both flags default to true,
+/// no default tool, filters by tool, else name (`like %name%`), else
+/// content uid (an inner join: one row per matching uid); storage order
+/// unless `sort` names a column; Spring `PageRequest` paging.
+/// `countAllMissions`: no group check, tool ignored.
+#[tokio::test]
+async fn paged_missions_and_count() {
+    let h = harness();
+    h.create("Alpha", "jz", "").await;
+    h.create("bravo", "jz", "").await;
+    h.create("Locked", "jz", "&password=pw").await;
+    h.create("Invite", "jz", "&inviteOnly=true").await;
+    h.create("Tooled", "jz", "&tool=other").await;
+    h.create("Viewer", "jz", "&defaultRole=MISSION_READONLY_SUBSCRIBER")
+        .await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Alpha/contents",
+        "jz",
+        &[],
+        r#"{"uids":["pin-1","pin-2","other"]}"#,
+    )
+    .await;
+    h.state.groups.create("Red", None, 0).unwrap();
+    h.state
+        .groups
+        .set_member("Red", "red-1", Some(crate::groups::Membership::Both))
+        .unwrap();
+    h.call(
+        "PUT",
+        "/Marti/api/missions/RedOps?creatorUid=R&group=Red",
+        "red-1",
+        &[],
+        "",
+    )
+    .await;
+
+    let names = |reply: &Reply| -> Vec<String> {
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+        assert_eq!(reply.json()["type"], "Mission");
+        reply
+            .data()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let paged = |q: &'static str| {
+        let h = &h;
+        async move { h.get(&format!("/Marti/api/pagedmissions{q}"), "jz").await }
+    };
+    assert_eq!(
+        names(&paged("").await),
+        ["Alpha", "bravo", "Locked", "Tooled", "Viewer"]
+    );
+    assert_eq!(
+        names(&paged("?pagesize=2&page=1").await),
+        ["Locked", "Tooled"]
+    );
+    assert_eq!(
+        names(&paged("?passwordProtected=false&defaultRole=false").await),
+        ["Alpha", "bravo", "Tooled"]
+    );
+    assert_eq!(
+        names(&paged("?tool=other&nameFilter=Alpha").await),
+        ["Tooled"],
+        "tool wins"
+    );
+    assert_eq!(names(&paged("?nameFilter=ra").await), ["bravo"]);
+    assert_eq!(
+        names(&paged("?nameFilter=RA").await),
+        Vec::<String>::new(),
+        "LIKE is case-sensitive"
+    );
+    assert_eq!(
+        names(&paged("?uidFilter=pin").await),
+        ["Alpha", "Alpha"],
+        "one row per matching uid"
+    );
+    // `order by name` under the database's en_US.UTF-8 collation.
+    assert_eq!(
+        names(&paged("?sort=name").await),
+        ["Alpha", "bravo", "Locked", "Tooled", "Viewer"]
+    );
+    assert_eq!(
+        names(&paged("?sort=name&ascending=false").await),
+        ["Viewer", "Tooled", "Locked", "bravo", "Alpha"]
+    );
+    let locked = paged("?nameFilter=Locked").await.data()[0].clone();
+    assert!(
+        locked.get("uids").is_none_or(|u| u == &json!([])),
+        "password-protected missions are cleared"
+    );
+    assert_eq!(
+        paged("?sort=bogus").await.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "unknown column"
+    );
+    assert_eq!(
+        paged("?pagesize=0").await.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "offset / limit"
+    );
+    assert_eq!(
+        paged("?page=-1").await.status,
+        StatusCode::BAD_REQUEST,
+        "PageRequest"
+    );
+    assert_eq!(
+        h.get("/Marti/api/pagedmissions", "outsider")
+            .await
+            .data()
+            .as_array()
+            .unwrap()
+            .len(),
+        5,
+        "RedOps hidden"
+    );
+
+    let count = |q: &'static str| {
+        let h = &h;
+        async move {
+            let r = h
+                .get(&format!("/Marti/api/missioncount{q}"), "outsider")
+                .await;
+            assert_eq!(r.json()["type"], "Mission");
+            r.data().clone()
+        }
+    };
+    assert_eq!(
+        count("").await,
+        json!(6),
+        "no group check, invite-only excluded"
+    );
+    assert_eq!(count("?passwordProtected=false").await, json!(5));
+    assert_eq!(
+        count("?defaultRole=false&tool=nothing").await,
+        json!(5),
+        "tool is ignored"
+    );
+}

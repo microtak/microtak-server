@@ -352,7 +352,7 @@ fn expiration_string(expiration: Option<i64>) -> String {
 }
 
 /// SQL `LIKE` with `%` and `_`.
-fn like(value: &str, pattern: &str) -> bool {
+pub(crate) fn like(value: &str, pattern: &str) -> bool {
     fn go(v: &[char], p: &[char]) -> bool {
         match p.first() {
             None => v.is_empty(),

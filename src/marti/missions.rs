@@ -104,6 +104,8 @@ pub fn router_with(state: MissionsState) -> Router {
             "/Marti/api/missions",
             get(list_missions).delete(delete_mission_by_guid),
         )
+        .route("/Marti/api/pagedmissions", get(paged_missions))
+        .route("/Marti/api/missioncount", get(mission_count))
         .route(
             "/Marti/api/missions/all/subscriptions",
             get(all_subscriptions),
@@ -908,6 +910,144 @@ async fn list_missions(
         })
         .collect();
     ok("Mission", missions.into())
+}
+
+/// The `getAllMissions*` filters: no invite-only missions, password ones
+/// only if asked for, roles other than none/`MISSION_SUBSCRIBER` only if
+/// asked for (`default_role_id is null or default_role_id = 2`).
+fn listed(m: &MissionRecord, include_protected: bool, include_roles: bool) -> bool {
+    !m.invite_only
+        && (include_protected || !m.password_protected())
+        && (include_roles || matches!(m.default_role, None | Some(Role::Subscriber)))
+}
+
+/// Text order under PostgreSQL's `en_US.UTF-8` collation, approximated:
+/// case-insensitive first, lowercase before uppercase on a tie.
+fn collate(a: &str, b: &str) -> std::cmp::Ordering {
+    a.to_lowercase()
+        .cmp(&b.to_lowercase())
+        .then_with(|| b.cmp(a))
+}
+
+/// `order by <column>` over the `missionAttributes` columns; `None` for a
+/// column that doesn't exist (an SQL error on the official server).
+fn column_order(column: &str) -> Option<fn(&MissionRecord, &MissionRecord) -> std::cmp::Ordering> {
+    Some(match column {
+        "id" => |a, b| a.id.cmp(&b.id),
+        "name" => |a, b| collate(&a.name, &b.name),
+        "create_time" => |a, b| a.create_time_ms.cmp(&b.create_time_ms),
+        "last_edited" => |a, b| a.last_edited_ms.cmp(&b.last_edited_ms),
+        "creatoruid" => |a, b| collate(&a.creator_uid, &b.creator_uid),
+        "description" => |a, b| collate(&a.fields.description, &b.fields.description),
+        "chatroom" => |a, b| collate(&a.fields.chat_room, &b.fields.chat_room),
+        "tool" => |a, b| collate(&a.tool, &b.tool),
+        "expiration" => |a, b| a.fields.expiration.cmp(&b.fields.expiration),
+        "guid" => |a, b| a.guid.cmp(&b.guid),
+        "invite_only" => |a, b| a.invite_only.cmp(&b.invite_only),
+        _ => return None,
+    })
+}
+
+/// `getPagedMissions` / `getMissionsFiltered`.
+async fn paged_missions(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let params = Params::parse(query)?;
+    let include_protected = params.bool("passwordProtected", true)?;
+    let include_roles = params.bool("defaultRole", true)?;
+    let int = |name: &str, default: i64| -> Result<i64, ApiError> {
+        match params.get(name) {
+            None => Ok(default),
+            Some(v) => v
+                .trim()
+                .parse::<i32>()
+                .map(i64::from)
+                .map_err(|_| ApiError::BadRequest(String::new())),
+        }
+    };
+    let (page, limit) = (int("page", 0)?, int("pagesize", 10)?);
+    let sort = params.string("sort");
+    let ascending = params.bool("ascending", true)?;
+    let (name_filter, uid_filter) = (params.string("nameFilter"), params.string("uidFilter"));
+    let tool = params.get("tool").map(str::to_string);
+    // `int page = offset / limit`, then `PageRequest.of(page, limit)`.
+    if limit == 0 {
+        return Err(ApiError::Internal);
+    }
+    if page < 0 || limit < 1 {
+        return Err(ApiError::BadRequest(String::new()));
+    }
+    let order = if sort.is_empty() {
+        None
+    } else {
+        Some(column_order(&sort).ok_or(ApiError::Internal)?)
+    };
+    let mut missions: Vec<MissionRecord> = state
+        .store
+        .list()
+        .into_iter()
+        .filter(|m| listed(m, include_protected, include_roles) && visible(&caller, m))
+        .collect();
+    // No ORDER BY: storage order.
+    missions.sort_by_key(|m| (m.id, m.create_time_ms));
+    let uid_rows = tool.is_none() && name_filter.trim().is_empty() && !uid_filter.trim().is_empty();
+    if let Some(tool) = &tool {
+        missions.retain(|m| &m.tool == tool);
+    } else if !name_filter.trim().is_empty() {
+        let pattern = format!("%{name_filter}%");
+        missions.retain(|m| super::file_manager::like(&m.name, &pattern));
+    } else if uid_rows {
+        // An inner join on mission_uid: a row per matching uid.
+        let pattern = format!("%{uid_filter}%");
+        missions = missions
+            .into_iter()
+            .flat_map(|m| {
+                let n = m.uids().filter(|c| matches!(&c.content, Content::Uid(u) if super::file_manager::like(u, &pattern))).count();
+                std::iter::repeat_n(m, n)
+            })
+            .collect();
+    }
+    if let Some(order) = order {
+        missions.sort_by(order);
+        if !ascending {
+            missions.reverse();
+        }
+    }
+    let offset = (page * limit) as usize;
+    let details = uid_rows && !sort.is_empty();
+    let out: Vec<Value> = missions
+        .iter()
+        .skip(offset)
+        .take(limit as usize)
+        .map(|m| {
+            let extras = MissionExtras {
+                cleared: m.password_protected(),
+                details: details && !m.password_protected(),
+                ..Default::default()
+            };
+            mission_json(&state, m, &groups_seen(&caller, m), extras)
+        })
+        .collect();
+    ok("Mission", out.into())
+}
+
+/// `countAllMissions`: the list filters only -- no group check, `tool`
+/// ignored.
+async fn mission_count(State(state): State<MissionsState>, RawQuery(query): RawQuery) -> ApiResult {
+    let params = Params::parse(query)?;
+    let include_protected = params.bool("passwordProtected", true)?;
+    let include_roles = params.bool("defaultRole", true)?;
+    let n = state
+        .store
+        .list()
+        .iter()
+        .filter(|m| listed(m, include_protected, include_roles))
+        .count();
+    ok("Mission", json!(n))
 }
 
 async fn get_mission_impl(
