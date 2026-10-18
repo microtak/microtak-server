@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/microtak/microtak-server/compare/v0.13.0...v0.14.0) (2026-10-18)
+
+
+### Features
+
+* **profiles:** device profiles as the official ProfileAPI ([1d45be6](https://github.com/microtak/microtak-server/commit/1d45be62ab6bf8ac794e77e3f2e80f78083d542a))
+
 ## [0.13.0](https://github.com/microtak/microtak-server/compare/v0.12.0...v0.13.0) (2026-10-18)
 
 
