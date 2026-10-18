@@ -2503,3 +2503,184 @@ async fn mission_map_layers() {
         "name and url are NOT NULL"
     );
 }
+
+/// `copyMission` + `copyMissionContainers`: a new mission with the
+/// original's groups and fields (not its password or default role), the
+/// creator as owner, keywords copied silently, map layers re-created,
+/// external data re-posted under the same id (so it moves), contents and
+/// uids re-added, each log entry also filed under the copy.
+#[tokio::test]
+async fn copy_mission() {
+    let (h, mut rx) = harness_with_hub();
+    h.create(
+        "Ops",
+        "jz",
+        "&description=night&defaultRole=MISSION_SUBSCRIBER&password=pw",
+    )
+    .await;
+    let ops = h
+        .get("/Marti/api/missions/Ops?password=pw", "jz")
+        .await
+        .data()[0]
+        .clone();
+    let owner = h.state.store.by_name("Ops", |_| true).unwrap();
+    let _ = (&ops, &owner);
+    let auth = {
+        let (_, token) = (
+            0,
+            h.state
+                .store
+                .subscriptions(&owner.guid)
+                .into_iter()
+                .next()
+                .unwrap()
+                .token,
+        );
+        bearer(&token)
+    };
+    let hdr = [("MissionAuthorization", auth.as_str())];
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/keywords?creatorUid=ANDROID-jz",
+        "jz",
+        &hdr,
+        r#"["k1"]"#,
+    )
+    .await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/contents?creatorUid=ANDROID-jz",
+        "jz",
+        &hdr,
+        r#"{"uids":["u-1"]}"#,
+    )
+    .await;
+    let layer = h
+        .call(
+            "POST",
+            "/Marti/api/missions/Ops/maplayers?creatorUid=ANDROID-jz",
+            "jz",
+            &hdr,
+            r#"{"name":"OSM","url":"https://t","creatorUid":"ANDROID-jz"}"#,
+        )
+        .await
+        .data()["uid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    h.call(
+        "POST",
+        "/Marti/api/missions/Ops/externaldata?creatorUid=ANDROID-jz",
+        "jz",
+        &hdr,
+        r#"{"uid":"ext-1","name":"F","tool":"public","urlData":"d","urlView":"v","notes":"n"}"#,
+    )
+    .await;
+    h.call(
+        "POST",
+        "/Marti/api/missions/logs/entries",
+        "jz",
+        &hdr,
+        r#"{"content":"log","creatorUid":"ANDROID-jz","missionNames":["Ops"]}"#,
+    )
+    .await;
+    drain(&mut rx);
+
+    let missing = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/copy?creatorUid=ANDROID-c",
+            "jz",
+            &hdr,
+            "",
+        )
+        .await;
+    assert_eq!(missing.status, StatusCode::BAD_REQUEST);
+    let reply = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/copy?creatorUid=ANDROID-c&copyName=Ops2&copyPath=/p",
+            "jz",
+            &hdr,
+            "",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.text());
+    assert_eq!(reply.json()["type"], "Mission");
+    let copy = reply.data()[0].clone();
+    assert_eq!(
+        (
+            copy["name"].as_str(),
+            copy["description"].as_str(),
+            copy["path"].as_str(),
+            copy["creatorUid"].as_str()
+        ),
+        (Some("Ops2"), Some("night"), Some("/p"), Some("ANDROID-c"))
+    );
+    assert!(copy["token"].as_str().is_some_and(|t| !t.is_empty()));
+    assert_eq!(copy["ownerRole"]["type"], "MISSION_OWNER");
+    assert!(copy.get("defaultRole").is_none(), "not copied");
+    assert_eq!(copy["passwordProtected"], false, "not copied");
+    assert_eq!(
+        (copy["uids"].clone(), copy["keywords"].clone()),
+        (json!([]), json!([])),
+        "the response is the mission as created"
+    );
+    let layers = copy["mapLayers"].as_array().unwrap();
+    assert_eq!(layers.len(), 1);
+    assert_ne!(layers[0]["uid"], layer.as_str(), "a new layer");
+    assert_eq!(layers[0]["creatorUid"], "ANDROID-c");
+    assert_eq!(copy["externalData"][0]["uid"], "ext-1");
+
+    let stored = h.get("/Marti/api/missions/Ops2", "jz").await.data()[0].clone();
+    assert_eq!(stored["keywords"], json!(["k1"]));
+    assert_eq!(stored["uids"][0]["data"], "u-1");
+    let ops_now = h
+        .get("/Marti/api/missions/Ops?password=pw", "jz")
+        .await
+        .data()[0]
+        .clone();
+    assert_eq!(
+        ops_now["externalData"],
+        json!([]),
+        "the external data moved to the copy"
+    );
+    assert_eq!(
+        ops_now["mapLayers"].as_array().unwrap().len(),
+        1,
+        "the original keeps its layer"
+    );
+    let logs = h
+        .get("/Marti/api/missions/Ops2/log", "jz")
+        .await
+        .data()
+        .clone();
+    assert_eq!(logs[0]["content"], "log");
+    assert_eq!(logs[0]["missionNames"], json!(["Ops", "Ops2"]));
+
+    let types: Vec<String> = drain(&mut rx).iter().map(|m| cot_type(&m.xml)).collect();
+    assert_eq!(
+        types.first().map(String::as_str),
+        Some("t-x-m-n"),
+        "{types:?}"
+    );
+    assert!(
+        types.contains(&"t-x-m-c-e".to_string()) && types.contains(&"t-x-m-c-l".to_string()),
+        "{types:?}"
+    );
+
+    let again = h
+        .call(
+            "PUT",
+            "/Marti/api/missions/Ops/copy?creatorUid=ANDROID-c&copyName=%20Ops2%20",
+            "jz",
+            &hdr,
+            "",
+        )
+        .await;
+    assert_eq!(again.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        again.json()["message"],
+        "Invalid Request: mission named Ops2 already exists"
+    );
+}

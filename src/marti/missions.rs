@@ -105,6 +105,7 @@ pub fn router_with(state: MissionsState) -> Router {
             get(list_missions).delete(delete_mission_by_guid),
         )
         .route("/Marti/api/pagedmissions", get(paged_missions))
+        .route("/Marti/api/missions/:name/copy", put(copy_mission))
         .route(
             "/Marti/api/missions/:name/maplayers",
             post(add_map_layer_by_name).put(update_map_layer_by_name),
@@ -1820,6 +1821,123 @@ async fn remove_content_by_guid(
     remove_content_impl(&state, &caller, mission, &Params::parse(query)?)
 }
 
+// --- mission copy ------------------------------------------------------------
+
+/// `copyMission` + `copyMissionContainers`.
+async fn copy_mission(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    require(role_for(&state, &mission, &caller), Permission::MissionRead)?;
+    let params = Params::parse(query)?;
+    let creator = params
+        .get("creatorUid")
+        .ok_or_else(|| ApiError::BadRequest(String::new()))?
+        .to_string();
+    let copy_name = params
+        .get("copyName")
+        .ok_or_else(|| ApiError::BadRequest(String::new()))?
+        .trim()
+        .to_string();
+    if copy_name.is_empty() {
+        return Err(ApiError::BadRequest(
+            "empty 'copyName' request parameter".into(),
+        ));
+    }
+    // `getMission(copy, false)`: any mission of that name, whatever its groups.
+    if state.store.by_name(&copy_name, |_| true).is_some() {
+        return Err(ApiError::BadRequest(format!(
+            "mission named {copy_name} already exists"
+        )));
+    }
+    let default_role = params.role("defaultRole")?;
+    let password_hash = match params.get("password").filter(|p| !p.is_empty()) {
+        Some(p) => Some(hash_password(p)?),
+        None => None,
+    };
+    let mut fields = mission.fields.clone();
+    if let Some(path) = params.get("copyPath") {
+        fields.path = path.to_string();
+    }
+    let now = now_ms();
+    let copy = state.store.create(
+        NewMission {
+            guid: random_uuid(),
+            name: copy_name,
+            fields,
+            tool: mission.tool.clone(),
+            creator_uid: creator.clone(),
+            groups: mission.groups.clone(),
+            password_hash,
+            default_role,
+            invite_only: mission.invite_only,
+        },
+        now,
+    )?;
+    // createMission broadcasts the new mission.
+    state
+        .notifier
+        .broadcast(&copy, Announcement::Create, &creator);
+    let tokens = Arc::clone(&state.tokens);
+    let (cname, cguid) = (copy.name.clone(), copy.guid.clone());
+    let owner = state.store.subscribe(
+        &copy.guid,
+        &creator,
+        &caller.username,
+        Role::Owner,
+        now,
+        |id| tokens.create(id, TokenType::Subscription, &cname, &cguid, now / 1000),
+    )?;
+    state.notifier.connect(&copy.guid, &creator);
+
+    // copyMissionContainers, in its order.
+    state
+        .store
+        .set_keywords(&copy.guid, mission.keywords.clone(), now)?;
+    for layer in state.store.map_layers_of(&mission.guid) {
+        let mut props = layer.props.clone();
+        props.insert("creatorUid".into(), creator.clone().into());
+        save_new_map_layer(&state, &copy, props, &creator)?;
+    }
+    for ext in state.store.external_data_of(&mission.guid) {
+        save_external(&state, &copy, ext, &creator)?;
+    }
+    let contents: Vec<Content> = mission
+        .hashes()
+        .chain(mission.uids())
+        .map(|c| c.content.clone())
+        .collect();
+    for content in contents {
+        state
+            .store
+            .add_content(&copy.guid, content, &creator, now_ms())?;
+        announce_latest_changes(&state, &copy, 1, &creator)?;
+    }
+    for mut entry in state.store.log_entries_for(&mission.name, Window::ALL) {
+        entry.mission_names.push(copy.name.clone());
+        let at = now_ms();
+        entry.server_time_ms = at;
+        entry.created_ms = Some(at);
+        let saved = state.store.save_log_entry(entry)?;
+        announce_log(&state, &caller, &saved);
+    }
+
+    // The response is the mission as createMission returned it, with the
+    // map layers and external data copyMissionContainers added to it.
+    let extras = MissionExtras {
+        token: Some(owner.token),
+        owner_role: Some(Role::Owner),
+        ..Default::default()
+    };
+    let json = mission_json(&state, &copy, &groups_seen(&caller, &copy), extras);
+    created("Mission", json!([json]))
+}
+
 // --- mission map layers ------------------------------------------------------
 
 /// `MapLayer` bean properties and their JSON types.
@@ -1976,6 +2094,18 @@ fn add_map_layer_impl(
     {
         return Err(ApiError::Internal);
     }
+    let layer = save_new_map_layer(state, &mission, props, &creator)?;
+    ok("MapLayer", map_layer_json(&layer))
+}
+
+/// `addMapLayerToMission`: `createMapLayer` (new uid and times), the
+/// ADD_CONTENT change and its `t-x-m-c`.
+fn save_new_map_layer(
+    state: &MissionsState,
+    mission: &MissionRecord,
+    props: BTreeMap<String, Value>,
+    creator: &str,
+) -> Result<crate::missions::MapLayerRecord, ApiError> {
     let now = now_ms();
     let layer = crate::missions::MapLayerRecord {
         uid: random_uuid().replace('-', ""),
@@ -1986,15 +2116,15 @@ fn add_map_layer_impl(
     };
     let change = state
         .store
-        .add_map_layer(&mission.guid, layer.clone(), &creator)?;
+        .add_map_layer(&mission.guid, layer.clone(), creator)?;
     let layer_xml = map_layer_xml(Some(&layer), &layer.uid);
     let xml = state
         .notifier
         .change_xml_with(&change, None, Some(&layer_xml));
     state
         .notifier
-        .announce(&mission, ChangeKind::Content, &creator, Some(&xml));
-    ok("MapLayer", map_layer_json(&layer))
+        .announce(mission, ChangeKind::Content, creator, Some(&xml));
+    Ok(layer)
 }
 
 /// `MapLayerService.updateMapLayer`: creatorUid, name, description, type,
@@ -2124,6 +2254,21 @@ fn external_change_json(
     Value::Object(out)
 }
 
+/// `setExternalMissionData`: create or move the record, its change, the
+/// `t-x-m-c-e`.
+fn save_external(
+    state: &MissionsState,
+    mission: &MissionRecord,
+    record: crate::missions::ExternalDataRecord,
+    creator: &str,
+) -> Result<(), ApiError> {
+    let change = state
+        .store
+        .set_external_data(&mission.guid, record.clone(), creator, now_ms())?;
+    announce_external(state, mission, &change, Some(&record), creator);
+    Ok(())
+}
+
 fn announce_external(
     state: &MissionsState,
     mission: &MissionRecord,
@@ -2169,11 +2314,7 @@ fn set_external_impl(
         notes: s("notes"),
         mission_guid: mission.guid.clone(),
     };
-    let change =
-        state
-            .store
-            .set_external_data(&mission.guid, record.clone(), &creator, now_ms())?;
-    announce_external(state, &mission, &change, Some(&record), &creator);
+    save_external(state, &mission, record.clone(), &creator)?;
     let mut response = ok(
         "com.bbn.marti.sync.model.ExternalMissionData",
         external_json(&record),
