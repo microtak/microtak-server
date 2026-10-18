@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.0](https://github.com/microtak/microtak-server/compare/v0.11.4...v0.12.0) (2026-10-18)
+
+
+### Features
+
+* **streaming:** latest SA of reachable clients on connect ([c7406e8](https://github.com/microtak/microtak-server/commit/c7406e8eed094e08da284a9ea02aee8699b7c93a))
+* **streaming:** latest SA on plain TCP too ([e47a732](https://github.com/microtak/microtak-server/commit/e47a732fc0cda255f63ae377e739d9df60c6c74b))
+
 ## [0.11.4](https://github.com/microtak/microtak-server/compare/v0.11.3...v0.11.4) (2026-10-18)
 
 
