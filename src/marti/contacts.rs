@@ -33,6 +33,7 @@ pub struct ContactsState {
 pub fn router(state: ContactsState) -> Router {
     Router::new()
         .route("/Marti/api/contacts/all", get(list_contacts))
+        .route("/Marti/api/cot/xml/:uid", get(cot_xml))
         .with_state(state)
 }
 
@@ -139,6 +140,31 @@ pub fn reachable(
         .collect()
 }
 
+/// `CotApi.getCotEvent`: the latest event for `uid`, `<marti>` removed, as
+/// `XML_HEADER` + event -- the bytes a TAK Protocol file transfer hashes.
+async fn cot_xml(
+    State(state): State<ContactsState>,
+    axum::extract::Path(uid): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match state.latest_cot.get(&uid) {
+        Some(event) => {
+            let xml = crate::cot::strip_marti(&event.xml);
+            let body = format!(
+                "{}{}",
+                crate::transport::takproto::XML_HEADER,
+                crate::transport::takproto::event_body(&xml)
+            );
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                body,
+            )
+                .into_response()
+        }
+        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn list_contacts(
     State(state): State<ContactsState>,
     Extension(identity): Extension<PeerIdentity>,
@@ -223,6 +249,42 @@ mod tests {
         assert_eq!(
             list[2]["uid"], "",
             "listed before its first report, without a uid"
+        );
+    }
+
+    /// `CotApi.getCotEvent`: the latest event for a uid as XML (what a TAK
+    /// Protocol file transfer for a large message points at), `<marti>`
+    /// removed; 404 with an empty body for an unknown uid.
+    #[tokio::test]
+    async fn latest_cot_by_uid() {
+        let s = state();
+        s.latest_cot.record("big-1", r#"<?xml version="1.0"?><event version="2.0" uid="big-1" type="u-d-f" how="h-e" time="t" start="t" stale="t"><point lat="0" lon="0" hae="0" ce="0" le="0"/><detail><marti><dest callsign="X"/></marti><remarks>r</remarks></detail></event>"#, 1);
+        let get = |uri: &str| {
+            let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            request.extensions_mut().insert(PeerIdentity("me".into()));
+            router(s.clone()).oneshot(request)
+        };
+        let response = get("/Marti/api/cot/xml/big-1").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/xml");
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            body,
+            r#"<?xml version='1.0' encoding='UTF-8' standalone='yes'?><event version="2.0" uid="big-1" type="u-d-f" how="h-e" time="t" start="t" stale="t"><point lat="0" lon="0" hae="0" ce="0" le="0"/><detail><remarks>r</remarks></detail></event>"#
+        );
+        let missing = get("/Marti/api/cot/xml/nope").await.unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert!(
+            axum::body::to_bytes(missing.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
