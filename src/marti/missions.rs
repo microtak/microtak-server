@@ -1877,14 +1877,14 @@ fn map_layer_props(v: &Value) -> BTreeMap<String, Value> {
                 .map(String::from)
                 .unwrap_or_else(|| val.to_string());
             props.insert(k.into(), Value::from(s));
-        } else if MAP_LAYER_INTS.contains(&k) {
-            if let Some(n) = val.as_i64().or_else(|| val.as_f64().map(|f| f as i64)) {
-                props.insert(k.into(), n.into());
-            }
-        } else if MAP_LAYER_DOUBLES.contains(&k) {
-            if let Some(f) = val.as_f64() {
-                props.insert(k.into(), json!(f));
-            }
+        } else if MAP_LAYER_INTS.contains(&k)
+            && let Some(n) = val.as_i64().or_else(|| val.as_f64().map(|f| f as i64))
+        {
+            props.insert(k.into(), n.into());
+        } else if MAP_LAYER_DOUBLES.contains(&k)
+            && let Some(f) = val.as_f64()
+        {
+            props.insert(k.into(), json!(f));
         }
     }
     props
