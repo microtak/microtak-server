@@ -60,6 +60,10 @@ pub struct AppConfig {
     pub plain_tcp_enabled: bool,
     /// Where the mTLS CoT relay listens.
     pub mtls_addr: SocketAddr,
+    /// The official `validateClientUid` check: a device's SA must carry
+    /// the `clientUid` its certificate was enrolled for, or the connection
+    /// ends. **On by default** (officially off).
+    pub validate_client_uid: bool,
     /// Common Name for a freshly-generated CA (ignored if a CA already
     /// exists in `data_dir`).
     pub ca_common_name: String,
@@ -187,6 +191,7 @@ impl Default for AppConfig {
             plain_tcp_addr: "0.0.0.0:8087".parse().unwrap(),
             plain_tcp_enabled: false,
             mtls_addr: "0.0.0.0:8089".parse().unwrap(),
+            validate_client_uid: true,
             ca_common_name: "MicroTAK CA".to_string(),
             server_common_name: "microtak-server".to_string(),
             server_names: Vec::new(),
@@ -544,6 +549,7 @@ impl App {
         .with_missions(mission_notifier)
         // `<buffer><latestSA enable="true"/>`, the official default.
         .with_latest_sa()
+        .with_validate_client_uid(config.validate_client_uid)
         // The official default input (`protocol="tls"`) negotiates TAK
         // Protocol.
         .with_tak_protocol(crate::transport::tls::TakProtocol {

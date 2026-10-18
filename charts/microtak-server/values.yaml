@@ -80,6 +80,9 @@ config:
   enrollmentMode: "auto"
   # Largest Data Sync upload (photos, data packages), in MB.
   maxUploadMb: 100
+  # A device's SA must carry the clientUid its certificate was enrolled
+  # for (the official validateClientUid; officially off).
+  validateClientUid: true
   limits:
     maxConnections: 1024
     maxConnectionsPerIp: 64

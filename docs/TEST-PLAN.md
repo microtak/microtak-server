@@ -59,7 +59,7 @@ The single most important interoperability risk identified during research.
 | TC-TLS-01 | Accept a valid client cert signed by MicroTAK's own CA over the mTLS CoT port | [COMPAT] |
 | TC-TLS-02 | Reject a client cert not signed by MicroTAK's CA (untrusted issuer) at the TLS layer | [COMPAT] |
 | TC-TLS-03 | Reject a client with no cert at all when client-cert-required mode is on; decide deliberately whether MicroTAK offers an unauthenticated mode at all | [DESIGN] |
-| TC-TLS-04 | **Bind CoT-level session identity to the authenticated cert's CN.** Reject (or clearly flag) a self-identifying CoT atom whose claimed `uid`/callsign is inconsistent with the connecting cert's identity. This is a deliberate divergence from at least one reference implementation, which has no such binding by its own documented admission and allows uid/callsign spoofing and silent mid-session re-identification. | [HARDEN] |
+| TC-TLS-04 | **The official `validateClientUid` check** (revised 2026-10-18): a device's SA must carry the `clientUid` its certificate was enrolled for, else the connection ends; a certificate enrolled without one has its SAs dropped; one not on record passes. Per certificate, so a re-enrolled phone just works. On by default (`validate_client_uid`; officially off). | [COMPAT] |
 | TC-TLS-05 | A revoked certificate is rejected. Decide and test explicitly **when**: at TLS handshake time vs. app-level check after handshake vs. continuous re-checking of already-open sessions | [DESIGN] |
 | TC-TLS-06 | Certificate enrollment issues certs usable immediately over the mTLS CoT port with no server restart/reload required | [COMPAT] |
 | TC-TLS-07 | Client cert bundle format (PKCS12) is importable by a real ATAK/WinTAK client, not just OpenSSL-verifiable — test against a live client, not just cryptographic correctness (real ATAK-specific import failures have been reported against at least one reference implementation's bundles, root cause unconfirmed) | [COMPAT] |
@@ -168,7 +168,7 @@ If MicroTAK ever implements Socket.IO/WebSocket-compatible live updates for brow
 
 ## 12. Device Registry (new module, not part of the original catalog)
 
-Added alongside the enrollment endpoint (§4) — tracks enrolled devices by certificate Common Name, implements TC-TLS-04's binding policy, and tracks revocation. Not part of the original research-derived catalog above (there's no external reference implementation to compare against here — this is MicroTAK's own design), so tracked with plain descriptions rather than TC-IDs.
+Added alongside the enrollment endpoint (§4) — tracks enrolled devices by certificate Common Name, records each certificate's enrolled `clientUid` (what TC-TLS-04 checks against), and tracks revocation. Not part of the original research-derived catalog above (there's no external reference implementation to compare against here — this is MicroTAK's own design), so tracked with plain descriptions rather than TC-IDs.
 
 **Implemented** (`src/registry.rs`), each with a passing unit test: enroll and find a device; re-enrollment (cert rotation) preserves an existing `uid` binding; re-enrollment preserves an existing revocation (does **not** silently un-revoke — a real bug caught by the mTLS integration tests during development, see TC-TLS-05 above); bind a `uid` on first use; idempotent re-assertion of an already-owned `uid`; reject binding a `uid` already owned by a different device; reject a device rebinding to a *different* `uid` than the one it already owns; revoke a device; revoking an unknown device errors; the registry persists across a reload from its JSON file; loading a nonexistent path starts empty rather than erroring.
 
@@ -293,9 +293,9 @@ See `docs/ARCHITECTURE.md` "Device identity vs. authored content". Samples are s
 
 | ID | Case | Type | Test |
 |---|---|---|---|
-| TC-TLS-04 (revised) | Only a device's own SA report (uid + contact callsign + endpoint) binds/must match its uid; content sent before the first SA binds nothing | [COMPAT] | `identity::*`, `cot::only_a_devices_own_report_counts_as_situational_awareness`, `e2e_rejects_cross_device_uid_spoofing_after_http_enrollment` |
-| TC-TLS-04b | A device's own chat and markers are relayed and it stays connected | [COMPAT] | `identity::a_devices_own_chat_and_markers_are_relayed`, `e2e_a_devices_chat_and_markers_are_relayed_intact` |
-| TC-TLS-04c | Content reusing another device's bound uid, or naming it as producer (`link relation="p-p"`), is dropped; the sender stays connected | [HARDEN] | `identity::content_*`, `e2e_content_impersonating_another_device_is_dropped` |
+| TC-TLS-04 (revised 2026-10-18) | Only a device's own SA report (uid + contact callsign + endpoint) is checked, against its certificate's enrolled `clientUid` (official `validateClientUid`) | [COMPAT] | `identity::*`, `cot::only_a_devices_own_report_counts_as_situational_awareness`, `tls::validate_client_uid_checks_each_sa_against_its_certificate`, `e2e_validate_client_uid_checks_sas_against_the_enrollment` |
+| TC-TLS-04b | A device's own chat and markers are relayed and it stays connected | [COMPAT] | `identity::content_is_not_checked`, `identity::a_devices_own_content_and_unknown_uids_are_relayed`, `e2e_a_devices_chat_and_markers_are_relayed_intact` |
+| TC-TLS-04c | Content reusing the uid another device's certificate was enrolled for, or naming it as producer (`link relation="p-p"`), is dropped; the sender stays connected | [HARDEN] | `identity::content_claiming_another_devices_enrolled_uid_is_dropped`, `registry::other_owner_of_enrolled_uid_skips_mine_and_blocked_identities`, `e2e_content_impersonating_another_device_is_dropped` |
 | TC-COT-10 | Relayed events arrive byte for byte as sent (unmodelled detail elements survive; XML declaration stripped) | [COMPAT] | `codec::decoded_events_carry_their_exact_original_xml`, `e2e_a_devices_chat_and_markers_are_relayed_intact` |
 | TC-CHAT-06 | `b-t-f` is chat; "All Chat Rooms" messages are broadcast; interleaved `<link>`s parse | [COMPAT] | `cot::*` |
 

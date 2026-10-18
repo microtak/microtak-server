@@ -21,6 +21,7 @@ data:
     admin_common_name = {{ .Values.config.adminCommonName | quote }}
     enrollment_mode = {{ .Values.config.enrollmentMode | quote }}
     max_upload_mb = {{ .Values.config.maxUploadMb }}
+    validate_client_uid = {{ .Values.config.validateClientUid }}
     max_connections = {{ .Values.config.limits.maxConnections }}
     max_connections_per_ip = {{ .Values.config.limits.maxConnectionsPerIp }}
     handshake_timeout_seconds = {{ .Values.config.limits.handshakeTimeoutSeconds }}

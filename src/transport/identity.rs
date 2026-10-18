@@ -1,30 +1,27 @@
-//! What an authenticated (mTLS) connection may say, and as whom
-//! (TC-TLS-04, revised 2026-09-29).
+//! The official `validateClientUid` check (`clientUidMatchesCert`): a
+//! device's own situational-awareness report must carry the `clientUid`
+//! its certificate was enrolled for.
 //!
-//! A device's identity is its **own situational-awareness report** -- its
-//! position/"PLI", recognised the way the official TAK Server does
-//! ([`Event::is_situational_awareness`]: a `uid` plus a `<contact>` with a
-//! `callsign` *and* an `endpoint`). Only those reports bind and must match
-//! the device's uid; the first one binds it (trust on first use), and a
-//! later one claiming a different uid ends the connection -- the same check
-//! as the official server's optional `validateClientUid`.
+//! Only SA messages are checked ([`Event::is_situational_awareness`]: a
+//! `uid` plus a `<contact>` with a `callsign` *and* an `endpoint`) --
+//! GeoChat, markers, shapes and routes carry their own uids. Officially:
+//! - a certificate not on record passes,
+//! - an SA with another uid than the certificate's ends the connection
+//!   (`deleteSubscriptionssByCertificate`),
+//! - a certificate enrolled without a `clientUid` can't match (the official
+//!   comparison throws), so its SAs are dropped.
 //!
-//! Everything else a device sends is content it *authored* -- GeoChat
-//! messages (`b-t-f`, uid `GeoChat.<sender>.<room>.<id>`), markers, shapes,
-//! routes, each with its own uid -- and is allowed, except that nothing may
-//! impersonate another enrolled device:
-//! - an event whose uid is another device's bound uid is dropped (it would
-//!   overwrite that device's position/contact on everyone's map), and
-//! - an event naming another device as its producer (`<link
-//!   relation="p-p" uid=…>` -- a chat message's sender, a marker's creator)
-//!   is dropped.
+//! Officially off by default (`<latestSA validateClientUid="false">`);
+//! MicroTAK's `validate_client_uid` is on by default.
 //!
-//! Dropping (rather than disconnecting) for authored content keeps one bad
-//! message from cutting a device off; the SA mismatch still disconnects,
-//! as before and as in the official server.
+//! One rule the official server doesn't have, at the owner's request (no
+//! impersonation, [`impersonation`]): an event reusing the uid another
+//! device's certificate was enrolled for, or naming that uid as its
+//! producer (`<link relation="p-p">` -- a chat sender, a marker's
+//! creator), is dropped, not relayed.
 
 use crate::cot::Event;
-use crate::registry::{DeviceRegistry, RegistryError};
+use crate::registry::DeviceRegistry;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -33,27 +30,32 @@ pub enum Verdict {
     Disconnect(String),
 }
 
-pub fn authorize(registry: &DeviceRegistry, common_name: &str, event: &Event) -> Verdict {
-    if event.is_situational_awareness() {
-        return match registry.bind_uid(common_name, &event.uid) {
-            Ok(()) => Verdict::Relay,
-            Err(
-                error @ (RegistryError::UidOwnedByOtherDevice { .. }
-                | RegistryError::DeviceUidMismatch { .. }),
-            ) => Verdict::Disconnect(error.to_string()),
-            Err(error) => Verdict::Disconnect(format!("identity check failed: {error}")),
-        };
+/// `enrolled`: the connecting certificate as enrolled
+/// ([`crate::registry::DeviceRegistry::enrolled_client_uid`]).
+pub fn validate_client_uid(enrolled: Option<&Option<String>>, event: &Event) -> Verdict {
+    if !event.is_situational_awareness() {
+        return Verdict::Relay;
     }
+    match enrolled {
+        None => Verdict::Relay,
+        Some(None) => Verdict::Drop("certificate enrolled without a clientUid".to_string()),
+        Some(Some(client_uid)) if *client_uid == event.uid => Verdict::Relay,
+        Some(Some(client_uid)) => Verdict::Disconnect(format!(
+            "SA uid '{}' doesn't match the certificate's enrollment '{client_uid}'",
+            event.uid
+        )),
+    }
+}
 
-    if let Some(owner) = registry.owner_of_uid(&event.uid)
-        && owner != common_name
-    {
+/// The no-impersonation rule: `Drop` an event that claims, as its uid or
+/// producer, the enrolled uid of another device than `mine` (this
+/// certificate's enrolled uid).
+pub fn impersonation(registry: &DeviceRegistry, mine: Option<&str>, event: &Event) -> Verdict {
+    if let Some(owner) = registry.other_owner_of_enrolled_uid(&event.uid, mine) {
         return Verdict::Drop(format!("uid '{}' belongs to device '{owner}'", event.uid));
     }
     for producer in event.producer_uids() {
-        if let Some(owner) = registry.owner_of_uid(producer)
-            && owner != common_name
-        {
+        if let Some(owner) = registry.other_owner_of_enrolled_uid(producer, mine) {
             return Verdict::Drop(format!(
                 "claims to be produced by '{producer}', which belongs to device '{owner}'"
             ));
@@ -67,145 +69,99 @@ mod tests {
     use super::*;
     use crate::cot::tests::{ATAK_CHAT, ATAK_MARKER, ATAK_SA};
 
-    fn registry_with(devices: &[&str]) -> DeviceRegistry {
-        let registry = DeviceRegistry::in_memory();
-        for device in devices {
-            registry.enroll(device, "cert", 0).unwrap();
-        }
-        registry
-    }
-
     fn event(xml: &str) -> Event {
         Event::from_xml(xml).unwrap()
     }
 
-    fn with_uid(xml: &str, from: &str, to: &str) -> Event {
-        event(&xml.replace(from, to))
+    fn enrolled(uid: &str) -> Option<String> {
+        Some(uid.to_string())
     }
 
     #[test]
-    fn a_devices_first_sa_binds_its_uid_and_later_ones_must_match() {
-        let registry = registry_with(&["alpha"]);
+    fn an_sa_with_the_certificates_client_uid_is_relayed() {
         assert_eq!(
-            authorize(&registry, "alpha", &event(ATAK_SA)),
+            validate_client_uid(Some(&enrolled("ANDROID-abc123")), &event(ATAK_SA)),
             Verdict::Relay
         );
-        assert_eq!(
-            registry.find("alpha").unwrap().uid.as_deref(),
-            Some("ANDROID-abc123")
-        );
-        assert_eq!(
-            authorize(&registry, "alpha", &event(ATAK_SA)),
-            Verdict::Relay
-        );
+    }
 
-        let other = with_uid(ATAK_SA, "ANDROID-abc123", "ANDROID-zzz");
+    #[test]
+    fn an_sa_with_another_uid_disconnects() {
         assert!(matches!(
-            authorize(&registry, "alpha", &other),
+            validate_client_uid(Some(&enrolled("ANDROID-other")), &event(ATAK_SA)),
             Verdict::Disconnect(_)
         ));
     }
 
     #[test]
-    fn an_sa_claiming_another_devices_uid_disconnects() {
-        let registry = registry_with(&["alpha", "mallory"]);
-        authorize(&registry, "alpha", &event(ATAK_SA));
+    fn a_certificate_not_on_record_passes() {
+        assert_eq!(validate_client_uid(None, &event(ATAK_SA)), Verdict::Relay);
+    }
+
+    #[test]
+    fn a_certificate_without_a_client_uid_has_its_sas_dropped() {
         assert!(matches!(
-            authorize(&registry, "mallory", &event(ATAK_SA)),
-            Verdict::Disconnect(_)
-        ));
-        assert_eq!(registry.find("mallory").unwrap().uid, None);
-    }
-
-    /// The bug this fixes: chat and markers carry their own uids and must
-    /// not be checked against the device's bound uid.
-    #[test]
-    fn a_devices_own_chat_and_markers_are_relayed() {
-        let registry = registry_with(&["alpha"]);
-        authorize(&registry, "alpha", &event(ATAK_SA));
-        assert_eq!(
-            authorize(&registry, "alpha", &event(ATAK_CHAT)),
-            Verdict::Relay
-        );
-        assert_eq!(
-            authorize(&registry, "alpha", &event(ATAK_MARKER)),
-            Verdict::Relay
-        );
-        assert_eq!(
-            registry.find("alpha").unwrap().uid.as_deref(),
-            Some("ANDROID-abc123")
-        );
-    }
-
-    /// Content sent before any SA doesn't bind the device to a chat or
-    /// marker uid (which would later reject its real position).
-    #[test]
-    fn content_before_the_first_sa_binds_nothing() {
-        let registry = registry_with(&["alpha"]);
-        assert_eq!(
-            authorize(&registry, "alpha", &event(ATAK_CHAT)),
-            Verdict::Relay
-        );
-        assert_eq!(registry.find("alpha").unwrap().uid, None);
-        assert_eq!(
-            authorize(&registry, "alpha", &event(ATAK_SA)),
-            Verdict::Relay
-        );
-        assert_eq!(
-            registry.find("alpha").unwrap().uid.as_deref(),
-            Some("ANDROID-abc123")
-        );
-    }
-
-    /// A non-SA event reusing another device's uid would overwrite that
-    /// device on everyone's map -- dropped.
-    #[test]
-    fn content_reusing_another_devices_uid_is_dropped() {
-        let registry = registry_with(&["alpha", "mallory"]);
-        authorize(&registry, "alpha", &event(ATAK_SA));
-        let fake_position = with_uid(
-            crate::cot::tests::MINIMAL_EVENT_PUB,
-            "TEST-UID-1",
-            "ANDROID-abc123",
-        );
-        assert!(matches!(
-            authorize(&registry, "mallory", &fake_position),
+            validate_client_uid(Some(&None), &event(ATAK_SA)),
             Verdict::Drop(_)
         ));
     }
 
-    /// Chat "from" another device, or a marker "created by" another device
-    /// (`link relation="p-p"`) -- dropped.
+    /// Chat and markers carry their own uids and are never checked.
     #[test]
-    fn content_naming_another_device_as_producer_is_dropped() {
-        let registry = registry_with(&["alpha", "mallory"]);
-        authorize(&registry, "alpha", &event(ATAK_SA));
-        authorize(
-            &registry,
-            "mallory",
-            &with_uid(ATAK_SA, "ANDROID-abc123", "ANDROID-mal"),
-        );
-        assert!(matches!(
-            authorize(&registry, "mallory", &event(ATAK_CHAT)),
-            Verdict::Drop(_)
-        ));
-        assert!(matches!(
-            authorize(&registry, "mallory", &event(ATAK_MARKER)),
-            Verdict::Drop(_)
-        ));
-        // Its own chat is fine.
-        let own_chat = with_uid(ATAK_CHAT, "ANDROID-abc123", "ANDROID-mal");
-        assert_eq!(authorize(&registry, "mallory", &own_chat), Verdict::Relay);
+    fn content_is_not_checked() {
+        let other = enrolled("ANDROID-other");
+        for xml in [ATAK_CHAT, ATAK_MARKER] {
+            assert_eq!(
+                validate_client_uid(Some(&other), &event(xml)),
+                Verdict::Relay
+            );
+            assert_eq!(
+                validate_client_uid(Some(&None), &event(xml)),
+                Verdict::Relay
+            );
+        }
     }
 
-    /// Links to uids no device has bound (e.g. a marker linked to another
-    /// marker, `relation="c-c"`, or an unenrolled producer) don't matter.
+    fn registry() -> DeviceRegistry {
+        let registry = DeviceRegistry::in_memory();
+        registry
+            .enroll_with_client_uid("alpha", "c1", 1, Some("ANDROID-abc123"))
+            .unwrap();
+        registry
+            .enroll_with_client_uid("mallory", "c2", 2, Some("ANDROID-mal"))
+            .unwrap();
+        registry
+    }
+
+    /// Alpha's SA (its uid), its chat and its marker (alpha as producer),
+    /// sent by mallory.
     #[test]
-    fn links_to_unbound_uids_are_fine() {
-        let registry = registry_with(&["alpha"]);
-        assert_eq!(
-            authorize(&registry, "alpha", &event(ATAK_MARKER)),
-            Verdict::Relay
-        );
+    fn content_claiming_another_devices_enrolled_uid_is_dropped() {
+        let registry = registry();
+        for xml in [ATAK_SA, ATAK_CHAT, ATAK_MARKER] {
+            assert!(
+                matches!(
+                    impersonation(&registry, Some("ANDROID-mal"), &event(xml)),
+                    Verdict::Drop(_)
+                ),
+                "{xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_devices_own_content_and_unknown_uids_are_relayed() {
+        let registry = registry();
+        for xml in [ATAK_SA, ATAK_CHAT, ATAK_MARKER] {
+            assert_eq!(
+                impersonation(&registry, Some("ANDROID-abc123"), &event(xml)),
+                Verdict::Relay
+            );
+            let unknown = xml.replace("ANDROID-abc123", "ANDROID-nobody");
+            assert_eq!(
+                impersonation(&registry, Some("ANDROID-mal"), &event(&unknown)),
+                Verdict::Relay
+            );
+        }
     }
 }

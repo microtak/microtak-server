@@ -405,7 +405,6 @@ impl Event {
 pub(crate) mod tests {
     use super::*;
 
-    pub(crate) const MINIMAL_EVENT_PUB: &str = MINIMAL_EVENT;
     const MINIMAL_EVENT: &str = r#"<event version="2.0" uid="TEST-UID-1" type="a-f-G-U-C" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.2500" lon="10.4000" hae="10.0" ce="5.0" le="3.0"/></event>"#;
 
     #[test]

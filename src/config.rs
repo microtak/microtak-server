@@ -29,6 +29,10 @@ pub struct Config {
     /// Off by default -- see `AppConfig::plain_tcp_enabled`.
     pub plain_tcp_enabled: bool,
     pub mtls_port: u16,
+    /// The official `validateClientUid`: a device's SA must carry the
+    /// `clientUid` its certificate was enrolled for (default `true`;
+    /// officially `false`).
+    pub validate_client_uid: bool,
     pub ca_common_name: String,
     pub server_common_name: String,
     /// Extra IPs/DNS names for the server certificate -- see
@@ -97,6 +101,7 @@ impl Default for Config {
             plain_tcp_port: defaults.plain_tcp_addr.port(),
             plain_tcp_enabled: defaults.plain_tcp_enabled,
             mtls_port: defaults.mtls_addr.port(),
+            validate_client_uid: defaults.validate_client_uid,
             ca_common_name: defaults.ca_common_name,
             server_common_name: defaults.server_common_name,
             server_names: defaults.server_names,
@@ -200,6 +205,7 @@ impl Config {
             plain_tcp_addr: SocketAddr::new(bind_ip, self.plain_tcp_port),
             plain_tcp_enabled: self.plain_tcp_enabled,
             mtls_addr: SocketAddr::new(bind_ip, self.mtls_port),
+            validate_client_uid: self.validate_client_uid,
             ca_common_name: self.ca_common_name.clone(),
             server_common_name: self.server_common_name.clone(),
             server_names: self.server_names.clone(),
@@ -503,5 +509,17 @@ mod tests {
         assert_eq!(app_config.admin_common_name.as_deref(), Some("admin"));
         assert_eq!(app_config.enrollment_mode, EnrollmentMode::Auto);
         assert!(!app_config.plain_tcp_enabled, "plain TCP must be opt-in");
+    }
+
+    #[test]
+    fn validate_client_uid_is_on_unless_turned_off() {
+        assert!(
+            Config::default()
+                .to_app_config()
+                .unwrap()
+                .validate_client_uid
+        );
+        let config: Config = toml::from_str("validate_client_uid = false\n").unwrap();
+        assert!(!config.to_app_config().unwrap().validate_client_uid);
     }
 }

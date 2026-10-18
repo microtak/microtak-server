@@ -198,6 +198,16 @@ private network.
 Uploads (photos, data packages) are streamed to disk and may be up to
 100 MB; change with `max_upload_mb`.
 
+A device's own position report (SA) must carry the `clientUid` its
+certificate was enrolled for (ATAK sends its device uid when enrolling);
+otherwise the connection ends -- the official TAK Server's
+`validateClientUid` check. It is on by default in MicroTAK (officially off);
+turn it off with `validate_client_uid = false`, e.g. for a client that
+enrolls with a different uid than it reports. Re-enrolling a phone under a
+new name just works: each certificate carries its own uid. Independently,
+no device may relay content under the uid another device's certificate was
+enrolled for.
+
 Data and backups live in Docker volumes so they survive container restarts.
 To customize settings, drop a `microtak.toml` next to `docker-compose.yml`
 and uncomment the volume mount for it.

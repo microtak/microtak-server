@@ -59,6 +59,9 @@ fn test_config() -> AppConfig {
         mtls_addr: "127.0.0.1:0".parse().unwrap(),
         data_dir: unique_temp_dir(),
         enrollment_mode: microtak_server::app::EnrollmentMode::Open,
+        // Most devices here enroll without a `clientUid`: the official
+        // default (off). `e2e_validate_client_uid_*` tests the check.
+        validate_client_uid: false,
         ..AppConfig::default()
     }
 }
@@ -136,10 +139,22 @@ fn enrollment_client() -> reqwest::Client {
 /// Enroll a device against the real, running enrollment HTTP endpoint --
 /// the same request shape a real ATAK client would send.
 async fn enroll(base_url: &str, common_name: &str) -> (String, rcgen::KeyPair) {
+    enroll_for(base_url, common_name, None).await
+}
+
+/// [`enroll`], as ATAK does it: `?clientUid=<device uid>`.
+async fn enroll_for(
+    base_url: &str,
+    common_name: &str,
+    client_uid: Option<&str>,
+) -> (String, rcgen::KeyPair) {
     let (csr_pem, key) = pki::build_csr(common_name).unwrap();
     let client = enrollment_client();
+    let query = client_uid
+        .map(|uid| format!("?clientUid={uid}"))
+        .unwrap_or_default();
     let response = client
-        .post(format!("{base_url}/Marti/api/tls/signClient/v2"))
+        .post(format!("{base_url}/Marti/api/tls/signClient/v2{query}"))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(csr_pem)
         .send()
@@ -1534,55 +1549,68 @@ async fn e2e_client_endpoints_reflects_real_connections() {
     );
 }
 
-/// Cross-device uid spoofing, exercised through the full enroll-then-connect
-/// chain (unlike `transport::tls`'s own unit test, which enrolls directly
-/// into a bespoke registry rather than via HTTP).
+/// The official `validateClientUid` check (on by default), through HTTP
+/// enrollment: each SA must carry the `clientUid` its certificate was
+/// enrolled for. A phone re-enrolled under a new name keeps working; an SA
+/// claiming another uid ends the connection; a certificate enrolled without
+/// a `clientUid` has its SAs dropped.
 #[tokio::test]
-async fn e2e_rejects_cross_device_uid_spoofing_after_http_enrollment() {
-    let app = App::bind(test_config()).await.unwrap();
+async fn e2e_validate_client_uid_checks_sas_against_the_enrollment() {
+    let app = App::bind(AppConfig {
+        validate_client_uid: true,
+        ..test_config()
+    })
+    .await
+    .unwrap();
     let enrollment_addr = app.enrollment_addr().unwrap();
     let mtls_addr = app.mtls_addr().unwrap();
     let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
-
     let base_url = format!("https://{enrollment_addr}");
-    let (cert_a, key_a) = enroll(&base_url, "spoof-target").await;
-    let (cert_spoofer, key_spoofer) = enroll(&base_url, "spoof-attacker").await;
-
-    let mut tls_a = connect_mtls(mtls_addr, &ca_cert_pem, &cert_a, key_a)
-        .await
-        .unwrap();
-    let mut tls_spoofer = connect_mtls(mtls_addr, &ca_cert_pem, &cert_spoofer, key_spoofer)
-        .await
-        .unwrap();
+    let connect = async |cn: &str, client_uid: Option<&str>| {
+        let (cert, key) = enroll_for(&base_url, cn, client_uid).await;
+        connect_mtls(mtls_addr, &ca_cert_pem, &cert, key)
+            .await
+            .unwrap()
+    };
+    let mut old = connect("phone", Some("ANDROID-1")).await;
+    let mut new = connect("phone-again", Some("ANDROID-1")).await;
+    let mut bare = connect("no-client-uid", None).await;
+    let mut attacker = connect("attacker", Some("ANDROID-attacker")).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    tls_a
-        .write_all(event_xml("CONTESTED-UID").as_bytes())
+    old.write_all(event_xml("ANDROID-1").as_bytes())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // The spoofer, as a legitimate other connected client, is entitled to
-    // receive spoof-target's just-broadcast event -- drain that expected
-    // traffic before looking for a rejection signal.
-    let mut drain_buf = vec![0u8; 4096];
-    let drained = timeout(Duration::from_secs(2), tls_spoofer.read(&mut drain_buf))
+    read_until_contains(&mut new, "ANDROID-1-CS").await;
+    new.write_all(event_xml("ANDROID-1").as_bytes())
         .await
-        .expect("timed out waiting for spoof-target's relayed event")
         .unwrap();
-    assert!(String::from_utf8_lossy(&drain_buf[..drained]).contains("CONTESTED-UID"));
-
-    let write_result = tls_spoofer
-        .write_all(event_xml("CONTESTED-UID").as_bytes())
-        .await;
-    let mut buf = [0u8; 16];
-    let read_result = timeout(Duration::from_secs(2), tls_spoofer.read(&mut buf)).await;
-    let rejected = write_result.is_err() || matches!(read_result, Ok(Ok(0)) | Ok(Err(_)));
     assert!(
-        rejected,
-        "a device claiming another enrolled device's uid must be disconnected; write={write_result:?} read={read_result:?}"
+        read_until_contains(&mut old, "ANDROID-1-CS")
+            .await
+            .contains("ANDROID-1-CS"),
+        "the re-enrolled phone's SA is relayed"
     );
+
+    bare.write_all(event_xml("ANDROID-bare").as_bytes())
+        .await
+        .unwrap();
+    assert!(
+        !receives_within(&mut old, "ANDROID-bare", Duration::from_millis(300)).await,
+        "an SA from a certificate without a clientUid is dropped"
+    );
+
+    let write_result = attacker.write_all(event_xml("ANDROID-1").as_bytes()).await;
+    let mut buf = [0u8; 4096];
+    let rejected = loop {
+        match timeout(Duration::from_secs(2), attacker.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break true,
+            Ok(Ok(_)) => continue, // relayed traffic before the disconnect
+            Err(_) => break write_result.is_err(),
+        }
+    };
+    assert!(rejected, "an SA with another uid ends the connection");
 }
 
 /// Revocation, exercised through the full enroll-then-connect chain. There
@@ -2102,7 +2130,8 @@ async fn e2e_a_devices_chat_and_markers_are_relayed_intact() {
 
 /// Impersonation through authored content is dropped, not relayed: chat
 /// "from" another device, a marker "created by" another device, and a
-/// non-SA event reusing another device's uid. The impersonator stays
+/// non-SA event reusing another device's uid -- "another device's" being
+/// the uid its certificate was enrolled for. The impersonator stays
 /// connected (its own traffic still flows).
 #[tokio::test]
 async fn e2e_content_impersonating_another_device_is_dropped() {
@@ -2112,8 +2141,8 @@ async fn e2e_content_impersonating_another_device_is_dropped() {
     let ca_cert_pem = app.ca_cert_pem.clone();
     tokio::spawn(app.run());
     let base_url = format!("https://{enrollment_addr}");
-    let (cert_v, key_v) = enroll(&base_url, "victim").await;
-    let (cert_m, key_m) = enroll(&base_url, "mallory").await;
+    let (cert_v, key_v) = enroll_for(&base_url, "victim", Some("ANDROID-victim")).await;
+    let (cert_m, key_m) = enroll_for(&base_url, "mallory", Some("ANDROID-mallory")).await;
     let (cert_w, key_w) = enroll(&base_url, "watcher").await;
     let mut victim = connect_mtls(mtls_addr, &ca_cert_pem, &cert_v, key_v)
         .await

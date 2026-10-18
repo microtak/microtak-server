@@ -1,5 +1,6 @@
 //! Device (EUD) registry: tracks enrolled devices by certificate Common
-//! Name, and binds each to the CoT `uid` it's authorized to assert.
+//! Name, and each issued certificate with the `clientUid` it was enrolled
+//! for.
 //!
 //! Persisted as an append-only, replayable event log (see
 //! [`crate::eventlog`]) rather than a snapshot rewritten on every
@@ -11,9 +12,9 @@
 //! `docs/ARCHITECTURE.md`'s backup section.
 //!
 //! Implements the enrollment side of `docs/TEST-PLAN.md` §4 (recording a
-//! signed device alongside its cert) and the identity-binding side of §3
-//! TC-TLS-04 (rejecting a connection that claims a `uid` belonging to a
-//! different, already-enrolled device).
+//! signed device alongside its cert), and holds what the official
+//! `validateClientUid` check compares SAs with (see
+//! [`DeviceRegistry::enrolled_client_uid`]).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,14 +31,6 @@ pub enum RegistryError {
     NotFound(String),
     #[error("a device with common name '{0}' is already enrolled")]
     AlreadyEnrolled(String),
-    #[error("uid '{uid}' is already bound to a different device (common name '{owner}')")]
-    UidOwnedByOtherDevice { uid: String, owner: String },
-    #[error("device '{common_name}' already claims uid '{existing}', cannot rebind to '{claimed}'")]
-    DeviceUidMismatch {
-        common_name: String,
-        existing: String,
-        claimed: String,
-    },
     #[error("'{0}' is not a SHA-256 certificate fingerprint")]
     InvalidFingerprint(String),
     #[error("device '{0}' has no readable certificate on record")]
@@ -52,10 +45,6 @@ pub struct DeviceRecord {
     pub cert_pem: String,
     pub enrolled_at_unix: i64,
     pub revoked: bool,
-    /// The CoT `uid` this device has been observed asserting, bound on
-    /// first use (trust-on-first-use) — `None` until the device's first
-    /// CoT event arrives over an authenticated connection. See TC-TLS-04.
-    pub uid: Option<String>,
 }
 
 /// A durable, replayable record of one registry mutation. This is the
@@ -76,6 +65,9 @@ enum RegistryEvent {
     Revoked {
         common_name: String,
     },
+    /// Written by MicroTAK before 0.13 (a uid bound to an identity on
+    /// first use); read and ignored.
+    #[allow(dead_code)]
     UidBound {
         common_name: String,
         uid: String,
@@ -164,8 +156,7 @@ impl DeviceRegistry {
 
     /// Enroll a device, or re-enroll an already-known common name with a
     /// new certificate (rotation) — see TC-ENROLL-04/TC-OTS-12. The
-    /// existing `uid` binding *and* revocation status, if any, are
-    /// preserved across re-enrollment: re-enrolling must not be usable as a
+    /// revocation status, if any, is preserved across re-enrollment: re-enrolling must not be usable as a
     /// backdoor to silently clear a prior revocation. Un-revoking is a
     /// separate, explicit action (not yet implemented — no `unrevoke`
     /// method exists today).
@@ -242,16 +233,40 @@ impl DeviceRegistry {
         Ok(state.devices.get(common_name).unwrap().clone())
     }
 
-    /// The common name of the device that has bound `uid`, if any.
-    pub fn owner_of_uid(&self, uid: &str) -> Option<String> {
+    /// The certificate `cert_der` as enrolled: `None` if it isn't on
+    /// record, else the `clientUid` it was enrolled for (official
+    /// `takCertRepository.findOneByHash(...).getClientUid()`).
+    pub fn enrolled_client_uid(&self, cert_der: &[u8]) -> Option<Option<String>> {
+        let fingerprint = crate::pki::fingerprint_sha256_colon_hex_der(cert_der);
         self.state
             .read()
             .unwrap()
-            .devices
-            .values()
-            // A blocked identity can't connect, so it holds no uid.
-            .find(|d| d.uid.as_deref() == Some(uid) && !d.revoked)
-            .map(|d| d.common_name.clone())
+            .certificates
+            .iter()
+            .rev()
+            .find(|c| {
+                crate::pki::fingerprint_sha256_colon_hex(&c.cert_pem).as_deref()
+                    == Some(fingerprint.as_str())
+            })
+            .map(|c| c.client_uid.clone())
+    }
+
+    /// The identity whose certificate was enrolled for `uid`, unless that's
+    /// `mine` (a re-enrolled phone's certificates share its uid) or the
+    /// identity is blocked.
+    pub fn other_owner_of_enrolled_uid(&self, uid: &str, mine: Option<&str>) -> Option<String> {
+        if mine == Some(uid) {
+            return None;
+        }
+        let state = self.state.read().unwrap();
+        state
+            .certificates
+            .iter()
+            .find(|c| {
+                c.client_uid.as_deref() == Some(uid)
+                    && !state.devices.get(&c.common_name).is_some_and(|d| d.revoked)
+            })
+            .map(|c| c.common_name.clone())
     }
 
     pub fn find(&self, common_name: &str) -> Option<DeviceRecord> {
@@ -424,61 +439,6 @@ impl DeviceRegistry {
     fn signal_revocation(&self) {
         self.revocations.send_modify(|generation| *generation += 1);
     }
-
-    /// Bind `uid` to `common_name`, enforcing TC-TLS-04: a `uid` already
-    /// claimed by a *different* enrolled device is rejected outright
-    /// (cross-device spoofing defense). The same device re-asserting the
-    /// same `uid` it already owns is a no-op success (the expected steady
-    /// state, since a connected device re-sends its self-ID atom
-    /// periodically) and does **not** append a new event — the log only
-    /// ever records genuine state transitions. A device that has already
-    /// bound a different `uid` attempting to bind yet another one is also
-    /// rejected — MicroTAK treats a device's `uid` as fixed once bound, a
-    /// deliberate simplification (see `docs/ARCHITECTURE.md`) vs.
-    /// real-world devices that might legitimately change identity (e.g.
-    /// app reinstall); revoking and re-enrolling is the escape hatch for
-    /// that case.
-    pub fn bind_uid(&self, common_name: &str, uid: &str) -> Result<(), RegistryError> {
-        let mut state = self.state.write().unwrap();
-
-        if let Some(owner) = state
-            .devices
-            .values()
-            .find(|d| d.uid.as_deref() == Some(uid) && d.common_name != common_name && !d.revoked)
-        {
-            return Err(RegistryError::UidOwnedByOtherDevice {
-                uid: uid.to_string(),
-                owner: owner.common_name.clone(),
-            });
-        }
-
-        let device = state
-            .devices
-            .get(common_name)
-            .ok_or_else(|| RegistryError::NotFound(common_name.to_string()))?;
-
-        match &device.uid {
-            None => {}
-            Some(existing) if existing == uid => return Ok(()), // idempotent, no event
-            Some(existing) => {
-                return Err(RegistryError::DeviceUidMismatch {
-                    common_name: common_name.to_string(),
-                    existing: existing.clone(),
-                    claimed: uid.to_string(),
-                });
-            }
-        }
-
-        let event = RegistryEvent::UidBound {
-            common_name: common_name.to_string(),
-            uid: uid.to_string(),
-        };
-        if let Some(log) = &self.log {
-            log.append(&event)?;
-        }
-        apply_event(&mut state, &event);
-        Ok(())
-    }
 }
 
 /// The reducer: apply one durable event to in-memory state. Used both for
@@ -502,7 +462,6 @@ fn apply_event(state: &mut RegistryState, event: &RegistryEvent) {
             });
             let devices = &mut state.devices;
             let existing = devices.get(common_name);
-            let existing_uid = existing.and_then(|d| d.uid.clone());
             let was_revoked = existing.map(|d| d.revoked).unwrap_or(false);
             devices.insert(
                 common_name.clone(),
@@ -511,7 +470,6 @@ fn apply_event(state: &mut RegistryState, event: &RegistryEvent) {
                     cert_pem: cert_pem.clone(),
                     enrolled_at_unix: *at_unix,
                     revoked: was_revoked,
-                    uid: existing_uid,
                 },
             );
         }
@@ -520,11 +478,7 @@ fn apply_event(state: &mut RegistryState, event: &RegistryEvent) {
                 device.revoked = true;
             }
         }
-        RegistryEvent::UidBound { common_name, uid } => {
-            if let Some(device) = state.devices.get_mut(common_name) {
-                device.uid = Some(uid.clone());
-            }
-        }
+        RegistryEvent::UidBound { .. } => {}
         RegistryEvent::CertRevoked {
             fingerprint,
             at_unix,
@@ -566,7 +520,6 @@ mod tests {
             .unwrap();
         assert_eq!(record.common_name, "device-a");
         assert!(!record.revoked);
-        assert!(record.uid.is_none());
 
         let found = registry.find("device-a").unwrap();
         assert_eq!(found, record);
@@ -585,86 +538,91 @@ mod tests {
     }
 
     #[test]
-    fn re_enrollment_rotates_cert_but_preserves_uid_binding() {
+    fn re_enrollment_rotates_the_cert() {
         let registry = DeviceRegistry::in_memory();
         registry.enroll("device-a", "cert-v1", 1_000).unwrap();
-        registry.bind_uid("device-a", "UID-A").unwrap();
-
         let rotated = registry.enroll("device-a", "cert-v2", 2_000).unwrap();
         assert_eq!(rotated.cert_pem, "cert-v2");
-        assert_eq!(rotated.uid.as_deref(), Some("UID-A"));
     }
 
-    /// A phone re-enrolled under a new name keeps its device uid: once
-    /// the old identity is blocked (it can't connect any more), it no
-    /// longer holds that uid.
+    /// What `validateClientUid` compares with: the `clientUid` a
+    /// certificate was enrolled for, looked up by the certificate itself.
     #[test]
-    fn a_blocked_identity_releases_its_uid() {
+    fn enrolled_client_uid_is_per_certificate() {
+        let ca = crate::pki::CertificateAuthority::generate("Test CA").unwrap();
+        let issue = |cn: &str| {
+            let (csr, _key) = crate::pki::build_csr(cn).unwrap();
+            ca.sign_csr(&csr, time::Duration::days(1)).unwrap().cert_pem
+        };
+        let (old, new, unknown, bare) =
+            (issue("phone"), issue("phone-2"), issue("x"), issue("bare"));
         let registry = DeviceRegistry::in_memory();
-        registry.enroll("old-name", "cert-1", 1_000).unwrap();
-        registry.bind_uid("old-name", "ANDROID-1").unwrap();
-        registry.enroll("new-name", "cert-2", 2_000).unwrap();
-        assert!(matches!(
-            registry.bind_uid("new-name", "ANDROID-1"),
-            Err(RegistryError::UidOwnedByOtherDevice { .. })
-        ));
-        registry.revoke("old-name").unwrap();
-        assert_eq!(registry.owner_of_uid("ANDROID-1"), None);
-        registry.bind_uid("new-name", "ANDROID-1").unwrap();
+        registry
+            .enroll_with_client_uid("phone", &old, 1, Some("ANDROID-1"))
+            .unwrap();
+        registry
+            .enroll_with_client_uid("phone-2", &new, 2, Some("ANDROID-1"))
+            .unwrap();
+        registry.enroll("bare", &bare, 3).unwrap();
+        let der = |pem: &str| ::pem::parse(pem).unwrap().contents().to_vec();
+
         assert_eq!(
-            registry.owner_of_uid("ANDROID-1").as_deref(),
-            Some("new-name")
+            registry.enrolled_client_uid(&der(&old)),
+            Some(Some("ANDROID-1".into()))
         );
-    }
-
-    #[test]
-    fn tc_tls_04_binds_uid_on_first_use() {
-        let registry = DeviceRegistry::in_memory();
-        registry.enroll("device-a", "cert", 1_000).unwrap();
-        registry.bind_uid("device-a", "UID-A").unwrap();
         assert_eq!(
-            registry.find("device-a").unwrap().uid.as_deref(),
-            Some("UID-A")
+            registry.enrolled_client_uid(&der(&new)),
+            Some(Some("ANDROID-1".into()))
         );
+        assert_eq!(registry.enrolled_client_uid(&der(&bare)), Some(None));
+        assert_eq!(registry.enrolled_client_uid(&der(&unknown)), None);
     }
 
     #[test]
-    fn tc_tls_04_same_device_reasserting_same_uid_is_idempotent() {
+    fn other_owner_of_enrolled_uid_skips_mine_and_blocked_identities() {
         let registry = DeviceRegistry::in_memory();
-        registry.enroll("device-a", "cert", 1_000).unwrap();
-        registry.bind_uid("device-a", "UID-A").unwrap();
-        registry.bind_uid("device-a", "UID-A").unwrap(); // no error
+        registry
+            .enroll_with_client_uid("victim", "c1", 1, Some("ANDROID-V"))
+            .unwrap();
+        registry
+            .enroll_with_client_uid("victim-again", "c2", 2, Some("ANDROID-V"))
+            .unwrap();
+        registry
+            .enroll_with_client_uid("mallory", "c3", 3, Some("ANDROID-M"))
+            .unwrap();
+
         assert_eq!(
-            registry.find("device-a").unwrap().uid.as_deref(),
-            Some("UID-A")
+            registry
+                .other_owner_of_enrolled_uid("ANDROID-V", Some("ANDROID-M"))
+                .as_deref(),
+            Some("victim")
         );
-    }
-
-    #[test]
-    fn tc_tls_04_rejects_uid_already_owned_by_a_different_device() {
-        let registry = DeviceRegistry::in_memory();
-        registry.enroll("device-a", "cert-a", 1_000).unwrap();
-        registry.enroll("device-b", "cert-b", 1_000).unwrap();
-        registry.bind_uid("device-a", "UID-A").unwrap();
-
-        let result = registry.bind_uid("device-b", "UID-A");
-        assert!(matches!(
-            result,
-            Err(RegistryError::UidOwnedByOtherDevice { .. })
-        ));
-    }
-
-    #[test]
-    fn tc_tls_04_rejects_device_rebinding_to_a_different_uid() {
-        let registry = DeviceRegistry::in_memory();
-        registry.enroll("device-a", "cert", 1_000).unwrap();
-        registry.bind_uid("device-a", "UID-A").unwrap();
-
-        let result = registry.bind_uid("device-a", "UID-B");
-        assert!(matches!(
-            result,
-            Err(RegistryError::DeviceUidMismatch { .. })
-        ));
+        assert_eq!(
+            registry
+                .other_owner_of_enrolled_uid("ANDROID-V", None)
+                .as_deref(),
+            Some("victim")
+        );
+        assert_eq!(
+            registry.other_owner_of_enrolled_uid("ANDROID-V", Some("ANDROID-V")),
+            None
+        );
+        assert_eq!(
+            registry.other_owner_of_enrolled_uid("ANDROID-X", None),
+            None
+        );
+        registry.revoke("victim").unwrap();
+        assert_eq!(
+            registry
+                .other_owner_of_enrolled_uid("ANDROID-V", None)
+                .as_deref(),
+            Some("victim-again")
+        );
+        registry.revoke("victim-again").unwrap();
+        assert_eq!(
+            registry.other_owner_of_enrolled_uid("ANDROID-V", None),
+            None
+        );
     }
 
     #[test]
@@ -709,13 +667,11 @@ mod tests {
         {
             let registry = DeviceRegistry::load_or_create(&path).unwrap();
             registry.enroll("device-a", "cert", 1_000).unwrap();
-            registry.bind_uid("device-a", "UID-A").unwrap();
         }
 
         let reloaded = DeviceRegistry::load_or_create(&path).unwrap();
         let record = reloaded.find("device-a").unwrap();
         assert_eq!(record.cert_pem, "cert");
-        assert_eq!(record.uid.as_deref(), Some("UID-A"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -881,8 +837,6 @@ mod tests {
             let registry = DeviceRegistry::load_or_create(&path).unwrap();
             registry.enroll("device-a", "cert-v1", 1_000).unwrap();
             registry.enroll("device-b", "cert-b", 1_100).unwrap();
-            registry.bind_uid("device-a", "UID-A").unwrap();
-            registry.bind_uid("device-a", "UID-A").unwrap(); // idempotent, no event
             registry.enroll("device-a", "cert-v2", 2_000).unwrap(); // rotation
             registry.revoke("device-b").unwrap();
         }
@@ -890,7 +844,6 @@ mod tests {
         let replayed = DeviceRegistry::load_or_create(&path).unwrap();
         let a = replayed.find("device-a").unwrap();
         assert_eq!(a.cert_pem, "cert-v2");
-        assert_eq!(a.uid.as_deref(), Some("UID-A"));
         assert!(!a.revoked);
         assert!(replayed.is_revoked("device-b"));
 

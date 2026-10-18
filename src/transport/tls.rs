@@ -4,16 +4,12 @@
 //! [`super::codec::StreamDecoder`] and broadcast-based relay), but requires
 //! a valid client certificate signed by the configured CA before any CoT is
 //! accepted (`docs/TEST-PLAN.md` §3, TC-TLS-01/02/03), and enforces
-//! [`DeviceRegistry`] identity binding (TC-TLS-04) plus revocation
-//! (TC-TLS-05, connect-time only — no continuous re-check of an
-//! already-open session, matching the interim policy documented in
-//! `docs/TEST-PLAN.md`).
+//! [`DeviceRegistry`] revocation (TC-TLS-05, at connect and on live
+//! sessions) and, when enabled, the official `validateClientUid` check
+//! (TC-TLS-04, see [`super::identity`]).
 //!
 //! A connection whose cert has no extractable Common Name, or whose CN is
-//! revoked, is disconnected immediately after the handshake. A connection
-//! whose CoT claims a `uid` already bound to a *different* device is
-//! disconnected as soon as that event is decoded — see
-//! [`DeviceRegistry::bind_uid`] for the exact binding policy.
+//! revoked, is disconnected immediately after the handshake.
 //!
 //! Shares a [`RelayHub`] with [`super::tcp::TcpRelay`] — a CoT event
 //! ingested here is relayed to plain-TCP clients too, and vice versa.
@@ -122,6 +118,7 @@ pub struct TlsRelay {
     missions: Option<Arc<dyn crate::transport::hub::StreamingMissions>>,
     tak_protocol: Option<Arc<TakProtocol>>,
     latest_sa: bool,
+    validate_client_uid: bool,
 }
 
 /// TAK Protocol negotiation on this listener, as on an official
@@ -156,6 +153,7 @@ impl TlsRelay {
             missions: None,
             tak_protocol: None,
             latest_sa: false,
+            validate_client_uid: false,
         })
     }
 
@@ -164,6 +162,13 @@ impl TlsRelay {
     /// whose messages reach it.
     pub fn with_latest_sa(mut self) -> Self {
         self.latest_sa = true;
+        self
+    }
+
+    /// `validateClientUid` (see [`super::identity`]): a client's SA must
+    /// carry the `clientUid` its certificate was enrolled for.
+    pub fn with_validate_client_uid(mut self, enabled: bool) -> Self {
+        self.validate_client_uid = enabled;
         self
     }
 
@@ -219,6 +224,7 @@ impl TlsRelay {
             let missions = self.missions.clone();
             let tak_protocol = self.tak_protocol.clone();
             let latest_sa = self.latest_sa;
+            let validate_client_uid = self.validate_client_uid;
             tokio::spawn(async move {
                 let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
                     return;
@@ -273,6 +279,7 @@ impl TlsRelay {
                         missions,
                         tak_protocol,
                         latest_sa,
+                        validate_client_uid,
                     },
                 )
                 .await;
@@ -310,6 +317,7 @@ struct Shared {
     missions: Option<Arc<dyn crate::transport::hub::StreamingMissions>>,
     tak_protocol: Option<Arc<TakProtocol>>,
     latest_sa: bool,
+    validate_client_uid: bool,
 }
 
 async fn handle_client(
@@ -328,28 +336,33 @@ async fn handle_client(
         missions,
         tak_protocol,
         latest_sa,
+        validate_client_uid,
     } = shared;
+    // The connection's client uid (the official subscription's
+    // `clientUid`): from its first message with a contact endpoint
+    // (`callsignExtractorCallback`).
+    let client_uid: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let my_uid = || client_uid.lock().unwrap().clone();
+    // What this certificate was enrolled for, for `validateClientUid`.
+    let enrolled = registry.enrolled_client_uid(&peer_cert);
     // Whatever ends the session: it leaves its missions' live subscribers
     // (`missionDisconnect` for every mission of the client uid).
     struct LeaveMissions<'a> {
         missions: &'a Option<Arc<dyn crate::transport::hub::StreamingMissions>>,
-        registry: &'a DeviceRegistry,
-        cn: &'a str,
+        client_uid: &'a std::sync::Mutex<Option<String>>,
     }
     impl Drop for LeaveMissions<'_> {
         fn drop(&mut self) {
-            if let (Some(missions), Some(uid)) = (
-                self.missions,
-                self.registry.find(self.cn).and_then(|d| d.uid),
-            ) {
-                missions.client_disconnected(&uid);
+            if let (Some(missions), Some(uid)) =
+                (self.missions, self.client_uid.lock().unwrap().as_deref())
+            {
+                missions.client_disconnected(uid);
             }
         }
     }
     let _leave = LeaveMissions {
         missions: &missions,
-        registry: &registry,
-        cn: &cn,
+        client_uid: &client_uid,
     };
     clients.register(ClientEndpoint {
         remote_addr: peer,
@@ -489,23 +502,35 @@ async fn handle_client(
                                         }
                                         continue;
                                     }
-                                    // TC-TLS-04: see `super::identity`.
-                                    match identity::authorize(&registry, &cn, &event) {
-                                        Verdict::Relay => {}
-                                        Verdict::Drop(reason) => {
-                                            crate::metrics::inc(&crate::metrics::COUNTERS.cot_events_dropped);
-                                            warn!(%peer, cn, uid = %event.uid, reason, "dropping event that impersonates another device");
-                                            continue;
-                                        }
-                                        Verdict::Disconnect(reason) => {
-                                            warn!(%peer, cn, uid = %event.uid, reason, "uid binding violation, disconnecting client");
-                                            let _ = writer.shutdown().await;
-                                            return;
+                                    if my_uid().is_none()
+                                        && event.detail.as_ref().and_then(|d| d.contact.as_ref()).is_some_and(|c| c.endpoint.is_some())
+                                    {
+                                        *client_uid.lock().unwrap() = Some(event.uid.clone());
+                                        clients.set_uid(peer, event.uid.clone());
+                                    }
+                                    if validate_client_uid {
+                                        match identity::validate_client_uid(enrolled.as_ref(), &event) {
+                                            Verdict::Relay => {}
+                                            Verdict::Drop(reason) => {
+                                                crate::metrics::inc(&crate::metrics::COUNTERS.cot_events_dropped);
+                                                warn!(%peer, cn, uid = %event.uid, reason, "dropping SA: clientUid can't be validated");
+                                                continue;
+                                            }
+                                            Verdict::Disconnect(reason) => {
+                                                warn!(%peer, cn, uid = %event.uid, reason, "illegal clientUid, disconnecting client");
+                                                let _ = writer.shutdown().await;
+                                                return;
+                                            }
                                         }
                                     }
+                                    // No impersonation (see `super::identity`).
+                                    if let Verdict::Drop(reason) = identity::impersonation(&registry, enrolled.as_ref().and_then(|e| e.as_deref()), &event) {
+                                        crate::metrics::inc(&crate::metrics::COUNTERS.cot_events_dropped);
+                                        warn!(%peer, cn, uid = %event.uid, reason, "dropping event that impersonates another device");
+                                        continue;
+                                    }
                                     let relayed: Arc<str> = crate::cot::strip_marti(&xml).into_owned().into();
-                                    if event.is_situational_awareness() {
-                                        clients.set_uid(peer, event.uid.clone());
+                                    if event.is_situational_awareness() && my_uid().as_deref() == Some(event.uid.as_str()) {
                                         clients.set_latest_sa(peer, Arc::clone(&relayed));
                                     }
                                     let mut dest: Vec<String> =
@@ -514,7 +539,7 @@ async fn handle_client(
                                     if let Some(missions) = &missions
                                         && !(mission_names.is_empty() && mission_guids.is_empty())
                                     {
-                                        let my_uid = registry.find(&cn).and_then(|d| d.uid);
+                                        let my_uid = my_uid();
                                         for uid in missions.route(my_uid.as_deref(), &cn, &mission_names, &mission_guids, &event.uid) {
                                             if !dest.contains(&uid) {
                                                 dest.push(uid);
@@ -556,8 +581,7 @@ async fn handle_client(
                         // team) message only goes to a connection whose own
                         // registry-bound uid is addressed; an undirected
                         // (broadcast) message goes to everyone, as before.
-                        let my_uid = registry.find(&cn).and_then(|d| d.uid);
-                        if !msg.is_deliverable_to(my_uid.as_deref()) {
+                        if !msg.is_deliverable_to(my_uid().as_deref()) {
                             continue;
                         }
                         // Groups (official reachability): only if the
@@ -678,11 +702,20 @@ mod tests {
     /// registry -- mirroring the real enrollment flow (HTTP endpoint signs
     /// + records) that a raw `ca.sign_csr` call alone wouldn't do.
     fn client_tls_connector(fixture: &Fixture, client_cn: &str) -> TlsConnector {
+        client_tls_connector_for(fixture, client_cn, None)
+    }
+
+    /// [`client_tls_connector`], enrolled for `client_uid`.
+    fn client_tls_connector_for(
+        fixture: &Fixture,
+        client_cn: &str,
+        client_uid: Option<&str>,
+    ) -> TlsConnector {
         let (csr, key) = build_csr(client_cn).unwrap();
         let signed = fixture.ca.sign_csr(&csr, Duration::days(365)).unwrap();
         fixture
             .registry
-            .enroll(client_cn, &signed.cert_pem, 0)
+            .enroll_with_client_uid(client_cn, &signed.cert_pem, 0, client_uid)
             .unwrap();
 
         let cert_der = pem_to_der(&signed.cert_pem);
@@ -1274,12 +1307,12 @@ mod tests {
         );
     }
 
-    /// TC-TLS-04: a second device (different cert, different authenticated
-    /// CN) trying to assert a uid already bound to a first device is
-    /// disconnected -- the cross-device spoofing case this binding exists
-    /// to prevent.
+    /// `validateClientUid`, per certificate: a phone re-enrolled under a
+    /// new name (same device uid) connects with its new certificate, and a
+    /// certificate whose SA claims another uid than it was enrolled for is
+    /// disconnected.
     #[tokio::test]
-    async fn tc_tls_04_disconnects_on_cross_device_uid_spoofing() {
+    async fn validate_client_uid_checks_each_sa_against_its_certificate() {
         let fixture = build_fixture();
         let relay = TlsRelay::bind(
             "127.0.0.1:0".parse().unwrap(),
@@ -1289,58 +1322,52 @@ mod tests {
             ConnectedClients::new(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .with_validate_client_uid(true);
         let addr = relay.local_addr().unwrap();
         tokio::spawn(relay.run());
+        let connect = |cn: &'static str, client_uid: &'static str| {
+            let connector = client_tls_connector_for(&fixture, cn, Some(client_uid));
+            async move {
+                let tcp = TcpStream::connect(addr).await.unwrap();
+                connector
+                    .connect(ServerName::try_from("microtak-server").unwrap(), tcp)
+                    .await
+                    .unwrap()
+            }
+        };
 
-        let mut tls_a = connect_client(addr, &fixture, "device-a").await;
-        let mut tls_spoofer = connect_client(addr, &fixture, "device-spoofer").await;
+        let mut old = connect("phone", "ANDROID-1").await;
+        let mut new = connect("phone-2", "ANDROID-1").await;
+        let mut spoofer = connect("spoofer", "SPOOFER").await;
         tokio::time::sleep(StdDuration::from_millis(50)).await;
 
-        // device-a legitimately claims SHARED-UID first.
-        tls_a
-            .write_all(event_xml("SHARED-UID").as_bytes())
+        old.write_all(event_xml("ANDROID-1").as_bytes())
             .await
             .unwrap();
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
-        assert_eq!(
-            fixture.registry.find("device-a").unwrap().uid.as_deref(),
-            Some("SHARED-UID")
-        );
-
-        // device-spoofer, as a legitimate *other* connected client, is
-        // entitled to receive device-a's just-broadcast event -- drain that
-        // expected traffic before looking for a rejection signal, so it
-        // isn't mistaken for one.
-        let mut drain_buf = vec![0u8; 4096];
-        let drained = timeout(StdDuration::from_secs(2), tls_spoofer.read(&mut drain_buf))
+        let got = read_until(&mut new, |b| contains(b, "ANDROID-1")).await;
+        assert!(contains(&got, "ANDROID-1"));
+        drain_all_available(&mut spoofer).await;
+        new.write_all(event_xml("ANDROID-1").as_bytes())
             .await
-            .expect("timed out waiting for device-a's relayed event")
             .unwrap();
+        let got = read_until(&mut old, |b| contains(b, "ANDROID-1")).await;
         assert!(
-            String::from_utf8_lossy(&drain_buf[..drained]).contains("SHARED-UID"),
-            "expected to first drain device-a's legitimately relayed event"
+            contains(&got, "ANDROID-1"),
+            "the re-enrolled phone's SA is relayed"
         );
+        drain_all_available(&mut spoofer).await;
 
-        // device-spoofer, a different authenticated identity, then tries to
-        // claim the same uid -- must be disconnected.
-        let write_result = tls_spoofer
-            .write_all(event_xml("SHARED-UID").as_bytes())
-            .await;
+        let write_result = spoofer.write_all(event_xml("ANDROID-1").as_bytes()).await;
         let mut buf = [0u8; 16];
-        let read_result = timeout(StdDuration::from_secs(2), tls_spoofer.read(&mut buf)).await;
+        let read_result = timeout(StdDuration::from_secs(2), spoofer.read(&mut buf)).await;
         let rejected = write_result.is_err() || matches!(read_result, Ok(Ok(0)) | Ok(Err(_)));
+        assert!(rejected, "write={write_result:?} read={read_result:?}");
+        let relayed = timeout(StdDuration::from_millis(300), old.read(&mut buf)).await;
         assert!(
-            rejected,
-            "a device asserting another device's uid must be disconnected; write={write_result:?} read={read_result:?}"
+            relayed.is_err(),
+            "the spoofed SA isn't relayed: {relayed:?}"
         );
-
-        // The uid must still belong to device-a, not have been overwritten.
-        assert_eq!(
-            fixture.registry.find("device-a").unwrap().uid.as_deref(),
-            Some("SHARED-UID")
-        );
-        assert_eq!(fixture.registry.find("device-spoofer").unwrap().uid, None);
     }
 
     fn individual_chat_xml(sender_uid: &str, dest_uid: &str, message: &str) -> String {

@@ -236,3 +236,12 @@ Prompted by wanting real CloudTAK (`dfpc-coe/CloudTAK`) to work against MicroTAK
 ## Sources
 
 Key public references used during research: `deptofdefense/AndroidTacticalAssaultKit-CIV` (`takproto/README.md`), `tkuester/taky` (source + issue tracker), `brian7704/OpenTAKServer` (source), `markqvist/Reticulum` and `markqvist/LXMF`, `Cloud-RF/tak-server` (`CoreConfig.xml`), and third-party Marti API documentation at `docs.magktech.com`.
+
+## The official clientUid check replaces the uid binding — 2026-10-18
+
+**Problem found** (live, ATAK on a Pixel): MicroTAK bound a device uid to the first identity whose SA carried it, for good. ATAK keeps its device uid (`ANDROID-…`) across enrollments, so after re-enrolling under a new name the new identity was disconnected on every SA ("uid binding violation"). The official server has no such binding: its optional `validateClientUid` (`SubmissionService.clientUidMatchesCert`, CoreConfig `<buffer><latestSA validateClientUid>`, default `false`) compares each SA's uid with the `clientUid` recorded **for the connecting certificate** at enrollment (`signClient?clientUid=`): a mismatch deletes the certificate's subscriptions (disconnect), a certificate not on record passes, one enrolled without a `clientUid` can't match (the comparison throws) so its SAs are dropped.
+
+**Now** (`src/transport/identity.rs`, `DeviceRegistry::enrolled_client_uid`): exactly that check, on by default (`validate_client_uid`, owner's decision; officially off). The identity-level binding and its `UidBound` log events are gone (old logs still load; the events are ignored). The connection's client uid -- used for directed chat, missions and latestSA -- is, as officially, the uid of its first message with a contact endpoint (`callsignExtractorCallback`). The owner-requested no-impersonation rule stays, now keyed on enrollment: content whose uid or `p-p` producer is the enrolled `clientUid` of another identity's certificate (not blocked) is dropped.
+
+**Caveat**: a client that enrolls with one uid and reports another is disconnected with the check on -- CloudTAK enrolls with `clientUid=<username> (ETL)` (node-tak `lib/api/credentials.ts`) and reports `ANDROID-CloudTAK-<connection id>`. Officially the same happens with `validateClientUid="true"`.
+
