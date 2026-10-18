@@ -106,6 +106,8 @@ pub fn router_with(state: MissionsState) -> Router {
         )
         .route("/Marti/api/pagedmissions", get(paged_missions))
         .route("/Marti/api/missions/:name/copy", put(copy_mission))
+        .route("/Marti/api/missions/:name/send", post(send_by_name))
+        .route("/Marti/api/missions/guid/:guid/send", post(send_by_guid))
         .route(
             "/Marti/api/missions/:name/maplayers",
             post(add_map_layer_by_name).put(update_map_layer_by_name),
@@ -1821,6 +1823,108 @@ async fn remove_content_by_guid(
     remove_content_impl(&state, &caller, mission, &Params::parse(query)?)
 }
 
+// --- mission send ------------------------------------------------------------
+
+/// `sendMissionArchive`: archive the mission, add it to Enterprise Sync
+/// (`addMissionArchiveToEsync`) and send a file transfer
+/// (`getFileTransferCotMessage`) to the contacts within the caller's
+/// groups.
+fn send_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+    headers: &HeaderMap,
+) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionRead)?;
+    let contacts = params.all("contacts");
+    if contacts.is_empty() {
+        return Err(ApiError::BadRequest("empty contacts array".into()));
+    }
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("localhost");
+    let server_name = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    let archive = mission_archive(state, &mission, server_name);
+    let hash = state
+        .content
+        .put(&archive, None)
+        .map_err(|_| ApiError::Internal)?;
+    // The caller's group vector.
+    let groups: Vec<String> = caller.groups.iter().cloned().collect();
+    state
+        .resources
+        .insert(
+            crate::sync::NewResource {
+                uid: random_uuid(),
+                name: Some(mission.name.clone()),
+                download_path: Some(format!("{}.zip", mission.name)),
+                mime_type: Some("application/zip".into()),
+                visible_in: groups,
+                ..Default::default()
+            },
+            &hash,
+            archive.len() as u64,
+            now_ms(),
+        )
+        .map_err(|_| ApiError::Internal)?;
+    let url = format!("https://{host}/Marti/sync/content?hash={hash}");
+    let now = now_ms();
+    let (time, stale) = (
+        crate::cot::cot_time(now),
+        crate::cot::cot_time(now + 100_000),
+    );
+    let filename = format!("{}.zip", mission.name);
+    // As submitted (with <marti><dest/>); the server strips <marti> on
+    // the way out, so recipients get it without.
+    let xml = format!(
+        "<?xml version='1.0' encoding='UTF-8' standalone='yes'?><event version='2.0' uid='{hash}' type='b-f-t-r' time='{time}' start='{time}' stale='{stale}' how='h-e'><point lat='0.0' lon='0.0' hae='9999999.0' ce='9999999' le='9999999' /><detail><fileshare sha256='{hash}' senderUid='{hash}' name='{filename}' filename='{filename}' senderUrl='{url}' sizeInBytes='{}' senderCallsign='{}'/></detail></event>",
+        archive.len(),
+        caller.username
+    );
+    let reach = (!caller.admin).then_some(&caller.groups);
+    let reachable: Vec<String> = super::contacts::reachable(&state.clients, &state.groups, reach)
+        .into_iter()
+        .filter_map(|c| c.uid)
+        .filter(|u| contacts.contains(u))
+        .collect();
+    if !reachable.is_empty() {
+        state.notifier.send_event(reachable, xml);
+    }
+    let json = mission_json(
+        state,
+        &mission,
+        &groups_seen(caller, &mission),
+        MissionExtras::default(),
+    );
+    ok("Mission", json!([json]))
+}
+
+async fn send_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    send_impl(&state, &caller, mission, &Params::parse(query)?, &headers)
+}
+
+async fn send_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    send_impl(&state, &caller, mission, &Params::parse(query)?, &headers)
+}
+
 // --- mission copy ------------------------------------------------------------
 
 /// `copyMission` + `copyMissionContainers`.
@@ -3253,27 +3357,10 @@ layer_handlers!(contacts_by_name, contacts_by_guid, contacts_impl);
 
 /// `getMissionArchive` (`archiveMission`): the mission as a data package --
 /// the latest CoT of each uid under `cot/`, the files under `contents/`.
-async fn archive_mission(
-    State(state): State<MissionsState>,
-    Extension(identity): Extension<PeerIdentity>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-) -> ApiResult {
+/// `archiveMission`: the mission package (CoT of the uids, the files, the
+/// manifest).
+fn mission_archive(state: &MissionsState, mission: &MissionRecord, server_name: &str) -> Vec<u8> {
     use super::mission_package as mp;
-    let caller = caller(&state, &identity, &headers);
-    let mission = existing(&state, &caller, Key::Name(&name))?;
-    require(role_for(&state, &mission, &caller), Permission::MissionRead)?;
-    // `request.getServerName()`: the Host header without its port.
-    let server_name = headers
-        .get(axum::http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .map(|h| {
-            h.rsplit_once(':')
-                .map(|(host, _)| host)
-                .unwrap_or(h)
-                .to_string()
-        })
-        .unwrap_or_default();
     let mut files = Vec::new();
     for add in mission.uids() {
         if let Content::Uid(uid) = &add.content {
@@ -3330,12 +3417,35 @@ async fn archive_mission(
         (r.name(), permissions)
     });
     let manifest = mp::manifest_xml(
-        &mp::archive_parameters(&mission, &server_name),
+        &mp::archive_parameters(mission, server_name),
         &files,
         &groups,
         role,
     );
-    let zip = mp::build_archive(&manifest, &files);
+    mp::build_archive(&manifest, &files)
+}
+
+async fn archive_mission(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    require(role_for(&state, &mission, &caller), Permission::MissionRead)?;
+    // `request.getServerName()`: the Host header without its port.
+    let server_name = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| {
+            h.rsplit_once(':')
+                .map(|(host, _)| host)
+                .unwrap_or(h)
+                .to_string()
+        })
+        .unwrap_or_default();
+    let zip = mission_archive(&state, &mission, &server_name);
     let encoded: String = url_encode_form(&name);
     Ok((
         [

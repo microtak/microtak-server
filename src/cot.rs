@@ -234,7 +234,8 @@ pub fn pong_xml(now_unix_millis: i64) -> String {
     )
 }
 
-fn cot_time(unix_millis: i64) -> String {
+/// `DateUtil.toCotTime`: `yyyy-MM-dd'T'HH:mm:ss'Z'`.
+pub(crate) fn cot_time(unix_millis: i64) -> String {
     let dt = time::OffsetDateTime::from_unix_timestamp(unix_millis.div_euclid(1000))
         .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
     format!(

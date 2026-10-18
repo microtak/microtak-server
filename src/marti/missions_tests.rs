@@ -2684,3 +2684,106 @@ async fn copy_mission() {
         "Invalid Request: mission named Ops2 already exists"
     );
 }
+
+/// `sendMissionArchive`: the mission's archive goes into Enterprise Sync
+/// (`<name>.zip`, application/zip, a random UID) and a `b-f-t-r` file
+/// transfer (uid = hash, the caller as sender) goes to the contacts the
+/// caller can reach; the answer is the mission.
+#[tokio::test]
+async fn send_mission_archive() {
+    let (h, mut rx) = harness_with_hub();
+    h.create("Ops", "jz", "").await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/contents?creatorUid=ANDROID-jz",
+        "jz",
+        &[],
+        r#"{"uids":["m-1"]}"#,
+    )
+    .await;
+    h.state.latest_cot.record("m-1", r#"<event version="2.0" uid="m-1" type="a-h-G" how="h-e" time="t" start="t" stale="t"><point lat="1" lon="2" hae="0" ce="0" le="0"/><detail/></event>"#, 1);
+    h.state
+        .clients
+        .register(crate::transport::connections::ClientEndpoint {
+            remote_addr: "127.0.0.1:5001".parse().unwrap(),
+            transport: crate::transport::connections::Transport::Tls,
+            common_name: Some("reader".into()),
+            uid: Some("ANDROID-R".into()),
+            connected_at_unix: 1,
+        });
+    drain(&mut rx);
+
+    let empty = h
+        .call("POST", "/Marti/api/missions/Ops/send", "jz", &[], "")
+        .await;
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        empty.json()["message"],
+        "Invalid Request: empty contacts array"
+    );
+
+    let reply = h
+        .call(
+            "POST",
+            "/Marti/api/missions/Ops/send?contacts=ANDROID-R&contacts=ANDROID-AWAY",
+            "jz",
+            &[],
+            "",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json()["type"], "Mission");
+    assert_eq!(reply.data()[0]["name"], "Ops");
+
+    let stored: Vec<_> = h
+        .state
+        .resources
+        .all()
+        .into_iter()
+        .filter(|r| r.name.as_deref() == Some("Ops"))
+        .collect();
+    assert_eq!(stored.len(), 1);
+    let r = &stored[0];
+    assert_eq!(
+        (r.download_path.as_deref(), r.mime_type.as_deref()),
+        (Some("Ops.zip"), Some("application/zip"))
+    );
+    assert_eq!(r.uid.len(), 36);
+    let zip = h.state.content.get(&r.hash).unwrap().unwrap();
+    assert!(zip.starts_with(b"PK"));
+
+    let sent = drain(&mut rx);
+    assert_eq!(sent.len(), 1, "one file transfer");
+    assert_eq!(
+        sent[0].dest_uids.as_deref(),
+        Some(&["ANDROID-R".to_string()][..]),
+        "only reachable contacts"
+    );
+    let xml = &sent[0].xml;
+    assert!(
+        xml.contains(&format!("uid='{}' type='b-f-t-r'", r.hash)),
+        "{xml}"
+    );
+    assert!(xml.contains(&format!("<fileshare sha256='{h}' senderUid='{h}' name='Ops.zip' filename='Ops.zip' senderUrl='https://localhost/Marti/sync/content?hash={h}' sizeInBytes='{}' senderCallsign='jz'/>", zip.len(), h = r.hash)), "{xml}");
+    assert!(
+        !xml.contains("<marti>"),
+        "the server strips <marti> when forwarding"
+    );
+
+    let guid = h.get("/Marti/api/missions/Ops", "jz").await.data()[0]["guid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        h.call(
+            "POST",
+            &format!("/Marti/api/missions/guid/{guid}/send?contacts=ANDROID-R"),
+            "jz",
+            &[],
+            ""
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+}
