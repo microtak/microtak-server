@@ -9,7 +9,7 @@ TLS/TCP, certificate enrollment, the Marti mission/Data Sync API), so
 existing ATAK, iTAK, WinTAK and CloudTAK clients connect to it without
 modification. **Compatibility with the official TAK Server and its clients
 is the first rule**: every API follows the official server's source
-(`TAK-Product-Center/Server`), including its JSON shapes, status codes and
+(`TAK-Product-Center/Server`, currently 5.7-RELEASE-14), including its JSON shapes, status codes and
 URL authorization, not a re-interpretation of it.
 It's a from-scratch implementation, not a fork — built after studying the
 official TAK Server, [taky](https://github.com/tkuester/taky), and
@@ -296,6 +296,7 @@ if that's unset, and falls back to sensible defaults if neither exists.
 
 ## Documentation
 
+- [ROADMAP.md](ROADMAP.md) — what's done, what's next.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — design decisions, protocol
   notes, and how MicroTAK relates to existing TAK servers.
 - [docs/TEST-PLAN.md](docs/TEST-PLAN.md) — the test-case catalog every
