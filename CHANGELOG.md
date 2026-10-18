@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.10.0](https://github.com/microtak/microtak-server/compare/v0.9.0...v0.10.0) (2026-10-17)
+
+
+### Features
+
+* **files:** FileManagerApi list, get, head and metadata ([8adb2a8](https://github.com/microtak/microtak-server/commit/8adb2a8382753c6f0cf376b2ef71a6ba37b31eef))
+
+
+### Bug Fixes
+
+* **chart:** appVersion follows the release ([850f827](https://github.com/microtak/microtak-server/commit/850f82707c900f422420be1ec50b8b6ff474fc89))
+* **chart:** release-please bumps appVersion by jsonpath ([81e364d](https://github.com/microtak/microtak-server/commit/81e364d5bf86fd40620beb70ce403f6df235306f))
+
+
+### Documentation
+
+* code coverage in the README ([1ea13c4](https://github.com/microtak/microtak-server/commit/1ea13c4be16c3ffb0f5a05a5f0c0fbc123d6402e))
+* non-affiliation notice in the README ([f79a496](https://github.com/microtak/microtak-server/commit/f79a496d1aa7d4dd5a20fdaf2ba8a325968a5afa))
+
 ## [0.9.0](https://github.com/microtak/microtak-server/compare/v0.8.2...v0.9.0) (2026-10-17)
 
 
