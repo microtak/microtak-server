@@ -99,6 +99,10 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 pub fn router(state: Arc<EnrollmentState>) -> Router {
     Router::new()
         .route("/Marti/api/tls/config", get(get_config))
+        .route(
+            "/Marti/api/tls/profile/enrollment",
+            get(super::discovery::enrollment_profiles),
+        )
         .route("/Marti/api/tls/ca.pem", get(get_ca_pem))
         .route("/Marti/api/tls/signClient/v2", post(sign_client_v2))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
@@ -869,6 +873,26 @@ mod tests {
                 "64-character lines"
             );
         }
+    }
+
+    /// ATAK's next call after enrolling: no device profiles -> 204.
+    #[tokio::test]
+    async fn enrollment_profiles_are_none() {
+        let base_url = spawn_server(test_state()).await;
+        let r = test_client()
+            .get(format!(
+                "{base_url}/Marti/api/tls/profile/enrollment?clientUid=ANDROID-1"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+        let r = test_client()
+            .get(format!("{base_url}/Marti/api/tls/profile/enrollment"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
     }
 
     /// A successfully enrolled device is recorded in the registry.
