@@ -249,7 +249,8 @@ impl DeviceRegistry {
             .unwrap()
             .devices
             .values()
-            .find(|d| d.uid.as_deref() == Some(uid))
+            // A blocked identity can't connect, so it holds no uid.
+            .find(|d| d.uid.as_deref() == Some(uid) && !d.revoked)
             .map(|d| d.common_name.clone())
     }
 
@@ -443,7 +444,7 @@ impl DeviceRegistry {
         if let Some(owner) = state
             .devices
             .values()
-            .find(|d| d.uid.as_deref() == Some(uid) && d.common_name != common_name)
+            .find(|d| d.uid.as_deref() == Some(uid) && d.common_name != common_name && !d.revoked)
         {
             return Err(RegistryError::UidOwnedByOtherDevice {
                 uid: uid.to_string(),
@@ -592,6 +593,28 @@ mod tests {
         let rotated = registry.enroll("device-a", "cert-v2", 2_000).unwrap();
         assert_eq!(rotated.cert_pem, "cert-v2");
         assert_eq!(rotated.uid.as_deref(), Some("UID-A"));
+    }
+
+    /// A phone re-enrolled under a new name keeps its device uid: once
+    /// the old identity is blocked (it can't connect any more), it no
+    /// longer holds that uid.
+    #[test]
+    fn a_blocked_identity_releases_its_uid() {
+        let registry = DeviceRegistry::in_memory();
+        registry.enroll("old-name", "cert-1", 1_000).unwrap();
+        registry.bind_uid("old-name", "ANDROID-1").unwrap();
+        registry.enroll("new-name", "cert-2", 2_000).unwrap();
+        assert!(matches!(
+            registry.bind_uid("new-name", "ANDROID-1"),
+            Err(RegistryError::UidOwnedByOtherDevice { .. })
+        ));
+        registry.revoke("old-name").unwrap();
+        assert_eq!(registry.owner_of_uid("ANDROID-1"), None);
+        registry.bind_uid("new-name", "ANDROID-1").unwrap();
+        assert_eq!(
+            registry.owner_of_uid("ANDROID-1").as_deref(),
+            Some("new-name")
+        );
     }
 
     #[test]
