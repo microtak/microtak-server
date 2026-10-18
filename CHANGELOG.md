@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/microtak/microtak-server/compare/v0.11.0...v0.11.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* **enrollment:** tls/config declares its namespaces ([65ca424](https://github.com/microtak/microtak-server/commit/65ca42438ce5bd75f1371a0fcb516437ddd1f72a))
+
 ## [0.11.0](https://github.com/microtak/microtak-server/compare/v0.10.0...v0.11.0) (2026-10-18)
 
 
