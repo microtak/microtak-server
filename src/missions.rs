@@ -486,6 +486,9 @@ enum Event {
         creator_uid: String,
         at_ms: i64,
         change_id: u64,
+        /// An offline change's server time (`at_ms` is its own time).
+        #[serde(default)]
+        server_ms: Option<i64>,
     },
     ContentRemoved {
         guid: String,
@@ -493,6 +496,8 @@ enum Event {
         creator_uid: String,
         at_ms: i64,
         change_id: u64,
+        #[serde(default)]
+        server_ms: Option<i64>,
     },
     Subscribed {
         guid: String,
@@ -779,6 +784,7 @@ fn apply(state: &mut State, event: &Event) {
             creator_uid,
             at_ms,
             change_id,
+            server_ms,
         } => {
             if let Some(m) = state.missions.get_mut(&guid) {
                 // An item shows its latest ADD_CONTENT change, ordered by it.
@@ -796,7 +802,7 @@ fn apply(state: &mut State, event: &Event) {
                     content: Some(content),
                     creator_uid,
                     timestamp_ms: at_ms,
-                    server_time_ms: at_ms,
+                    server_time_ms: server_ms.unwrap_or(at_ms),
                     external_data: None,
                     map_layer_uid: None,
                 });
@@ -809,6 +815,7 @@ fn apply(state: &mut State, event: &Event) {
             creator_uid,
             at_ms,
             change_id,
+            server_ms,
         } => {
             if let Some(m) = state.missions.get_mut(&guid) {
                 m.contents.retain(|c| c.content != content);
@@ -820,7 +827,7 @@ fn apply(state: &mut State, event: &Event) {
                     content: Some(content),
                     creator_uid,
                     timestamp_ms: at_ms,
-                    server_time_ms: at_ms,
+                    server_time_ms: server_ms.unwrap_or(at_ms),
                     external_data: None,
                     map_layer_uid: None,
                 });
@@ -1258,6 +1265,19 @@ impl MissionStore {
         creator_uid: &str,
         now_ms: i64,
     ) -> Result<(), MissionError> {
+        self.add_content_at(guid, content, creator_uid, now_ms, None)
+    }
+
+    /// `addMissionContentAtTime`: an offline change at `at_ms`, recorded
+    /// at server time `server_ms`.
+    pub fn add_content_at(
+        &self,
+        guid: &str,
+        content: Content,
+        creator_uid: &str,
+        at_ms: i64,
+        server_ms: Option<i64>,
+    ) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, guid)?;
         let change_id = state.next_change_id;
@@ -1267,8 +1287,9 @@ impl MissionStore {
                 guid: guid.into(),
                 content,
                 creator_uid: creator_uid.into(),
-                at_ms: now_ms,
+                at_ms,
                 change_id,
+                server_ms,
             },
         )
     }
@@ -1280,6 +1301,18 @@ impl MissionStore {
         creator_uid: &str,
         now_ms: i64,
     ) -> Result<(), MissionError> {
+        self.remove_content_at(guid, content, creator_uid, now_ms, None)
+    }
+
+    /// `deleteMissionContentAtTime`.
+    pub fn remove_content_at(
+        &self,
+        guid: &str,
+        content: Content,
+        creator_uid: &str,
+        at_ms: i64,
+        server_ms: Option<i64>,
+    ) -> Result<(), MissionError> {
         let mut state = self.state.write().unwrap();
         Self::existing(&state, guid)?;
         let change_id = state.next_change_id;
@@ -1289,8 +1322,9 @@ impl MissionStore {
                 guid: guid.into(),
                 content,
                 creator_uid: creator_uid.into(),
-                at_ms: now_ms,
+                at_ms,
                 change_id,
+                server_ms,
             },
         )
     }

@@ -73,6 +73,32 @@ impl Harness {
         }
     }
 
+    async fn call_bytes(&self, method: &str, uri: &str, cn: &str, body: &[u8]) -> Reply {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::from(body.to_vec()))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(PeerIdentity(cn.to_string()));
+        let response = self.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        Reply {
+            status,
+            body,
+            content_type,
+        }
+    }
+
     async fn get(&self, uri: &str, cn: &str) -> Reply {
         self.call("GET", uri, cn, &[], "").await
     }
@@ -2786,4 +2812,178 @@ async fn send_mission_archive() {
         .status,
         StatusCode::OK
     );
+}
+
+fn package(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    crate::zip::stored(
+        &entries
+            .iter()
+            .map(|(n, b)| (n.to_string(), b.to_vec()))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn cot(uid: &str) -> String {
+    format!(
+        r#"<event version="2.0" uid="{uid}" type="a-h-G" how="h-e" time="t" start="t" stale="t"><point lat="1" lon="2" hae="0" ce="0" le="0"/><detail/></event>"#
+    )
+}
+
+/// `addMissionPackage` with `changes.json`: offline ADD/REMOVE changes
+/// replayed at their own timestamps (uids from `{ndx}/{uid}.cot`, files
+/// from `{ndx}/{name}`, log entries with `created` = the change time);
+/// `externalData` entries never take effect (its setter isn't
+/// `setTempExternalData`); other change types are skipped. Conflicts (a
+/// committed change to the same uid / file name / log entry after the
+/// offline one) → 409 with the conflicting changes; a change before the
+/// mission's creation, or an unreadable file → 500.
+#[tokio::test]
+async fn offline_changes_in_a_mission_package() {
+    let (h, mut rx) = harness_with_hub();
+    h.create("Ops", "jz", "").await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/subscription?uid=ANDROID-B",
+        "bee",
+        &[],
+        "",
+    )
+    .await;
+    drain(&mut rx);
+    let created = h
+        .state
+        .store
+        .by_name("Ops", |_| true)
+        .unwrap()
+        .create_time_ms;
+    let pad = |ms: i64| super::pad_millis(created + ms);
+    let changes = json!({ "missionChanges": [
+        { "type": "ADD_CONTENT", "contentUid": "u-off", "timestamp": pad(5_000) },
+        { "type": "ADD_CONTENT", "contentResource": { "name": "note.txt", "hash": "ignored", "mimeType": "text/plain", "keywords": ["k"] }, "timestamp": pad(6_000) },
+        { "type": "ADD_CONTENT", "logEntry": { "content": "offline log", "creatorUid": "ANDROID-A", "entryUid": "e-1" }, "timestamp": pad(7_000) },
+        { "type": "ADD_CONTENT", "externalData": { "uid": "ext-x", "name": "n", "tool": "t", "notes": "" }, "timestamp": pad(8_000) },
+        { "type": "CREATE_MISSION", "timestamp": pad(9_000) },
+    ]});
+    let pkg = package(&[
+        ("changes.json", changes.to_string().as_bytes()),
+        ("0/u-off.cot", cot("u-off").as_bytes()),
+        ("1/note.txt", b"offline note"),
+    ]);
+    let reply = h
+        .call_bytes(
+            "PUT",
+            "/Marti/api/missions/Ops/contents/missionpackage?creatorUid=ANDROID-off",
+            "jz",
+            &pkg,
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json()["type"], "MissionChange");
+    assert_eq!(reply.data().clone(), json!([]));
+
+    let m = h.get("/Marti/api/missions/Ops", "jz").await.data()[0].clone();
+    assert_eq!(m["uids"][0]["data"], "u-off");
+    assert_eq!(m["uids"][0]["timestamp"], pad(5_000), "the offline time");
+    let file = &m["contents"][0]["data"];
+    assert_eq!(
+        (
+            file["name"].as_str(),
+            file["mimeType"].as_str(),
+            file["keywords"].clone()
+        ),
+        (Some("note.txt"), Some("text/plain"), json!(["k"]))
+    );
+    assert_eq!(
+        m["externalData"],
+        json!([]),
+        "externalData entries never apply"
+    );
+    let uid_change = h
+        .get("/Marti/api/missions/Ops/changes", "jz")
+        .await
+        .data()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["contentUid"] == "u-off")
+        .unwrap()
+        .clone();
+    assert_eq!(uid_change["timestamp"], pad(5_000));
+    assert_ne!(uid_change["serverTime"], pad(5_000), "server time is now");
+    let logs = h
+        .get("/Marti/api/missions/Ops/log", "jz")
+        .await
+        .data()
+        .clone();
+    assert_eq!(logs[0]["content"], "offline log");
+    assert_eq!(logs[0]["created"], pad(7_000));
+    assert!(
+        drain(&mut rx)
+            .iter()
+            .any(|m| m.xml.contains(r#"uid="u-off""#)),
+        "the CoT reaches subscribers"
+    );
+
+    // A committed change to u-off at +5s: an offline change at +4s conflicts.
+    let conflict = json!({ "missionChanges": [{ "type": "REMOVE_CONTENT", "contentUid": "U-OFF", "timestamp": pad(4_000) }] });
+    let reply = h
+        .call_bytes(
+            "PUT",
+            "/Marti/api/missions/Ops/contents/missionpackage?creatorUid=X",
+            "jz",
+            &package(&[("changes.json", conflict.to_string().as_bytes())]),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert_eq!(reply.data()[0]["contentUid"], "U-OFF");
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops", "jz").await.data()[0]["uids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "nothing applied"
+    );
+
+    // Later than everything: the remove applies.
+    let later = json!({ "missionChanges": [{ "type": "REMOVE_CONTENT", "contentUid": "u-off", "timestamp": pad(60_000) }] });
+    assert_eq!(
+        h.call_bytes(
+            "PUT",
+            "/Marti/api/missions/Ops/contents/missionpackage?creatorUid=X",
+            "jz",
+            &package(&[("changes.json", later.to_string().as_bytes())])
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops", "jz").await.data()[0]["uids"],
+        json!([])
+    );
+
+    let before = json!({ "missionChanges": [{ "type": "ADD_CONTENT", "contentUid": "z", "timestamp": pad(-60_000) }] });
+    let reply = h
+        .call_bytes(
+            "PUT",
+            "/Marti/api/missions/Ops/contents/missionpackage?creatorUid=X",
+            "jz",
+            &package(&[("changes.json", before.to_string().as_bytes())]),
+        )
+        .await;
+    assert_eq!(
+        (reply.status, reply.data().clone()),
+        (StatusCode::INTERNAL_SERVER_ERROR, json!([])),
+        "before the mission was created"
+    );
+    let garbage = h
+        .call_bytes(
+            "PUT",
+            "/Marti/api/missions/Ops/contents/missionpackage?creatorUid=X",
+            "jz",
+            &package(&[("changes.json", b"not json")]),
+        )
+        .await;
+    assert_eq!(garbage.status, StatusCode::INTERNAL_SERVER_ERROR);
 }

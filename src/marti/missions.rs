@@ -3474,6 +3474,261 @@ fn url_encode_form(s: &str) -> String {
 /// `addMissionPackage` without `changes.json`: CoT files become uid
 /// content (and reach the live subscribers), other files become Enterprise
 /// Sync resources in the mission. Answers the (empty) conflict list.
+/// `addMissionPackage` with `changes.json`: `hasConflicts`, then each
+/// ADD/REMOVE_CONTENT change at its own time. Unknown JSON properties are
+/// ignored (the official plain `ObjectMapper` rejects them).
+fn apply_offline_changes(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: &MissionRecord,
+    creator: &str,
+    changes_json: &[u8],
+    files: &[(String, Vec<u8>)],
+) -> ApiResult {
+    let failed = || -> ApiResult {
+        Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            api_response("MissionChange", json!([])),
+        )
+            .into_response())
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(changes_json) else {
+        return failed();
+    };
+    let pending: Vec<Value> = doc
+        .get("missionChanges")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let kind = |c: &Value| {
+        c.get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let relevant = |c: &Value| matches!(kind(c).as_str(), "ADD_CONTENT" | "REMOVE_CONTENT");
+    let str_of = |c: &Value, k: &str| {
+        c.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let mut times = Vec::new();
+    for c in &pending {
+        // An unreadable timestamp fails the whole read.
+        match json_date(c.get("timestamp")) {
+            Ok(t) => times.push(t),
+            Err(_) => return failed(),
+        }
+    }
+
+    // hasConflicts
+    let committed = state.store.changes(&mission.guid, Window::ALL, false)?;
+    let mut conflicts = Vec::new();
+    for (c, ts) in pending.iter().zip(&times) {
+        if !relevant(c) {
+            continue;
+        }
+        // getTimestamp().before(...) on a missing timestamp: an exception.
+        let Some(ts) = *ts else {
+            return failed();
+        };
+        if ts < mission.create_time_ms {
+            return failed();
+        }
+        if let Some(uid) = str_of(c, "contentUid") {
+            let hit = committed.iter().any(|k| {
+                matches!(&k.content, Some(Content::Uid(u)) if u.eq_ignore_ascii_case(&uid))
+                    && ts < k.timestamp_ms
+            });
+            if hit {
+                conflicts.push(c.clone());
+            }
+        } else if let Some(resource) = c.get("contentResource").filter(|r| r.is_object()) {
+            let Some(name) = resource.get("name").and_then(|n| n.as_str()) else {
+                return failed();
+            };
+            let mut hit = false;
+            for k in &committed {
+                let Some(Content::Hash(hash)) = &k.content else {
+                    continue;
+                };
+                // findContentResource: a gone file has no name, and
+                // compareToIgnoreCase(null) throws.
+                let Some(other) = state
+                    .resources
+                    .by_hash(hash, None)
+                    .into_iter()
+                    .next()
+                    .and_then(|r| r.name)
+                else {
+                    return failed();
+                };
+                if other.eq_ignore_ascii_case(name) && ts < k.timestamp_ms {
+                    hit = true;
+                }
+            }
+            if hit {
+                conflicts.push(c.clone());
+            }
+        } else if let Some(entry) = c.get("logEntry").filter(|e| e.is_object())
+            && let Some(id) = str_of(entry, "id")
+        {
+            for existing in state.store.log_entries_for(&mission.name, Window::ALL) {
+                if existing.id != id {
+                    continue;
+                }
+                let Some(created) = existing.created_ms else {
+                    return failed();
+                };
+                if ts < created {
+                    conflicts.push(c.clone());
+                    break;
+                }
+            }
+        }
+        // externalData: `setExternalMissionData` doesn't set the temp
+        // external data the import looks at, so it never takes effect.
+    }
+    if !conflicts.is_empty() {
+        return Ok((
+            StatusCode::CONFLICT,
+            api_response("MissionChange", Value::Array(conflicts)),
+        )
+            .into_response());
+    }
+
+    let file = |path: &str| {
+        files
+            .iter()
+            .find(|(n, _)| n == path)
+            .map(|(_, b)| b.clone())
+    };
+    for (ndx, (c, ts)) in pending.iter().zip(&times).enumerate() {
+        if !relevant(c) {
+            continue;
+        }
+        let ts = ts.unwrap_or_else(now_ms);
+        let add = kind(c) == "ADD_CONTENT";
+        let now = now_ms();
+        if let Some(uid) = str_of(c, "contentUid") {
+            if add {
+                let Some(bytes) = file(&format!("{ndx}/{uid}.cot")) else {
+                    continue;
+                };
+                let xml =
+                    super::mission_package::trim_bom(&String::from_utf8_lossy(&bytes)).to_string();
+                // submitMissionCot: the event goes to the mission at the
+                // offline time and on to its subscribers.
+                state.latest_cot.record(&uid, &xml, now);
+                state.store.add_content_at(
+                    &mission.guid,
+                    Content::Uid(uid),
+                    creator,
+                    ts,
+                    Some(now),
+                )?;
+                announce_latest_changes(state, mission, 1, creator)?;
+                let start = xml.find("<event").unwrap_or(0);
+                let subscribers: Vec<String> = state
+                    .notifier
+                    .live_subscribers(&mission.guid)
+                    .into_iter()
+                    .filter(|u| u != creator)
+                    .collect();
+                if !subscribers.is_empty() {
+                    state
+                        .notifier
+                        .send_event(subscribers, xml[start..].to_string());
+                }
+            } else {
+                state.store.remove_content_at(
+                    &mission.guid,
+                    Content::Uid(uid),
+                    creator,
+                    ts,
+                    Some(now),
+                )?;
+                announce_latest_changes(state, mission, 1, creator)?;
+            }
+        } else if let Some(resource) = c.get("contentResource").filter(|r| r.is_object()) {
+            let name = resource
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            let mut hash = resource
+                .get("hash")
+                .and_then(|h| h.as_str())
+                .unwrap_or("")
+                .to_string();
+            if add {
+                if let Some(bytes) = file(&format!("{ndx}/{name}")) {
+                    // addToEnterpriseSync at the change's time.
+                    hash = state
+                        .content
+                        .put(&bytes, None)
+                        .map_err(|_| ApiError::Internal)?;
+                    state
+                        .resources
+                        .insert(
+                            crate::sync::NewResource {
+                                uid: random_uuid(),
+                                name: Some(name.clone()),
+                                download_path: Some(name.clone()),
+                                mime_type: resource
+                                    .get("mimeType")
+                                    .and_then(|m| m.as_str())
+                                    .map(String::from),
+                                keywords: strings(resource.get("keywords")),
+                                visible_in: mission.groups.iter().cloned().collect(),
+                                ..Default::default()
+                            },
+                            &hash,
+                            bytes.len() as u64,
+                            ts,
+                        )
+                        .map_err(|_| ApiError::Internal)?;
+                }
+                // getCachedResourcesByHash: an unknown hash isn't added.
+                if !state.resources.by_hash(&hash, None).is_empty() {
+                    state.store.add_content_at(
+                        &mission.guid,
+                        Content::Hash(hash),
+                        creator,
+                        ts,
+                        Some(now),
+                    )?;
+                    announce_latest_changes(state, mission, 1, creator)?;
+                }
+            } else {
+                state.store.remove_content_at(
+                    &mission.guid,
+                    Content::Hash(hash),
+                    creator,
+                    ts,
+                    Some(now),
+                )?;
+                announce_latest_changes(state, mission, 1, creator)?;
+            }
+        } else if let Some(entry) = c.get("logEntry").filter(|e| e.is_object()) {
+            let id = str_of(entry, "id");
+            if add {
+                let mut record = log_entry_from(entry, id.unwrap_or_else(random_uuid), now)?;
+                if !record.mission_names.contains(&mission.name) {
+                    record.mission_names.push(mission.name.clone());
+                }
+                record.created_ms = Some(ts);
+                let saved = state.store.save_log_entry(record)?;
+                announce_log(state, caller, &saved);
+            } else if let Some(id) = id {
+                state.store.delete_log_entry(&id)?;
+            }
+        }
+    }
+    ok("MissionChange", json!([]))
+}
+
 async fn add_mission_package(
     State(state): State<MissionsState>,
     Extension(identity): Extension<PeerIdentity>,
@@ -3497,13 +3752,9 @@ async fn add_mission_package(
         )
             .into_response());
     };
-    if files.iter().any(|(n, _)| n == "changes.json") {
-        tracing::warn!(mission = %mission.name, "mission package with offline changes (changes.json) not supported yet");
-        return Ok((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            api_response("MissionChange", json!([])),
-        )
-            .into_response());
+    if let Some((_, changes)) = files.iter().find(|(n, _)| n == "changes.json") {
+        let changes = changes.clone();
+        return apply_offline_changes(&state, &caller, &mission, &creator, &changes, &files);
     }
     for (filename, bytes) in files {
         if filename.to_lowercase().contains("manifest.xml") {
