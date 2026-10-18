@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.3](https://github.com/microtak/microtak-server/compare/v0.11.2...v0.11.3) (2026-10-18)
+
+
+### Bug Fixes
+
+* **profiles:** enrollment and connection device profiles answer 204 ([31b2cfa](https://github.com/microtak/microtak-server/commit/31b2cfaf8567f0f49c67b90cd67dbcc6625d9b5e))
+
 ## [0.11.2](https://github.com/microtak/microtak-server/compare/v0.11.1...v0.11.2) (2026-10-18)
 
 
