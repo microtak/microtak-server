@@ -530,9 +530,24 @@ fn shaped_success_response(headers: &HeaderMap, cert_pem: &str, ca_cert_pem: &st
             .into_response()
     } else if accept.is_empty() || accept.contains("application/json") || accept.contains("*/*") {
         (StatusCode::OK, Json(body)).into_response()
-    } else {
+    } else if accept.to_ascii_lowercase().contains("application/xml") {
+        // signClientCertV2's XML branch (ATAK): `Util.certToPEM(x, false)`
+        // is the base64 with a newline after every 64 characters.
+        let wrap = |pem: &str| {
+            let b64: String = strip_pem_armor(pem).split('\n').collect();
+            let mut out = String::new();
+            for (i, c) in b64.chars().enumerate() {
+                out.push(c);
+                if (i + 1) % 64 == 0 {
+                    out.push('\n');
+                }
+            }
+            out
+        };
         let xml = format!(
-            "<enrollmentResponse><signedCert><![CDATA[{bare_cert}]]></signedCert><ca0><![CDATA[{bare_ca}]]></ca0></enrollmentResponse>"
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><enrollment><signedCert>{}</signedCert><ca>{}</ca></enrollment>",
+            wrap(cert_pem),
+            wrap(ca_cert_pem)
         );
         (
             StatusCode::OK,
@@ -540,6 +555,9 @@ fn shaped_success_response(headers: &HeaderMap, cert_pem: &str, ca_cert_pem: &st
             xml,
         )
             .into_response()
+    } else {
+        // Any other Accept: 400, as officially.
+        StatusCode::BAD_REQUEST.into_response()
     }
 }
 
@@ -811,6 +829,46 @@ mod tests {
         // Still a JSON *body*, just served with a text/plain Content-Type.
         let parsed: serde_json::Value = serde_json::from_str(&body_text).unwrap();
         assert!(!parsed["signedCert"].as_str().unwrap().is_empty());
+    }
+
+    /// `signClientCertV2` with `Accept: application/xml` (ATAK): the
+    /// official `<enrollment>` document, certificates as `Util.certToPEM(x,
+    /// false)` -- base64 wrapped every 64 characters, no armor.
+    #[tokio::test]
+    async fn signclient_v2_xml_response_is_the_official_enrollment_document() {
+        let state = test_state();
+        let base_url = spawn_server(state).await;
+        let (csr_pem, _key) = build_csr("device-atak").unwrap();
+        let response = test_client()
+            .post(format!(
+                "{base_url}/Marti/api/tls/signClient/v2?clientUid=ANDROID-1&version=3"
+            ))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .header(ACCEPT, "application/xml")
+            .body(csr_pem)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/xml"
+        );
+        let body = response.text().await.unwrap();
+        let rest = body
+            .strip_prefix("<?xml version=\"1.0\" encoding=\"UTF-8\"?><enrollment><signedCert>")
+            .expect(&body);
+        let (cert, rest) = rest.split_once("</signedCert><ca>").expect(&body);
+        let (ca, rest) = rest.split_once("</ca>").expect(&body);
+        assert_eq!(rest, "</enrollment>");
+        for b64 in [cert, ca] {
+            assert!(!b64.contains("BEGIN"), "no armor");
+            let lines: Vec<&str> = b64.split('\n').filter(|l| !l.is_empty()).collect();
+            assert!(
+                lines[..lines.len() - 1].iter().all(|l| l.len() == 64),
+                "64-character lines"
+            );
+        }
     }
 
     /// A successfully enrolled device is recorded in the registry.
