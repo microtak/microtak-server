@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.13.0](https://github.com/microtak/microtak-server/compare/v0.12.0...v0.13.0) (2026-10-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* **streaming:** with the default, a client that enrolls with another clientUid than its SA uid is disconnected, e.g. CloudTAK (node-tak enrolls as '<username> (ETL)'). Set validate_client_uid = false for it.
+
+### Features
+
+* **streaming:** the official clientUid check replaces the uid binding ([80bcccc](https://github.com/microtak/microtak-server/commit/80bcccc57bb657060501896b44a4695010e76c8a))
+
 ## [0.12.0](https://github.com/microtak/microtak-server/compare/v0.11.4...v0.12.0) (2026-10-18)
 
 
