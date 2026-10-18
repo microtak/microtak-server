@@ -68,6 +68,7 @@ pub mod mission_package;
 pub mod mission_token;
 pub mod missions;
 pub mod oauth;
+pub mod security;
 pub mod subscriptions;
 
 /// The authenticated identity of an mTLS-connected caller — the connecting

@@ -479,6 +479,16 @@ impl App {
         }))
         .merge(admin::router(admin_state))
         .merge(discovery::router())
+        .merge(crate::marti::security::router(
+            crate::marti::security::SecurityState {
+                non_secure_ports: config
+                    .plain_tcp_enabled
+                    .then_some(config.plain_tcp_addr.port())
+                    .into_iter()
+                    .chain(config.metrics_addr.map(|a| a.port()))
+                    .collect(),
+            },
+        ))
         .merge(contacts::router(contacts::ContactsState {
             clients: clients.clone(),
             latest_cot: Arc::clone(&latest_cot),
