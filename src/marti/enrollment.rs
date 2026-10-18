@@ -115,10 +115,14 @@ pub fn router(state: Arc<EnrollmentState>) -> Router {
 /// this same path instead, before this schema had been confirmed from an
 /// authoritative source; see [`get_ca_pem`] for where that moved).
 async fn get_config() -> impl IntoResponse {
-    const NAME_ENTRIES_XML: &str = "<ns2:certificateConfig><nameEntries>\
-        <nameEntry name=\"O\" value=\"MicroTAK\"/>\
-        <nameEntry name=\"OU\" value=\"MicroTAK\"/>\
-        </nameEntries></ns2:certificateConfig>";
+    // As JAXB writes it (CertManagerApi.getConfig): the root QName is in
+    // `com.bbn.marti.config`, the CoreConfig types in
+    // `http://bbn.com/marti/xml/config`. Both namespaces must be declared:
+    // ATAK rejects the document otherwise and never sends its CSR.
+    const NAME_ENTRIES_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <ns2:certificateConfig xmlns=\"http://bbn.com/marti/xml/config\" xmlns:ns2=\"com.bbn.marti.config\">\
+        <nameEntries><nameEntry name=\"O\" value=\"MicroTAK\"/><nameEntry name=\"OU\" value=\"MicroTAK\"/></nameEntries>\
+        </ns2:certificateConfig>";
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/xml")],
@@ -624,9 +628,24 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), 200);
         let body = response.text().await.unwrap();
-        assert!(body.contains("certificateConfig"));
-        assert!(body.contains("name=\"O\""));
-        assert!(body.contains("name=\"OU\""));
+        // CertManagerApi.getConfig: JAXB, root QName in com.bbn.marti.config,
+        // the CoreConfig types in http://bbn.com/marti/xml/config.
+        assert_eq!(
+            body,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+             <ns2:certificateConfig xmlns=\"http://bbn.com/marti/xml/config\" xmlns:ns2=\"com.bbn.marti.config\">\
+             <nameEntries><nameEntry name=\"O\" value=\"MicroTAK\"/><nameEntry name=\"OU\" value=\"MicroTAK\"/></nameEntries>\
+             </ns2:certificateConfig>"
+        );
+        // Namespace-well-formed: every prefix is bound (ATAK's parser is strict).
+        let mut reader = quick_xml::NsReader::from_str(&body);
+        loop {
+            match reader.read_resolved_event().unwrap() {
+                (quick_xml::name::ResolveResult::Unknown(p), _) => panic!("unbound prefix {p:?}"),
+                (_, quick_xml::events::Event::Eof) => break,
+                _ => {}
+            }
+        }
     }
 
     /// MicroTAK's own CA-distribution endpoint: no auth required, returns
