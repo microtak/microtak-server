@@ -2998,3 +2998,153 @@ async fn e2e_certadmin_is_admin_only() {
         assert_eq!(status, 403, "{path}");
     }
 }
+
+/// Device profiles end to end, as ATAK meets them: the admin builds an
+/// enrollment and a connection profile for group Red; a phone enrolling
+/// with an invite token gets the enrollment one right after enrolling (same
+/// Basic credentials, enrollment port) and the connection one over mTLS;
+/// the admin API stays the admin's.
+#[tokio::test]
+async fn e2e_device_profiles_reach_the_enrolling_phone() {
+    let config = AppConfig {
+        admin_common_name: Some("admin".to_string()),
+        enrollment_mode: AppConfig::default().enrollment_mode,
+        ..test_config()
+    };
+    let app = App::bind(config).await.unwrap();
+    let groups = app.groups.clone();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    let bootstrap = std::fs::read_to_string(app.bootstrap_token_path().unwrap()).unwrap();
+    tokio::spawn(app.run());
+    groups.create("Red", None, 0).unwrap();
+    groups
+        .set_member(
+            "Red",
+            "phone-1",
+            Some(microtak_server::groups::Membership::Both),
+        )
+        .unwrap();
+    let enroll_url = format!("https://{enrollment_addr}");
+    let api = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
+
+    let (csr, admin_key) = pki::build_csr("admin").unwrap();
+    let body: serde_json::Value = enrollment_client()
+        .post(format!(
+            "{enroll_url}/Marti/api/tls/signClient/v2?token={}",
+            bootstrap.trim()
+        ))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(csr)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let admin_cert = wrap_pem(body["signedCert"].as_str().unwrap());
+    let admin = mtls_reqwest_client(&ca_cert_pem, &admin_cert, admin_key, marti_api_addr);
+
+    for (name, kind, file) in [
+        ("Welcome", "Enrollment", "welcome.pref"),
+        ("Daily", "Connection", "daily.pref"),
+    ] {
+        let created = admin
+            .post(format!("{api}/Marti/api/device/profile/{name}?group=Red"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), 201);
+        let added = admin
+            .put(format!(
+                "{api}/Marti/api/device/profile/{name}/file?filename={file}"
+            ))
+            .body("<preferences/>")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(added.status(), 200);
+        let profile: serde_json::Value = admin
+            .get(format!("{api}/Marti/api/device/profile/{name}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mut profile = profile["data"].clone();
+        profile["type"] = serde_json::json!(kind);
+        let updated = admin
+            .put(format!("{api}/Marti/api/device/profile/{name}"))
+            .json(&profile)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), 200);
+    }
+
+    let minted: serde_json::Value = admin
+        .post(format!("{api}/Marti/api/admin/enrollmentTokens"))
+        .json(&serde_json::json!({ "commonName": "phone-1" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = minted["token"].as_str().unwrap().to_string();
+    let (csr, phone_key) = pki::build_csr("phone-1").unwrap();
+    let enrolled: serde_json::Value = enrollment_client()
+        .post(format!("{enroll_url}/Marti/api/tls/signClient/v2"))
+        .basic_auth("phone-1", Some(&token))
+        .header(CONTENT_TYPE, "text/plain")
+        .body(csr)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let phone_cert = wrap_pem(enrolled["signedCert"].as_str().unwrap());
+
+    let at_enrollment = enrollment_client()
+        .get(format!(
+            "{enroll_url}/Marti/api/tls/profile/enrollment?clientUid=ANDROID-1"
+        ))
+        .basic_auth("phone-1", Some(&token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(at_enrollment.status(), 200);
+    let package = at_enrollment.bytes().await.unwrap();
+    assert!(
+        microtak_server::marti::mission_package::extract(&package)
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name == "file0/welcome.pref")
+    );
+
+    let phone = mtls_reqwest_client(&ca_cert_pem, &phone_cert, phone_key, marti_api_addr);
+    let on_connect = phone
+        .get(format!(
+            "{api}/Marti/api/device/profile/connection?syncSecago=-1&clientUid=ANDROID-1"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(on_connect.status(), 200);
+    let package = on_connect.bytes().await.unwrap();
+    assert!(
+        microtak_server::marti::mission_package::extract(&package)
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name == "file0/daily.pref")
+    );
+    let listing = phone
+        .get(format!("{api}/Marti/api/device/profile"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listing.status(), 403, "the admin API is the admin's");
+}

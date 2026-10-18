@@ -26,7 +26,8 @@
 //!   connection registry [`client_endpoints`] uses.
 //! - [`groups`]: `GET /Marti/api/groups/all`, a real, honestly-empty stub.
 //!
-//! Not yet implemented: real groups/channels, device profiles.
+//! - [`profiles`]: device profiles (`/Marti/api/device/profile/*`,
+//!   `/Marti/api/tls/profile/enrollment`).
 //!
 //! [`MtlsHttpServer`] injects the connecting cert's Common Name into every
 //! request as a [`PeerIdentity`] extension — [`missions`] uses this to
@@ -68,6 +69,7 @@ pub mod mission_package;
 pub mod mission_token;
 pub mod missions;
 pub mod oauth;
+pub mod profiles;
 pub mod security;
 pub mod subscriptions;
 

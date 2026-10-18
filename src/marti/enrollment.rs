@@ -99,10 +99,6 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 pub fn router(state: Arc<EnrollmentState>) -> Router {
     Router::new()
         .route("/Marti/api/tls/config", get(get_config))
-        .route(
-            "/Marti/api/tls/profile/enrollment",
-            get(super::discovery::enrollment_profiles),
-        )
         .route("/Marti/api/tls/ca.pem", get(get_ca_pem))
         .route("/Marti/api/tls/signClient/v2", post(sign_client_v2))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
@@ -452,7 +448,7 @@ fn already_enrolled(common_name: &str) -> Response {
 /// malformed value -- all treated as "no credentials presented," not an
 /// error, since Basic Auth here is optional (an alternative to the invite
 /// token, not a requirement).
-fn basic_auth_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+pub(crate) fn basic_auth_credentials(headers: &HeaderMap) -> Option<(String, String)> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let encoded = value.strip_prefix("Basic ")?;
     let decoded = base64::engine::general_purpose::STANDARD
@@ -873,26 +869,6 @@ mod tests {
                 "64-character lines"
             );
         }
-    }
-
-    /// ATAK's next call after enrolling: no device profiles -> 204.
-    #[tokio::test]
-    async fn enrollment_profiles_are_none() {
-        let base_url = spawn_server(test_state()).await;
-        let r = test_client()
-            .get(format!(
-                "{base_url}/Marti/api/tls/profile/enrollment?clientUid=ANDROID-1"
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 204);
-        let r = test_client()
-            .get(format!("{base_url}/Marti/api/tls/profile/enrollment"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 400);
     }
 
     /// A successfully enrolled device is recorded in the registry.

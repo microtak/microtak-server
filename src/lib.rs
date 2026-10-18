@@ -23,6 +23,7 @@ pub mod marti;
 pub mod metrics;
 pub mod missions;
 pub mod pki;
+pub mod profiles;
 pub mod ratelimit;
 pub mod registry;
 pub mod servernames;

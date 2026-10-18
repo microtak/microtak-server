@@ -32,6 +32,8 @@ This file lists direction, not dates.
 - The latest situational awareness of every reachable client, sent to a
   client right after it connects (`latestSA`, on by default as
   officially), on mTLS and plain TCP.
+- Device profiles: the official profile admin API and delivery at
+  enrollment, on connect, per tool and by sending (no profile directories).
 - Persistence and backups, Docker images and Helm chart (amd64 and arm64),
   release binaries.
 - CI: unit, end-to-end and black-box suites (the black-box suite drives the
@@ -52,7 +54,8 @@ All three are admin-only on the official server too.
 
 ## Then
 
-- Device profiles and the WebSocket API web clients use.
+- The WebSocket API (`/takproto/1`) the official WebTAK uses. No other
+  client in use needs it: ATAK, iTAK, OmniTAK and CloudTAK stream over TLS.
 - Load testing: a simulator that keeps a configurable number of TAK
   clients (100 by default) connected and active against a deployment, to
   see how MicroTAK holds up under constant use.

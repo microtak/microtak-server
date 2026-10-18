@@ -255,6 +255,22 @@ everyone sees everyone.
   and support the official read-only subscriber role
   (`defaultRole: "MISSION_READONLY_SUBSCRIBER"`).
 
+### Device profiles
+
+Push settings and files to devices, as the official TAK Server's device
+profiles do: a profile is a named set of files (ATAK `.pref` files, data
+packages, …) for one or more groups. Devices fetch it as a mission package
+right after enrolling (`Enrollment` profiles), every time they connect
+(`Connection`), or when a tool asks (`Tool`); the admin can also send one to
+chosen devices. A new profile has no groups and reaches nobody until it gets
+some (or all groups).
+
+The admin manages them with the official admin API
+(`/Marti/api/device/profile…`: create with `POST …/{name}?group=…`, add
+files with `PUT …/{name}/file?filename=…`, set type, groups and `active` with
+`PUT …/{name}`). Profile directories (files served from folders on the
+server) aren't supported.
+
 ### TLS certificates
 
 - **Server names**: the server certificate names `server_common_name`

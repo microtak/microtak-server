@@ -235,6 +235,8 @@ pub enum AppError {
     OAuthKey(#[from] oauth::JwtSignerError),
     #[error("resource store error: {0}")]
     Resources(#[from] SyncError),
+    #[error("device profile store setup failed: {0}")]
+    Profiles(#[from] crate::profiles::ProfileError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -314,6 +316,10 @@ impl App {
         )?);
         let enrollment_tokens = Arc::new(EnrollmentTokenStore::load_or_create(
             config.data_dir.join("enrollment_tokens.log"),
+        )?);
+        let profiles = Arc::new(crate::profiles::ProfileStore::load_or_create(
+            config.data_dir.join("device-profiles.log"),
+            config.data_dir.join("profile-content"),
         )?);
         let users = Arc::new(UserStore::load_or_create(
             config.data_dir.join("users.log"),
@@ -412,7 +418,17 @@ impl App {
             groups: Arc::clone(&groups),
         });
 
+        let enrollment_profiles = crate::marti::profiles::EnrollmentProfilesState {
+            store: Arc::clone(&profiles),
+            groups: Arc::clone(&groups),
+            users: Arc::clone(&users),
+            tokens: Arc::clone(&enrollment_tokens),
+            limiter: Arc::clone(&limiter),
+        };
         let plain_router = enrollment::router(enrollment_state)
+            .merge(crate::marti::profiles::enrollment_router(
+                enrollment_profiles,
+            ))
             .merge(oauth::router(
                 Arc::clone(&users),
                 limiter,
@@ -483,6 +499,14 @@ impl App {
             latest_cot: Arc::clone(&latest_cot),
         }))
         .merge(admin::router(admin_state))
+        .merge(crate::marti::profiles::router(
+            crate::marti::profiles::ProfilesState {
+                store: profiles,
+                groups: Arc::clone(&groups),
+                notifier: Arc::clone(&mission_notifier),
+                max_upload_bytes: config.max_upload_bytes,
+            },
+        ))
         .merge(discovery::router())
         .merge(crate::marti::security::router(
             crate::marti::security::SecurityState {

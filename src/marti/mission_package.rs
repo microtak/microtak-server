@@ -65,7 +65,13 @@ pub fn manifest_xml(
             attr("value", value.as_deref())
         ));
     }
-    xml.push_str("    </Configuration>\n    <Contents>\n");
+    xml.push_str("    </Configuration>\n");
+    // JAXB writes an empty list as an empty element.
+    xml.push_str(if files.is_empty() {
+        "    <Contents/>\n"
+    } else {
+        "    <Contents>\n"
+    });
     for file in files {
         let mut attrs = format!(r#" zipEntry="{}" ignore="false""#, escape(&file.zip_entry));
         for (k, v) in &file.attributes {
@@ -79,7 +85,9 @@ pub fn manifest_xml(
             None => xml.push_str(&format!("        <Content{attrs}/>\n")),
         }
     }
-    xml.push_str("    </Contents>\n");
+    if !files.is_empty() {
+        xml.push_str("    </Contents>\n");
+    }
     if !groups.is_empty() {
         xml.push_str("    <Groups>\n");
         for g in groups {

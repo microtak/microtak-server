@@ -37,35 +37,6 @@ pub fn router() -> Router {
         .route("/Marti/api/version", get(version))
         .route("/Marti/api/version/config", get(version_config))
         .route("/files/api/config", get(files_config))
-        .route(
-            "/Marti/api/device/profile/connection",
-            get(connection_profiles),
-        )
-}
-
-/// `ProfileAPI.getEnrollmentTimeProfiles` / `getConnectionTimeProfiles`
-/// with no device profiles configured: 204; a missing required parameter
-/// is Spring's 400. ATAK asks for both (after enrolling, after connecting).
-fn no_profiles(raw: Option<&str>, required: &[&str]) -> axum::http::StatusCode {
-    let pairs: Vec<(String, String)> =
-        serde_urlencoded::from_str(raw.unwrap_or("")).unwrap_or_default();
-    if required.iter().all(|r| pairs.iter().any(|(k, _)| k == r)) {
-        axum::http::StatusCode::NO_CONTENT
-    } else {
-        axum::http::StatusCode::BAD_REQUEST
-    }
-}
-
-pub(crate) async fn enrollment_profiles(
-    axum::extract::RawQuery(raw): axum::extract::RawQuery,
-) -> axum::http::StatusCode {
-    no_profiles(raw.as_deref(), &["clientUid"])
-}
-
-async fn connection_profiles(
-    axum::extract::RawQuery(raw): axum::extract::RawQuery,
-) -> axum::http::StatusCode {
-    no_profiles(raw.as_deref(), &["syncSecago", "clientUid"])
 }
 
 async fn version() -> impl IntoResponse {
@@ -94,28 +65,6 @@ mod tests {
         app.oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await
             .unwrap()
-    }
-
-    #[tokio::test]
-    async fn device_profiles_are_none() {
-        assert_eq!(
-            get(
-                router(),
-                "/Marti/api/device/profile/connection?syncSecago=-1&clientUid=ANDROID-1"
-            )
-            .await
-            .status(),
-            StatusCode::NO_CONTENT
-        );
-        assert_eq!(
-            get(
-                router(),
-                "/Marti/api/device/profile/connection?clientUid=ANDROID-1"
-            )
-            .await
-            .status(),
-            StatusCode::BAD_REQUEST
-        );
     }
 
     #[tokio::test]

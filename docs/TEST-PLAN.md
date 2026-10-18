@@ -332,3 +332,17 @@ Before this, `DeviceRegistry::revoke` existed but nothing called it, revoking a 
 | TC-REVOKE-05 | `e2e_certadmin_lists_certificates_in_the_official_shape`, `e2e_certadmin_is_admin_only` -- official `CertManagerAdminApi`: envelope, `TakCert` fields, COT dates, active/replaced, unknown hash = 500 |
 | TC-REVOKE-06 | `e2e_certadmin_revokes_and_deletes_by_id` (official `revoke/{ids}`, `download/{ids}` zip, `delete/{ids}`) |
 | TC-REVOKE-07 | `e2e_revoking_a_user_account_revokes_its_certificate` |
+
+## 25. Device profiles (2026-10-18)
+
+The official `ProfileAPI` / `ProfileAdminAPI` (`com.bbn.marti.device.profile`, TAK Server 5.7-RELEASE-14), on `src/profiles.rs` + `src/marti/profiles.rs`. Group matching as the official `GROUP_CLAUSE` (either direction; `APPLY_TO_ALL_GROUPS`); creation defaults from `V26__device_profile.sql`; packages as `createProfileMissionPackage` (`file<N>/<name>`, `onReceiveImport`/`onReceiveDelete`); `updated` as epoch millis (plain `ObjectMapper`). Profile directories are not implemented (none configured, `directories` lists none).
+
+| ID | Case | Type | Test |
+|---|---|---|---|
+| TC-PROFILE-01 | Store: defaults, group reach, enrollment/connect/tool selection, `syncSecago`, persistence, content kept until the last file goes | [COMPAT] | `profiles::*` |
+| TC-PROFILE-02 | Admin API: create (201/200), list/get in the official envelope and shape, files (`id`/`name`), file download/delete, delete by id, update without `type` → 500 | [COMPAT] | `marti::profiles::tests::the_admin_api_*`, `updating_without_a_type_is_the_official_500` |
+| TC-PROFILE-03 | Delivery: connection profiles of the caller's groups as a mission package, 204 otherwise, 400 without `clientUid`/`syncSecago`; tool profiles; named package stable (`ProfileMissionPackage-<id>`) and group-checked | [COMPAT] | `devices_get_connection_profiles_*`, `tool_profiles_*`, `the_named_mission_package_*` |
+| TC-PROFILE-04 | Enrollment port: Basic auth (password account, or the invite token that enrolled the name), 401 otherwise, rate-limited | [COMPAT] | `enrollment_profiles_go_to_the_user_that_just_enrolled`, `e2e_device_profiles_reach_the_enrolling_phone` |
+| TC-PROFILE-05 | Send: `b-f-t-r` file transfer from "TAK Server" to the chosen uids, hash of the served package | [COMPAT] | `sending_a_profile_is_a_file_transfer_to_the_chosen_devices` |
+| TC-PROFILE-06 | Admin-only except the device calls (`security-context.xml`) | [COMPAT] | `only_the_device_calls_are_open_to_non_admins`, `e2e_device_profiles_reach_the_enrolling_phone` |
+
