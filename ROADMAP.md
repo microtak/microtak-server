@@ -29,9 +29,9 @@ This file lists direction, not dates.
   import.
 - `/Marti/api/contacts/all`, `/Marti/api/subscriptions/all`,
   `/Marti/api/security/isSecure`.
-- The latest situational awareness of every reachable client, sent to an
-  mTLS client right after it connects (`latestSA`, on by default as
-  officially). Plain TCP clients don't take part yet.
+- The latest situational awareness of every reachable client, sent to a
+  client right after it connects (`latestSA`, on by default as
+  officially), on mTLS and plain TCP.
 - Persistence and backups, Docker images and Helm chart (amd64 and arm64),
   release binaries.
 - CI: unit, end-to-end and black-box suites (the black-box suite drives the

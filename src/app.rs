@@ -525,7 +525,8 @@ impl App {
                 TcpRelay::bind(config.plain_tcp_addr, hub.clone(), clients.clone())
                     .await?
                     .with_groups(Arc::clone(&groups))
-                    .with_admission(admission.clone()),
+                    .with_admission(admission.clone())
+                    .with_latest_sa(),
             )
         } else {
             None

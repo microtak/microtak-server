@@ -31,6 +31,7 @@ pub struct TcpRelay {
     clients: ConnectedClients,
     groups: Arc<GroupStore>,
     admission: Admission,
+    latest_sa: bool,
 }
 
 impl TcpRelay {
@@ -46,6 +47,7 @@ impl TcpRelay {
             clients,
             groups: Arc::new(GroupStore::in_memory()),
             admission: Admission::default(),
+            latest_sa: false,
         })
     }
 
@@ -64,6 +66,12 @@ impl TcpRelay {
         self
     }
 
+    /// `<buffer><latestSA enable="true"/>`: see `TlsRelay::with_latest_sa`.
+    pub fn with_latest_sa(mut self) -> Self {
+        self.latest_sa = true;
+        self
+    }
+
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
     }
@@ -78,11 +86,12 @@ impl TcpRelay {
             let rx = self.hub.subscribe();
             let clients = self.clients.clone();
             let groups = Arc::clone(&self.groups);
+            let latest_sa = self.latest_sa;
             tokio::spawn(async move {
                 let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
                     return;
                 };
-                handle_client(stream, peer, tx, rx, clients, groups).await;
+                handle_client(stream, peer, tx, rx, clients, groups, latest_sa).await;
             });
         }
     }
@@ -95,6 +104,7 @@ async fn handle_client(
     mut rx: broadcast::Receiver<Outbound>,
     clients: ConnectedClients,
     groups: Arc<GroupStore>,
+    latest_sa: bool,
 ) {
     info!(%peer, "client connected");
     clients.register(ClientEndpoint {
@@ -114,6 +124,23 @@ async fn handle_client(
     let mut decoder = StreamDecoder::new();
     let mut read_buf = [0u8; 4096];
     let (mut reader, mut writer) = stream.split();
+    // The connection's client uid: from its first message with a contact
+    // endpoint (`callsignExtractorCallback`).
+    let mut client_uid: Option<String> = None;
+
+    // latestSA (`sendLatestReachableSA`): anonymous both ways, so every
+    // connected client whose IN groups include `__ANON__`.
+    if latest_sa {
+        let my_out = groups.active_groups(None, Direction::Out);
+        for (endpoint, xml) in clients.latest_sas_except(peer) {
+            let their_in = groups.active_groups(endpoint.common_name.as_deref(), Direction::In);
+            if their_in.iter().any(|group| my_out.contains(group))
+                && writer.write_all(xml.as_bytes()).await.is_err()
+            {
+                return;
+            }
+        }
+    }
 
     loop {
         tokio::select! {
@@ -156,10 +183,19 @@ async fn handle_client(
                                     // broadcast channel (no subscribers at
                                     // all) is not an error for the sender.
                                     crate::metrics::inc(&crate::metrics::COUNTERS.cot_events_tcp);
-                                    let xml = crate::cot::strip_marti(&xml).into_owned();
+                                    let relayed: Arc<str> = crate::cot::strip_marti(&xml).into_owned().into();
+                                    if client_uid.is_none()
+                                        && event.detail.as_ref().and_then(|d| d.contact.as_ref()).is_some_and(|c| c.endpoint.is_some())
+                                    {
+                                        client_uid = Some(event.uid.clone());
+                                        clients.set_uid(peer, event.uid.clone());
+                                    }
+                                    if event.is_situational_awareness() && client_uid.as_deref() == Some(event.uid.as_str()) {
+                                        clients.set_latest_sa(peer, Arc::clone(&relayed));
+                                    }
                                     let _ = tx.send(Outbound {
                                         sender: peer,
-                                        xml: xml.into(),
+                                        xml: relayed,
                                         dest_uids,
                                         groups: Arc::new(groups.active_groups(None, Direction::In)),
                                         origin: crate::transport::hub::Origin::Client,
@@ -297,6 +333,54 @@ mod tests {
         assert!(
             echoed.is_err(),
             "sender should not receive its own broadcast event back"
+        );
+    }
+
+    /// latestSA on plain TCP too (the official server does it for every
+    /// subscription): a new client first gets the latest SA of each other
+    /// connected client -- the SA with that connection's own uid, the one
+    /// its first contact-endpoint message set.
+    #[tokio::test]
+    async fn new_clients_get_the_latest_sa_of_connected_clients() {
+        let sa = |uid: &str, callsign: &str| {
+            format!(
+                r#"<event version="2.0" uid="{uid}" type="a-f-G-U-C" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.25" lon="10.4" hae="10.0" ce="5.0" le="3.0"/><detail><contact callsign="{callsign}" endpoint="*:-1:stcp"/></detail></event>"#
+            )
+        };
+        let relay = TcpRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            RelayHub::new(),
+            ConnectedClients::new(),
+        )
+        .await
+        .unwrap()
+        .with_latest_sa();
+        let addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+
+        let mut a = TcpStream::connect(addr).await.unwrap();
+        a.write_all(sa("UID-A", "first").as_bytes()).await.unwrap();
+        a.write_all(sa("UID-A", "latest").as_bytes()).await.unwrap();
+        // Another uid's SA (a relayed marker) isn't A's own.
+        a.write_all(sa("UID-OTHER", "other").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut b = TcpStream::connect(addr).await.unwrap();
+        let mut got = String::new();
+        let mut buf = vec![0u8; 8192];
+        while !got.contains("</event>") {
+            let n = timeout(Duration::from_secs(2), b.read(&mut buf))
+                .await
+                .expect("A's latest SA")
+                .unwrap();
+            got.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(got.contains(r#"callsign="latest""#), "got: {got}");
+        assert!(
+            !got.contains("first") && !got.contains("UID-OTHER"),
+            "got: {got}"
         );
     }
 
