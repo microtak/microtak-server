@@ -317,6 +317,11 @@ impl App {
         let enrollment_tokens = Arc::new(EnrollmentTokenStore::load_or_create(
             config.data_dir.join("enrollment_tokens.log"),
         )?);
+        // The official `profiles/` folder: its subfolders are profile
+        // directories.
+        let profiles_dir = config.data_dir.join("profiles");
+        std::fs::create_dir_all(&profiles_dir)?;
+        let profiles_dir = std::fs::canonicalize(&profiles_dir)?;
         let profiles = Arc::new(crate::profiles::ProfileStore::load_or_create(
             config.data_dir.join("device-profiles.log"),
             config.data_dir.join("profile-content"),
@@ -424,6 +429,8 @@ impl App {
             users: Arc::clone(&users),
             tokens: Arc::clone(&enrollment_tokens),
             limiter: Arc::clone(&limiter),
+            profiles_dir: profiles_dir.clone(),
+            max_upload_bytes: config.max_upload_bytes,
         };
         let plain_router = enrollment::router(enrollment_state)
             .merge(crate::marti::profiles::enrollment_router(
@@ -505,6 +512,7 @@ impl App {
                 groups: Arc::clone(&groups),
                 notifier: Arc::clone(&mission_notifier),
                 max_upload_bytes: config.max_upload_bytes,
+                profiles_dir,
             },
         ))
         .merge(discovery::router())

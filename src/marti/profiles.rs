@@ -13,11 +13,14 @@
 //!   `-1` for all);
 //! - `GET /Marti/api/device/profile/tool/{tool}`.
 //!
-//! Not implemented: profile *directories* (files served from directories
-//! under the official server's `profiles/` folder) -- MicroTAK has none, so
-//! `GET /device/profile/directories` lists none.
+//! Profile *directories*: subfolders of `data_dir/profiles` (the official
+//! server's `profiles/`) attached to tool profiles and served file by file
+//! (`GET /Marti/api/{device,tls}/profile/tool/{tool}/file?relativePath=`):
+//! one file as itself, several (a folder) as a `multiFile` mission package,
+//! with `Last-Modified` / `If-Modified-Since` (304).
 
 use std::collections::BTreeSet;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -51,6 +54,8 @@ pub struct ProfilesState {
     pub groups: Arc<GroupStore>,
     pub notifier: Arc<MissionNotifier>,
     pub max_upload_bytes: u64,
+    /// The profiles folder (canonical), whose subfolders are directories.
+    pub profiles_dir: PathBuf,
 }
 
 /// What the enrollment port needs to know who asks.
@@ -61,6 +66,8 @@ pub struct EnrollmentProfilesState {
     pub users: Arc<UserStore>,
     pub tokens: Arc<EnrollmentTokenStore>,
     pub limiter: Arc<AuthLimiter>,
+    pub profiles_dir: PathBuf,
+    pub max_upload_bytes: u64,
 }
 
 fn now_ms() -> i64 {
@@ -151,6 +158,18 @@ pub fn router(state: ProfilesState) -> Router {
         .route("/Marti/api/device/profile/directories", get(directories))
         .route("/Marti/api/device/profile/tool/:tool", get(tool))
         .route(
+            "/Marti/api/device/profile/tool/:tool/file",
+            get(device_tool_file),
+        )
+        .route(
+            "/Marti/api/device/profile/:name/directories",
+            get(list_directories).delete(clear_directories),
+        )
+        .route(
+            "/Marti/api/device/profile/:name/directories/:dirs",
+            axum::routing::put(add_directories),
+        )
+        .route(
             "/Marti/api/device/profile/:name/missionpackage",
             get(mission_package).head(|| async { StatusCode::OK }),
         )
@@ -177,6 +196,7 @@ pub fn router(state: ProfilesState) -> Router {
 pub fn enrollment_router(state: EnrollmentProfilesState) -> Router {
     Router::new()
         .route("/Marti/api/tls/profile/enrollment", get(enrollment))
+        .route("/Marti/api/tls/profile/tool/:tool/file", get(tls_tool_file))
         .with_state(state)
 }
 
@@ -388,8 +408,408 @@ async fn delete_file(
     }
 }
 
-async fn directories() -> Response {
-    api_response("String", Vec::<String>::new()).into_response()
+/// `getValidDirectories`: the profiles folder's immediate subfolders.
+pub fn valid_directories(root: &FsPath) -> Vec<String> {
+    let mut dirs: Vec<String> = std::fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    dirs.sort();
+    dirs
+}
+
+async fn directories(State(state): State<ProfilesState>) -> Response {
+    api_response("String", valid_directories(&state.profiles_dir)).into_response()
+}
+
+fn directory_json(d: &crate::profiles::ProfileDirectory) -> serde_json::Value {
+    json!({ "id": d.id, "path": d.path })
+}
+
+async fn list_directories(
+    State(state): State<ProfilesState>,
+    Path(name): Path<String>,
+) -> Response {
+    let Some(profile) = state.store.by_name(&name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let dirs: Vec<_> = state
+        .store
+        .directories(profile.id)
+        .iter()
+        .map(directory_json)
+        .collect();
+    api_response("ProfileDirectory", dirs).into_response()
+}
+
+/// `updateDirectories` (`{directories}` comma-separated): every one must
+/// be a valid directory, else 500.
+async fn add_directories(
+    State(state): State<ProfilesState>,
+    Path((name, dirs)): Path<(String, String)>,
+) -> Response {
+    let Some(profile) = state.store.by_name(&name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let valid = valid_directories(&state.profiles_dir);
+    let wanted: Vec<String> = dirs.split(',').map(str::to_string).collect();
+    if wanted.iter().any(|d| !valid.contains(d)) {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    match state.store.add_directories(profile.id, &wanted, now_ms()) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn clear_directories(
+    State(state): State<ProfilesState>,
+    Path(name): Path<String>,
+) -> Response {
+    let Some(profile) = state.store.by_name(&name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match state.store.clear_directories(profile.id) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// One file found under a profile directory.
+struct DirContent {
+    file: PathBuf,
+    bytes: Vec<u8>,
+    modified_secs: i64,
+    /// The profile directory's own name (`ProfileDirectory.path`).
+    dir_name: String,
+}
+
+/// `checkFile`: the path is what it says (no symlinks, `.`, `//`) and
+/// inside the profiles folder.
+fn check_file(root: &FsPath, absolute: &FsPath) -> bool {
+    match std::fs::canonicalize(absolute) {
+        Ok(canonical) => canonical == absolute && canonical.starts_with(root),
+        // Nothing there: nothing to escape to.
+        Err(_) => !absolute.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        }),
+    }
+}
+
+fn modified_secs(path: &FsPath) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `loadDirectoryContents`: every file below `dir`; a bad path anywhere
+/// empties the result, as officially.
+fn load_directory(root: &FsPath, dir: &FsPath, dir_name: &str, out: &mut Vec<DirContent>) -> bool {
+    let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(e) => e.flatten().map(|e| e.path()).collect(),
+        Err(_) => return true,
+    };
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            if !load_directory(root, &path, dir_name, out) {
+                return false;
+            }
+        } else {
+            if !check_file(root, &path) {
+                out.clear();
+                return false;
+            }
+            out.push(DirContent {
+                bytes: std::fs::read(&path).unwrap_or_default(),
+                modified_secs: modified_secs(&path),
+                file: path,
+                dir_name: dir_name.to_string(),
+            });
+        }
+    }
+    true
+}
+
+/// `getProfileDirectoryContent` for one relative path: `Ok(None)` when no
+/// directory has it (404), `Err` for a traversal attempt or a file over
+/// the size limit (500).
+fn find_content(
+    root: &FsPath,
+    dirs: &[crate::profiles::ProfileDirectory],
+    relative: &str,
+    limit: u64,
+) -> Result<Option<Vec<DirContent>>, ()> {
+    for dir in dirs {
+        // String concatenation, as officially ("profiles/" + path + relativePath).
+        let absolute = PathBuf::from(format!("{}/{}{relative}", root.display(), dir.path));
+        if absolute.to_string_lossy().contains("//") || !check_file(root, &absolute) {
+            return Err(());
+        }
+        if !absolute.exists() {
+            continue;
+        }
+        let mut out = Vec::new();
+        if absolute.is_dir() {
+            load_directory(root, &absolute, &dir.path, &mut out);
+            return Ok(Some(out));
+        }
+        let size = std::fs::metadata(&absolute).map(|m| m.len()).unwrap_or(0);
+        if size > limit {
+            return Err(());
+        }
+        out.push(DirContent {
+            bytes: std::fs::read(&absolute).map_err(|_| ())?,
+            modified_secs: modified_secs(&absolute),
+            file: absolute,
+            dir_name: dir.path.clone(),
+        });
+        return Ok(Some(out));
+    }
+    Ok(None)
+}
+
+const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Java's `DateTimeFormatter.RFC_1123_DATE_TIME` in UTC (day not padded).
+fn rfc1123(secs: i64) -> String {
+    let t =
+        time::OffsetDateTime::from_unix_timestamp(secs).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{}, {} {} {} {:02}:{:02}:{:02} GMT",
+        WEEKDAYS[t.weekday().number_days_from_monday() as usize],
+        t.day(),
+        MONTHS[t.month() as usize - 1],
+        t.year(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
+}
+
+fn parse_rfc1123(s: &str) -> Option<i64> {
+    let rest = s.split_once(", ").map(|(_, r)| r).unwrap_or(s);
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    let [day, month, year, hms, zone] = parts.as_slice() else {
+        return None;
+    };
+    if *zone != "GMT" && *zone != "UTC" && *zone != "Z" {
+        return None;
+    }
+    let month = MONTHS.iter().position(|m| m == month)? as u8 + 1;
+    let mut hms = hms.split(':').map(|v| v.parse::<u8>());
+    let (h, m, sec) = (hms.next()?.ok()?, hms.next()?.ok()?, hms.next()?.ok()?);
+    let date = time::Date::from_calendar_date(
+        year.parse().ok()?,
+        time::Month::try_from(month).ok()?,
+        day.parse().ok()?,
+    )
+    .ok()?;
+    let t = date.with_hms(h, m, sec).ok()?.assume_utc();
+    Some(t.unix_timestamp())
+}
+
+/// `URLConnection.guessContentTypeFromName` for common files.
+fn content_type(name: &str) -> &'static str {
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" | "jpe" => "image/jpeg",
+        "gif" => "image/gif",
+        "txt" | "text" | "java" | "c" | "h" => "text/plain",
+        "html" | "htm" => "text/html",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+/// `createProfileFileMissionPackage`: each file under its folders relative
+/// to its profile directory.
+fn multi_file_package(contents: &[DirContent]) -> Vec<u8> {
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut seen_dirs: BTreeSet<String> = BTreeSet::new();
+    let mut manifest_files = Vec::new();
+    for content in contents {
+        let mut dirs: Vec<String> = Vec::new();
+        let mut cursor = content.file.parent();
+        while let Some(dir) = cursor {
+            if dir.file_name().is_none()
+                || dir
+                    .file_name()
+                    .is_some_and(|n| n == content.dir_name.as_str())
+            {
+                break;
+            }
+            dirs.push(dir.file_name().unwrap().to_string_lossy().into_owned());
+            cursor = dir.parent();
+        }
+        let mut prefix = String::new();
+        for d in dirs.iter().rev() {
+            prefix.push_str(d);
+            prefix.push('/');
+            if seen_dirs.insert(prefix.clone()) {
+                entries.push((prefix.clone(), Vec::new()));
+            }
+        }
+        let name = content
+            .file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let entry = format!("{prefix}{name}");
+        entries.push((entry.clone(), content.bytes.clone()));
+        manifest_files.push(ArchiveFile {
+            zip_entry: entry,
+            bytes: Vec::new(),
+            attributes: Vec::new(),
+            uid_parameter: None,
+        });
+    }
+    let manifest = manifest_xml(
+        &[
+            ("uid", Some(super::envelope::random_uuid())),
+            ("name", Some("multiFile".into())),
+            ("onReceiveImport", Some("true".into())),
+            ("onReceiveDelete", Some("true".into())),
+        ],
+        &manifest_files,
+        &[],
+        None,
+    );
+    entries.push(("MANIFEST/".into(), Vec::new()));
+    entries.push(("MANIFEST/manifest.xml".into(), manifest.into_bytes()));
+    crate::zip::stored(&entries)
+}
+
+/// `ProfileService.getProfileDirectoryContent`.
+#[allow(clippy::too_many_arguments)]
+fn tool_file(
+    store: &ProfileStore,
+    root: &FsPath,
+    limit: u64,
+    user_groups: &BTreeSet<String>,
+    tool: &str,
+    pairs: &[(String, String)],
+    headers: &HeaderMap,
+) -> Response {
+    let relatives: Vec<&str> = pairs
+        .iter()
+        .filter(|(k, _)| k == "relativePath")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    // `PreventDirectoryTraversal` (`^(?!.*\.\.).+`, 255 characters).
+    if relatives.is_empty()
+        || param(pairs, "clientUid").is_none()
+        || relatives
+            .iter()
+            .any(|r| r.is_empty() || r.contains("..") || r.len() > 255)
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let since = match changed_since(pairs, false) {
+        Ok(since) => since,
+        Err(status) => return status.into_response(),
+    };
+    let valid = valid_directories(root);
+    let mut contents: Vec<DirContent> = Vec::new();
+    for relative in relatives {
+        let dirs = store.directories_for_tool(tool, user_groups, since);
+        if dirs.is_empty() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if dirs.iter().any(|d| !valid.contains(&d.path)) {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        match find_content(root, &dirs, relative, limit) {
+            Ok(Some(found)) => contents.extend(found),
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(()) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+    if contents.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let last_modified = contents.iter().map(|c| c.modified_secs).max().unwrap_or(0);
+    if let Some(value) = headers.get(header::IF_MODIFIED_SINCE) {
+        let Some(since) = value.to_str().ok().and_then(parse_rfc1123) else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        contents.retain(|c| c.modified_secs > since);
+    }
+    let last_modified = (header::LAST_MODIFIED, rfc1123(last_modified));
+    match contents.len() {
+        0 => (StatusCode::NOT_MODIFIED, [last_modified]).into_response(),
+        1 => {
+            let c = contents.remove(0);
+            let name = c
+                .file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (
+                [
+                    last_modified,
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!("attachment; filename={name}"),
+                    ),
+                    (header::CONTENT_TYPE, content_type(&name).to_string()),
+                ],
+                c.bytes,
+            )
+                .into_response()
+        }
+        _ => (
+            [
+                last_modified,
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename={FILENAME}"),
+                ),
+                (header::CONTENT_TYPE, "application/zip".to_string()),
+            ],
+            multi_file_package(&contents),
+        )
+            .into_response(),
+    }
+}
+
+async fn device_tool_file(
+    State(state): State<ProfilesState>,
+    Extension(PeerIdentity(cn)): Extension<PeerIdentity>,
+    Path(tool): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let groups = caller_groups(&state.groups, &cn);
+    tool_file(
+        &state.store,
+        &state.profiles_dir,
+        state.max_upload_bytes,
+        &groups,
+        &tool,
+        &params(raw.as_deref()),
+        &headers,
+    )
 }
 
 /// The caller's groups, either direction (`getGroupVectorBitString`).
@@ -542,6 +962,36 @@ async fn enrollment_user(
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(username)
+}
+
+async fn tls_tool_file(
+    State(state): State<EnrollmentProfilesState>,
+    peer: PeerIp,
+    Path(tool): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let user = match enrollment_user(&state, &peer, &headers).await {
+        Ok(user) => user,
+        Err(StatusCode::UNAUTHORIZED) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Basic realm=\"TAK Server\"")],
+            )
+                .into_response();
+        }
+        Err(status) => return status.into_response(),
+    };
+    let groups = caller_groups(&state.groups, &user);
+    tool_file(
+        &state.store,
+        &state.profiles_dir,
+        state.max_upload_bytes,
+        &groups,
+        &tool,
+        &params(raw.as_deref()),
+        &headers,
+    )
 }
 
 async fn enrollment(

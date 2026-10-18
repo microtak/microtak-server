@@ -86,6 +86,15 @@ pub struct ProfileFile {
     pub hash: String,
 }
 
+/// A directory under the server's profiles folder attached to a profile
+/// (`device_profile_directory`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileDirectory {
+    pub id: i64,
+    pub profile_id: i64,
+    pub path: String,
+}
+
 /// What `PUT /device/profile/{name}` changes (the official `save` of the
 /// posted `Profile`).
 #[derive(Debug, Clone)]
@@ -133,14 +142,25 @@ enum ProfileEvent {
         id: i64,
         at_ms: i64,
     },
+    DirectoryAdded {
+        id: i64,
+        profile_id: i64,
+        path: String,
+        at_ms: i64,
+    },
+    DirectoriesCleared {
+        profile_id: i64,
+    },
 }
 
 #[derive(Default)]
 struct State {
     profiles: Vec<Profile>,
     files: Vec<ProfileFile>,
+    directories: Vec<ProfileDirectory>,
     next_profile_id: i64,
     next_file_id: i64,
+    next_directory_id: i64,
 }
 
 fn touch(state: &mut State, profile_id: i64, at_ms: i64) {
@@ -195,6 +215,7 @@ fn apply(state: &mut State, event: &ProfileEvent) {
         ProfileEvent::Deleted { id } => {
             state.profiles.retain(|p| p.id != *id);
             state.files.retain(|f| f.profile_id != *id);
+            state.directories.retain(|d| d.profile_id != *id);
         }
         ProfileEvent::FileAdded {
             id,
@@ -211,6 +232,23 @@ fn apply(state: &mut State, event: &ProfileEvent) {
                 hash: hash.clone(),
             });
             touch(state, *profile_id, *at_ms);
+        }
+        ProfileEvent::DirectoryAdded {
+            id,
+            profile_id,
+            path,
+            at_ms,
+        } => {
+            state.next_directory_id = state.next_directory_id.max(*id);
+            state.directories.push(ProfileDirectory {
+                id: *id,
+                profile_id: *profile_id,
+                path: path.clone(),
+            });
+            touch(state, *profile_id, *at_ms);
+        }
+        ProfileEvent::DirectoriesCleared { profile_id } => {
+            state.directories.retain(|d| d.profile_id != *profile_id);
         }
         ProfileEvent::FileDeleted { id, at_ms } => {
             if let Some(i) = state.files.iter().position(|f| f.id == *id) {
@@ -418,6 +456,78 @@ impl ProfileStore {
         }
     }
 
+    /// A profile's directories, by id.
+    pub fn directories(&self, profile_id: i64) -> Vec<ProfileDirectory> {
+        let mut dirs: Vec<ProfileDirectory> = self
+            .state
+            .read()
+            .unwrap()
+            .directories
+            .iter()
+            .filter(|d| d.profile_id == profile_id)
+            .cloned()
+            .collect();
+        dirs.sort_by_key(|d| d.id);
+        dirs
+    }
+
+    /// `updateDirectories`: adds (doesn't replace) and marks the profile
+    /// updated.
+    pub fn add_directories(
+        &self,
+        profile_id: i64,
+        paths: &[String],
+        now_ms: i64,
+    ) -> Result<(), ProfileError> {
+        let mut state = self.state.write().unwrap();
+        if !state.profiles.iter().any(|p| p.id == profile_id) {
+            return Err(ProfileError::NotFound);
+        }
+        for path in paths {
+            let id = state.next_directory_id + 1;
+            self.record(
+                &mut state,
+                ProfileEvent::DirectoryAdded {
+                    id,
+                    profile_id,
+                    path: path.clone(),
+                    at_ms: now_ms,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `deleteDirectories` (doesn't mark the profile updated).
+    pub fn clear_directories(&self, profile_id: i64) -> Result<(), ProfileError> {
+        let mut state = self.state.write().unwrap();
+        if !state.profiles.iter().any(|p| p.id == profile_id) {
+            return Err(ProfileError::NotFound);
+        }
+        self.record(&mut state, ProfileEvent::DirectoriesCleared { profile_id })
+    }
+
+    /// `getProfileDirectoriesForTool`: the directories of every active
+    /// profile for `tool` that reaches `user_groups` (changed since, with
+    /// `syncSecago`).
+    pub fn directories_for_tool(
+        &self,
+        tool: &str,
+        user_groups: &BTreeSet<String>,
+        changed_since_ms: Option<i64>,
+    ) -> Vec<ProfileDirectory> {
+        self.all()
+            .into_iter()
+            .filter(|p| {
+                p.active
+                    && p.tool.as_deref() == Some(tool)
+                    && p.reaches(user_groups)
+                    && changed_since_ms.is_none_or(|since| p.updated_ms > since)
+            })
+            .flat_map(|p| self.directories(p.id))
+            .collect()
+    }
+
     pub fn contents(&self, file: &ProfileFile) -> Option<Vec<u8>> {
         self.content.get(&file.hash).ok().flatten()
     }
@@ -593,6 +703,65 @@ mod tests {
         assert_eq!(
             store.files_for_tool("radio", &groups(&["x"]), None).len(),
             1
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn directories_belong_to_tool_profiles_and_persist() {
+        let (store, dir) = store();
+        store.create("Maps", groups(&["G"]), 1).unwrap();
+        let maps = store.by_name("Maps").unwrap();
+        store
+            .add_directories(maps.id, &["imagery".into(), "dted".into()], 2)
+            .unwrap();
+        assert_eq!(store.by_id(maps.id).unwrap().updated_ms, 2);
+        let paths = |d: Vec<ProfileDirectory>| d.into_iter().map(|d| d.path).collect::<Vec<_>>();
+        assert!(
+            store
+                .directories_for_tool("maps", &groups(&["G"]), None)
+                .is_empty(),
+            "no tool yet"
+        );
+        store
+            .update(
+                maps.id,
+                ProfileUpdate {
+                    name: "Maps".into(),
+                    active: true,
+                    apply_on_enrollment: false,
+                    apply_on_connect: false,
+                    tool: Some("maps".into()),
+                    groups: groups(&["G"]),
+                    all_groups: false,
+                },
+                3,
+            )
+            .unwrap();
+        assert_eq!(
+            paths(store.directories_for_tool("maps", &groups(&["G"]), None)),
+            ["imagery", "dted"]
+        );
+        assert!(
+            store
+                .directories_for_tool("maps", &groups(&["X"]), None)
+                .is_empty()
+        );
+        assert!(
+            store
+                .directories_for_tool("maps", &groups(&["G"]), Some(3))
+                .is_empty()
+        );
+        drop(store);
+        let store =
+            ProfileStore::load_or_create(dir.join("profiles.log"), dir.join("content")).unwrap();
+        assert_eq!(paths(store.directories(maps.id)), ["imagery", "dted"]);
+        store.clear_directories(maps.id).unwrap();
+        assert!(store.directories(maps.id).is_empty());
+        assert_eq!(
+            store.by_id(maps.id).unwrap().updated_ms,
+            3,
+            "clearing doesn't touch it"
         );
         std::fs::remove_dir_all(dir).ok();
     }

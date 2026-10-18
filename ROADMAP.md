@@ -33,7 +33,8 @@ This file lists direction, not dates.
   client right after it connects (`latestSA`, on by default as
   officially), on mTLS and plain TCP.
 - Device profiles: the official profile admin API and delivery at
-  enrollment, on connect, per tool and by sending (no profile directories).
+  enrollment, on connect, per tool and by sending, including profile
+  directories.
 - Persistence and backups, Docker images and Helm chart (amd64 and arm64),
   release binaries.
 - CI: unit, end-to-end and black-box suites (the black-box suite drives the

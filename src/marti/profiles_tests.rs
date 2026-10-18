@@ -13,6 +13,7 @@ struct Fixture {
     store: Arc<ProfileStore>,
     hub: RelayHub,
     tokens: Arc<EnrollmentTokenStore>,
+    profiles_dir: std::path::PathBuf,
     _dir: TempDir,
 }
 
@@ -32,6 +33,9 @@ fn fixture() -> Fixture {
     let store = Arc::new(
         ProfileStore::load_or_create(dir.join("profiles.log"), dir.join("content")).unwrap(),
     );
+    let profiles_dir = dir.join("profiles");
+    std::fs::create_dir_all(&profiles_dir).unwrap();
+    let profiles_dir = std::fs::canonicalize(&profiles_dir).unwrap();
     let groups = Arc::new(GroupStore::in_memory());
     groups.create("Red", None, 0).unwrap();
     groups.create("Blue", None, 0).unwrap();
@@ -57,6 +61,7 @@ fn fixture() -> Fixture {
         groups: Arc::clone(&groups),
         notifier,
         max_upload_bytes: 10 * 1024 * 1024,
+        profiles_dir: profiles_dir.clone(),
     });
     let enroll = enrollment_router(EnrollmentProfilesState {
         store: Arc::clone(&store),
@@ -69,6 +74,8 @@ fn fixture() -> Fixture {
             100,
             1,
         )),
+        profiles_dir: profiles_dir.clone(),
+        max_upload_bytes: 10 * 1024 * 1024,
     });
     Fixture {
         app,
@@ -76,6 +83,7 @@ fn fixture() -> Fixture {
         store,
         hub,
         tokens,
+        profiles_dir,
         _dir: TempDir(dir),
     }
 }
@@ -598,4 +606,278 @@ fn only_the_device_calls_are_open_to_non_admins() {
         assert!(!allowed(method, path, false), "{method} {path}");
         assert!(allowed(method, path, true), "{method} {path}");
     }
+}
+
+async fn call_with(
+    app: &Router,
+    identity: &str,
+    uri: &str,
+    header: Option<(&str, &str)>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut request = Request::builder()
+        .uri(uri)
+        .extension(PeerIdentity(identity.to_string()));
+    if let Some((k, v)) = header {
+        request = request.header(k, v);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, headers, bytes)
+}
+
+/// A "Maps" tool profile for group Red with the profiles folder's "imagery"
+/// directory: `imagery/readme.txt`, `imagery/tiles/a/1.png`,
+/// `imagery/tiles/b.png`.
+async fn maps_with_directory(f: &Fixture) {
+    let imagery = f.profiles_dir.join("imagery");
+    std::fs::create_dir_all(imagery.join("tiles/a")).unwrap();
+    std::fs::create_dir_all(f.profiles_dir.join("dted")).unwrap();
+    std::fs::write(imagery.join("readme.txt"), "hello").unwrap();
+    std::fs::write(imagery.join("tiles/a/1.png"), "png-1").unwrap();
+    std::fs::write(imagery.join("tiles/b.png"), "png-b").unwrap();
+    call(
+        &f.app,
+        "admin",
+        "POST",
+        "/Marti/api/device/profile/Maps?group=Red",
+        vec![],
+    )
+    .await;
+    let id = f.store.by_name("Maps").unwrap().id;
+    let posted = json!({ "id": id, "name": "Maps", "active": true, "type": "Tool", "tool": "maps", "groups": ["Red"] });
+    call(
+        &f.app,
+        "admin",
+        "PUT",
+        "/Marti/api/device/profile/Maps",
+        posted.to_string().into_bytes(),
+    )
+    .await;
+    let (status, ..) = call(
+        &f.app,
+        "admin",
+        "PUT",
+        "/Marti/api/device/profile/Maps/directories/imagery",
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admins_attach_directories_of_the_profiles_folder() {
+    let f = fixture();
+    maps_with_directory(&f).await;
+    let (_, _, body) = call(
+        &f.app,
+        "admin",
+        "GET",
+        "/Marti/api/device/profile/directories",
+        vec![],
+    )
+    .await;
+    assert_eq!(json(&body)["data"], json!(["dted", "imagery"]));
+    let (_, _, body) = call(
+        &f.app,
+        "admin",
+        "GET",
+        "/Marti/api/device/profile/Maps/directories",
+        vec![],
+    )
+    .await;
+    let body = json(&body);
+    assert_eq!(body["type"], "ProfileDirectory");
+    assert_eq!(body["data"][0]["path"], "imagery");
+    assert_eq!(
+        body["data"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["id", "path"]
+    );
+    let (status, ..) = call(
+        &f.app,
+        "admin",
+        "PUT",
+        "/Marti/api/device/profile/Maps/directories/dted,nope",
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "every directory must exist"
+    );
+    let (status, ..) = call(
+        &f.app,
+        "admin",
+        "PUT",
+        "/Marti/api/device/profile/Maps/directories/dted",
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let id = f.store.by_name("Maps").unwrap().id;
+    assert_eq!(f.store.directories(id).len(), 2, "adds, doesn't replace");
+    let (status, ..) = call(
+        &f.app,
+        "admin",
+        "DELETE",
+        "/Marti/api/device/profile/Maps/directories",
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(f.store.directories(id).is_empty());
+}
+
+#[tokio::test]
+async fn devices_get_directory_files_one_by_one_or_as_a_package() {
+    let f = fixture();
+    maps_with_directory(&f).await;
+    let base = "/Marti/api/device/profile/tool/maps/file?clientUid=A&relativePath=";
+
+    let (status, headers, body) =
+        call_with(&f.app, "red-device", &format!("{base}/readme.txt"), None).await;
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::OK, b"hello".as_slice())
+    );
+    assert_eq!(headers[header::CONTENT_TYPE], "text/plain");
+    assert_eq!(
+        headers[header::CONTENT_DISPOSITION],
+        "attachment; filename=readme.txt"
+    );
+    let last_modified = headers[header::LAST_MODIFIED].to_str().unwrap().to_string();
+    assert!(last_modified.ends_with(" GMT"), "{last_modified}");
+
+    let (status, headers, package) =
+        call_with(&f.app, "red-device", &format!("{base}/tiles"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CONTENT_TYPE], "application/zip");
+    let (names, manifest) = entries(&package);
+    assert_eq!(
+        names,
+        [
+            "tiles/",
+            "tiles/a/",
+            "tiles/a/1.png",
+            "tiles/b.png",
+            "MANIFEST/",
+            "MANIFEST/manifest.xml"
+        ]
+    );
+    assert!(manifest.contains(r#"<Parameter name="name" value="multiFile"/>"#));
+
+    let (status, ..) = call_with(
+        &f.app,
+        "red-device",
+        &format!("{base}/tiles/b.png"),
+        Some(("if-modified-since", &last_modified)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED, "not changed since");
+    let (status, ..) = call_with(
+        &f.app,
+        "red-device",
+        &format!("{base}/tiles/b.png"),
+        Some(("if-modified-since", "Thu, 1 Jan 1970 00:00:00 GMT")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, ..) = call_with(&f.app, "red-device", &format!("{base}/missing.txt"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, ..) = call_with(
+        &f.app,
+        "red-device",
+        &format!("{base}/../../profiles.log"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no .. at all");
+    let (status, ..) = call_with(&f.app, "someone-else", &format!("{base}/readme.txt"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "not in Red: no directories");
+    let (status, ..) = call_with(
+        &f.app,
+        "red-device",
+        "/Marti/api/device/profile/tool/other/file?clientUid=A&relativePath=/readme.txt",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlink_out_of_the_profiles_folder_is_refused() {
+    let f = fixture();
+    maps_with_directory(&f).await;
+    let outside = f.profiles_dir.parent().unwrap().join("secret.txt");
+    std::fs::write(&outside, "secret").unwrap();
+    std::os::unix::fs::symlink(&outside, f.profiles_dir.join("imagery/link.txt")).unwrap();
+    let base = "/Marti/api/device/profile/tool/maps/file?clientUid=A&relativePath=";
+    let (status, _, body) =
+        call_with(&f.app, "red-device", &format!("{base}/link.txt"), None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!String::from_utf8_lossy(&body).contains("secret"));
+    let (status, _, body) = call_with(&f.app, "red-device", &format!("{base}/"), None).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a folder holding the link isn't served either"
+    );
+    assert!(!String::from_utf8_lossy(&body).contains("secret"));
+}
+
+#[tokio::test]
+async fn the_enrollment_port_serves_directory_files_with_basic_auth() {
+    let f = fixture();
+    maps_with_directory(&f).await;
+    let uri = "/Marti/api/tls/profile/tool/maps/file?clientUid=A&relativePath=/readme.txt";
+    let anonymous = f
+        .enroll
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    let encoded = base64::engine::general_purpose::STANDARD.encode("red-user:s3cret");
+    let ok = f
+        .enroll
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Basic {encoded}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+}
+
+#[test]
+fn rfc1123_is_javas_format() {
+    assert_eq!(super::rfc1123(0), "Thu, 1 Jan 1970 00:00:00 GMT");
+    assert_eq!(
+        super::rfc1123(1_792_281_600),
+        "Sun, 18 Oct 2026 00:00:00 GMT"
+    );
+    assert_eq!(
+        super::parse_rfc1123("Sun, 18 Oct 2026 00:00:00 GMT"),
+        Some(1_792_281_600)
+    );
+    assert_eq!(super::parse_rfc1123("garbage"), None);
 }

@@ -268,8 +268,10 @@ some (or all groups).
 The admin manages them with the official admin API
 (`/Marti/api/device/profile…`: create with `POST …/{name}?group=…`, add
 files with `PUT …/{name}/file?filename=…`, set type, groups and `active` with
-`PUT …/{name}`). Profile directories (files served from folders on the
-server) aren't supported.
+`PUT …/{name}`). Tool profiles can also serve whole folders: put them under
+`data_dir/profiles/` (one subfolder per directory), attach them with
+`PUT …/{name}/directories/{dir,dir}`, and devices fetch files or folders
+with `GET /Marti/api/device/profile/tool/{tool}/file?relativePath=/…`.
 
 ### TLS certificates
 
