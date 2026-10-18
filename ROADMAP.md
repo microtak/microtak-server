@@ -10,6 +10,9 @@ This file lists direction, not dates.
 
 ## Done
 
+- TAK Protocol (streaming protobuf) on the TLS port, negotiated as on the
+  official default input; messages over 64 KiB become file transfers to
+  `/Marti/api/cot/xml/{uid}`.
 - CoT over TLS (mTLS) and an optional plain-TCP relay; ping/pong, GeoChat,
   direct messages, `<marti><dest>` routing, groups ("channels").
 - Certificate enrollment (`/Marti/api/tls`), OAuth login for CloudTAK,
@@ -46,7 +49,8 @@ All three are admin-only on the official server too.
 
 ## Then
 
-- TAK Protocol (protobuf framing) next to XML CoT.
+- The latest situational awareness sent to a client right after it
+  connects (`latestSA`), as the official server does.
 - Device profiles and the WebSocket API web clients use.
 - Load testing: a simulator that keeps a configurable number of TAK
   clients (100 by default) connected and active against a deployment, to
