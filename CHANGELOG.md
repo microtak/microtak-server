@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.4](https://github.com/microtak/microtak-server/compare/v0.11.3...v0.11.4) (2026-10-18)
+
+
+### Bug Fixes
+
+* **registry:** a blocked identity releases its uid ([438dfe6](https://github.com/microtak/microtak-server/commit/438dfe6b8cab9ad029644bbb52c4fb50ac25469c))
+
 ## [0.11.3](https://github.com/microtak/microtak-server/compare/v0.11.2...v0.11.3) (2026-10-18)
 
 
