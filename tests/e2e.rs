@@ -262,11 +262,12 @@ async fn e2e_enroll_then_connect_via_mtls_and_relay_across_transports() {
         .unwrap();
 
     let mut buf = vec![0u8; 4096];
-    let n = timeout(Duration::from_secs(2), tls_b.read(&mut buf))
-        .await
-        .expect("device-b (mTLS) should receive device-a's event")
-        .unwrap();
-    assert!(String::from_utf8_lossy(&buf[..n]).contains("FROM-MTLS-A"));
+    // The TAK Protocol announcement arrives first on every mTLS connection.
+    let got = read_until_contains(&mut tls_b, "FROM-MTLS-A").await;
+    assert!(
+        got.contains("FROM-MTLS-A"),
+        "device-b (mTLS) should receive device-a's event: {got}"
+    );
 
     let n = timeout(Duration::from_secs(2), plain_client.read(&mut buf))
         .await
@@ -280,11 +281,11 @@ async fn e2e_enroll_then_connect_via_mtls_and_relay_across_transports() {
         .await
         .unwrap();
 
-    let n = timeout(Duration::from_secs(2), tls_a.read(&mut buf))
-        .await
-        .expect("mTLS client should receive an event relayed from a plain-TCP client")
-        .unwrap();
-    assert!(String::from_utf8_lossy(&buf[..n]).contains("FROM-PLAIN-TCP"));
+    let got = read_until_contains(&mut tls_a, "FROM-PLAIN-TCP").await;
+    assert!(
+        got.contains("FROM-PLAIN-TCP"),
+        "mTLS client should receive an event relayed from a plain-TCP client: {got}"
+    );
 }
 
 /// Periodic backup, end-to-end against the real assembled server: enroll a
@@ -1423,12 +1424,17 @@ async fn e2e_fanout_to_multiple_clients_across_mixed_transports() {
         ("mTLS client C", &mut tls_c),
         ("plain-TCP client D", &mut plain_d),
     ] {
-        let n = timeout(Duration::from_secs(2), stream.read(&mut buf))
-            .await
-            .unwrap_or_else(|_| panic!("{name} timed out waiting for the fanned-out event"))
-            .unwrap();
+        let mut got = String::new();
+        while !got.contains("FANOUT-EVENT") {
+            let n = timeout(Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{name} timed out waiting for the fanned-out event"))
+                .unwrap();
+            assert!(n > 0, "{name} closed");
+            got.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
         assert!(
-            String::from_utf8_lossy(&buf[..n]).contains("FANOUT-EVENT"),
+            got.contains("FANOUT-EVENT"),
             "{name} did not receive the expected event"
         );
     }

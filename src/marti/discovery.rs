@@ -25,7 +25,7 @@ use serde_json::json;
 
 /// Reported in `GET /Marti/api/version`'s body -- purely informational, no
 /// client parses this beyond "did I get a 200."
-const VERSION_STRING: &str = concat!("MicroTAK ", env!("CARGO_PKG_VERSION"));
+pub(crate) const VERSION_STRING: &str = concat!("MicroTAK ", env!("CARGO_PKG_VERSION"));
 
 /// MicroTAK doesn't enforce a real upload size limit today (see
 /// `content_store`/`marti::content`) -- this is a conservative, honestly-

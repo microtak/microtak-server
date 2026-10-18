@@ -24,5 +24,6 @@ pub mod connections;
 pub mod hub;
 pub mod identity;
 pub mod proxy_protocol;
+pub mod takproto;
 pub mod tcp;
 pub mod tls;

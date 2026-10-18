@@ -540,7 +540,17 @@ impl App {
         .await?
         .with_groups(Arc::clone(&groups))
         .with_admission(admission)
-        .with_missions(mission_notifier);
+        .with_missions(mission_notifier)
+        // The official default input (`protocol="tls"`) negotiates TAK
+        // Protocol.
+        .with_tak_protocol(crate::transport::tls::TakProtocol {
+            server_version: crate::marti::discovery::VERSION_STRING.to_string(),
+            cot_url_base: Some(format!(
+                "https://{}:{}",
+                config.server_common_name,
+                config.marti_api_addr.port()
+            )),
+        });
 
         if config.backup.enabled {
             let offsite = OffsiteTarget::new(config.backup.offsite_command.clone());

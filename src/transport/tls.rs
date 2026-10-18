@@ -120,6 +120,19 @@ pub struct TlsRelay {
     groups: Arc<GroupStore>,
     admission: Admission,
     missions: Option<Arc<dyn crate::transport::hub::StreamingMissions>>,
+    tak_protocol: Option<Arc<TakProtocol>>,
+}
+
+/// TAK Protocol negotiation on this listener, as on an official
+/// `protocol="tls"` (`COTPROTOTLS`) input; without it the listener is XML
+/// only (`cottls`). See [`super::takproto`].
+#[derive(Debug, Clone)]
+pub struct TakProtocol {
+    /// `TakServerVersionInfo/@serverVersion` in the announcement.
+    pub server_version: String,
+    /// `https://host:port` for the `/Marti/api/cot/xml/{uid}` file
+    /// transfers that replace protobuf messages over 64 KiB.
+    pub cot_url_base: Option<String>,
 }
 
 impl TlsRelay {
@@ -140,7 +153,14 @@ impl TlsRelay {
             groups: Arc::new(GroupStore::in_memory()),
             admission: Admission::default(),
             missions: None,
+            tak_protocol: None,
         })
+    }
+
+    /// Offer TAK Protocol (protobuf) to every client after connecting.
+    pub fn with_tak_protocol(mut self, tak_protocol: TakProtocol) -> Self {
+        self.tak_protocol = Some(Arc::new(tak_protocol));
+        self
     }
 
     /// Route `<marti><dest mission=…>` content through `missions`.
@@ -187,6 +207,7 @@ impl TlsRelay {
             let clients = self.clients.clone();
             let groups = Arc::clone(&self.groups);
             let missions = self.missions.clone();
+            let tak_protocol = self.tak_protocol.clone();
             tokio::spawn(async move {
                 let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
                     return;
@@ -228,7 +249,19 @@ impl TlsRelay {
 
                 info!(%peer, cn, "mTLS client connected");
                 handle_client(
-                    tls_stream, peer, cn, peer_cert, tx, rx, registry, clients, groups, missions,
+                    tls_stream,
+                    peer,
+                    cn,
+                    peer_cert,
+                    tx,
+                    rx,
+                    Shared {
+                        registry,
+                        clients,
+                        groups,
+                        missions,
+                        tak_protocol,
+                    },
                 )
                 .await;
             });
@@ -257,6 +290,15 @@ fn peer_common_name(stream: &TlsStream<TcpStream>) -> Option<String> {
 // One connection's whole context; bundling it into a struct would only
 // move the same nine fields around.
 #[allow(clippy::too_many_arguments)]
+/// What every connection of a listener shares.
+struct Shared {
+    registry: Arc<DeviceRegistry>,
+    clients: ConnectedClients,
+    groups: Arc<GroupStore>,
+    missions: Option<Arc<dyn crate::transport::hub::StreamingMissions>>,
+    tak_protocol: Option<Arc<TakProtocol>>,
+}
+
 async fn handle_client(
     stream: TlsStream<TcpStream>,
     peer: SocketAddr,
@@ -264,11 +306,15 @@ async fn handle_client(
     peer_cert: Vec<u8>,
     tx: broadcast::Sender<Outbound>,
     mut rx: broadcast::Receiver<Outbound>,
-    registry: Arc<DeviceRegistry>,
-    clients: ConnectedClients,
-    groups: Arc<GroupStore>,
-    missions: Option<Arc<dyn crate::transport::hub::StreamingMissions>>,
+    shared: Shared,
 ) {
+    let Shared {
+        registry,
+        clients,
+        groups,
+        missions,
+        tak_protocol,
+    } = shared;
     // Whatever ends the session: it leaves its missions' live subscribers
     // (`missionDisconnect` for every mission of the client uid).
     struct LeaveMissions<'a> {
@@ -310,6 +356,36 @@ async fn handle_client(
     let (mut reader, mut writer) = split(stream);
     let mut revocations = registry.revocations();
 
+    // TAK Protocol: announce once the session is authenticated
+    // (`startProtocolNegotiation`); a `t-x-takp-q` for version 1 switches
+    // this connection to protobuf both ways.
+    let negotiation_uuid = crate::marti::envelope::random_uuid();
+    let mut protobuf = false;
+    let mut frames = super::takproto::FrameDecoder::default();
+    if let Some(tp) = &tak_protocol {
+        let hello = super::takproto::announcement(
+            &negotiation_uuid,
+            &tp.server_version,
+            crate::cot::now_unix_millis(),
+        );
+        if writer.write_all(hello.as_bytes()).await.is_err() {
+            return;
+        }
+    }
+    let cot_url_base = tak_protocol.as_ref().and_then(|tp| tp.cot_url_base.clone());
+    // What this connection writes: XML, or a protobuf frame once negotiated.
+    let encode = |protobuf: bool, xml: &str| -> Option<Vec<u8>> {
+        if protobuf {
+            super::takproto::encode_outbound(
+                xml,
+                crate::cot::now_unix_millis() as u64,
+                cot_url_base.as_deref(),
+            )
+        } else {
+            Some(xml.as_bytes().to_vec())
+        }
+    };
+
     loop {
         tokio::select! {
             // Revoking this certificate or blocking this identity cuts the
@@ -335,18 +411,49 @@ async fn handle_client(
                     }
                 };
 
-                match decoder.feed(&read_buf[..n]) {
+                let decoded = if protobuf {
+                    match frames.feed(&read_buf[..n]) {
+                        Ok(messages) => Ok(messages
+                            .iter()
+                            .filter_map(super::takproto::proto_to_cot)
+                            .filter_map(|xml| {
+                                let event = crate::cot::Event::from_xml(super::takproto::event_body(&xml)).ok()?;
+                                Some(DecodedItem::Event { event: Box::new(event), xml })
+                            })
+                            .collect::<Vec<_>>()),
+                        Err(error) => {
+                            warn!(%peer, cn, %error, "TAK protocol error, disconnecting client");
+                            let _ = writer.shutdown().await;
+                            return;
+                        }
+                    }
+                } else {
+                    decoder.feed(&read_buf[..n])
+                };
+                match decoded {
                     Ok(items) => {
                         for item in items {
                             match item {
                                 DecodedItem::Event { event, xml } => {
                                     // Control messages are consumed, never
                                     // relayed; a ping gets the official pong.
+                                    if tak_protocol.is_some()
+                                        && !protobuf
+                                        && event.cot_type.eq_ignore_ascii_case("t-x-takp-q")
+                                    {
+                                        let supported = super::takproto::requested_version(&xml).as_deref()
+                                            == Some(super::takproto::TAK_PROTO_VERSION);
+                                        let answer = super::takproto::response(&negotiation_uuid, supported, crate::cot::now_unix_millis());
+                                        if writer.write_all(answer.as_bytes()).await.is_err() {
+                                            return;
+                                        }
+                                        protobuf = supported;
+                                        continue;
+                                    }
                                     if event.is_control() {
                                         if event.is_ping()
-                                            && let Err(error) = writer
-                                                .write_all(crate::cot::pong_xml(crate::cot::now_unix_millis()).as_bytes())
-                                                .await
+                                            && let Some(pong) = encode(protobuf, &crate::cot::pong_xml(crate::cot::now_unix_millis()))
+                                            && let Err(error) = writer.write_all(&pong).await
                                         {
                                             warn!(%peer, %error, "write error, disconnecting client");
                                             return;
@@ -430,7 +537,12 @@ async fn handle_client(
                         if !msg.reaches(&groups.active_groups(Some(&cn), Direction::Out)) {
                             continue;
                         }
-                        if let Err(error) = writer.write_all(msg.xml.as_bytes()).await {
+                        // A message the protobuf encoder can't send (over
+                        // 64 KiB with no file URL) is dropped, as officially.
+                        let Some(bytes) = encode(protobuf, &msg.xml) else {
+                            continue;
+                        };
+                        if let Err(error) = writer.write_all(&bytes).await {
                             warn!(%peer, %error, "write error, disconnecting client");
                             return;
                         }
@@ -848,6 +960,133 @@ mod tests {
             !received.contains("t-x-c-t"),
             "the ping was relayed: {received}"
         );
+    }
+
+    /// Reads until `pred` holds for what arrived (or 2 s pass).
+    async fn read_until(
+        stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+        pred: impl Fn(&[u8]) -> bool,
+    ) -> Vec<u8> {
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 8192];
+        while !pred(&got) {
+            let n = timeout(StdDuration::from_secs(2), stream.read(&mut buf))
+                .await
+                .expect("timed out")
+                .unwrap();
+            assert!(n > 0, "closed");
+            got.extend_from_slice(&buf[..n]);
+        }
+        got
+    }
+
+    fn contains(hay: &[u8], needle: &str) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    /// TAK Protocol on a negotiating (`protocol="tls"`) input: the
+    /// announcement after connect, `t-x-takp-q` version 1 answered with
+    /// status true and then protobuf both ways; an XML client on the same
+    /// relay keeps getting XML; another version gets status false and
+    /// stays XML.
+    #[tokio::test]
+    async fn tak_protocol_negotiation_and_protobuf_streaming() {
+        use crate::transport::takproto;
+        let fixture = build_fixture();
+        let relay = TlsRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.server_config.clone(),
+            RelayHub::new(),
+            fixture.registry.clone(),
+            ConnectedClients::new(),
+        )
+        .await
+        .unwrap()
+        .with_tak_protocol(TakProtocol {
+            server_version: "MicroTAK test".into(),
+            cot_url_base: Some("https://microtak-server:8443".into()),
+        });
+        let addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+
+        let mut proto = connect_client(addr, &fixture, "device-p").await;
+        let mut xml = connect_client(addr, &fixture, "device-x").await;
+        let hello = read_until(&mut proto, |b| contains(b, "</event>")).await;
+        let hello = String::from_utf8_lossy(&hello).into_owned();
+        assert!(
+            hello.contains("type='t-x-takp-v'")
+                && hello.contains("<TakProtocolSupport version='1'/>")
+                && hello.contains("serverVersion='MicroTAK test' apiVersion='3'"),
+            "{hello}"
+        );
+        let uuid = hello
+            .split("uid='")
+            .nth(1)
+            .unwrap()
+            .split('\'')
+            .next()
+            .unwrap()
+            .to_string();
+        read_until(&mut xml, |b| contains(b, "t-x-takp-v")).await;
+
+        // An unsupported version: status false, the connection stays XML.
+        xml.write_all(br#"<event version="2.0" uid="X" type="t-x-takp-q" time="t" start="t" stale="t" how="m-g"><point lat="0" lon="0" hae="0" ce="999999" le="999999"/><detail><TakControl><TakRequest version="2"/></TakControl></detail></event>"#).await.unwrap();
+        let no = read_until(&mut xml, |b| contains(b, "TakResponse")).await;
+        assert!(
+            contains(&no, "status='false'"),
+            "{}",
+            String::from_utf8_lossy(&no)
+        );
+
+        proto.write_all(br#"<event version="2.0" uid="P" type="t-x-takp-q" time="t" start="t" stale="t" how="m-g"><point lat="0" lon="0" hae="0" ce="999999" le="999999"/><detail><TakControl><TakRequest version="1"/></TakControl></detail></event>"#).await.unwrap();
+        let yes = read_until(&mut proto, |b| contains(b, "TakResponse")).await;
+        let yes = String::from_utf8_lossy(&yes).into_owned();
+        assert!(
+            yes.contains("type='t-x-takp-r'")
+                && yes.contains(&format!("uid='{uuid}'"))
+                && yes.contains("status='true'"),
+            "{yes}"
+        );
+
+        // protobuf in -> XML out to the XML client.
+        let sa = event_xml("PROTO-UID");
+        let frame = takproto::frame(&takproto::cot_to_proto(&sa, 1).unwrap());
+        proto.write_all(&frame).await.unwrap();
+        let got = read_until(&mut xml, |b| contains(b, "PROTO-UID")).await;
+        let got = String::from_utf8_lossy(&got).into_owned();
+        assert!(
+            got.contains(r#"<event version="2.0" uid="PROTO-UID""#),
+            "dom4j-style XML: {got}"
+        );
+
+        // XML in -> protobuf out to the protobuf client.
+        xml.write_all(event_xml("XML-UID").as_bytes())
+            .await
+            .unwrap();
+        let mut decoder = takproto::FrameDecoder::default();
+        let mut buf = vec![0u8; 8192];
+        let mut messages = Vec::new();
+        while messages.is_empty() {
+            let n = timeout(StdDuration::from_secs(2), proto.read(&mut buf))
+                .await
+                .expect("timed out")
+                .unwrap();
+            messages.extend(decoder.feed(&buf[..n]).unwrap());
+        }
+        assert_eq!(messages[0].cot_event.as_ref().unwrap().uid, "XML-UID");
+
+        // A ping in protobuf gets the pong in protobuf.
+        let ping = takproto::frame(&takproto::cot_to_proto(PING, 1).unwrap());
+        proto.write_all(&ping).await.unwrap();
+        let mut pong = Vec::new();
+        while pong.is_empty() {
+            let n = timeout(StdDuration::from_secs(2), proto.read(&mut buf))
+                .await
+                .expect("timed out")
+                .unwrap();
+            pong.extend(decoder.feed(&buf[..n]).unwrap());
+        }
+        assert_eq!(pong[0].cot_event.as_ref().unwrap().r#type, "t-x-c-t-r");
     }
 
     /// node-cot's `CoT.ping()`, as CloudTAK (node-tak) sends it every 5 s.

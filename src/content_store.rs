@@ -254,7 +254,7 @@ fn is_image(head: &[u8]) -> bool {
             ))
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_encode(&digest)
 }

@@ -30,6 +30,9 @@ sha2 = "0.10"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 ring = "0.17"
 bytes = "1"
+# TAK Protocol (streaming protobuf): the official .proto messages, as
+# hand-written prost structs (no codegen).
+prost = "0.14"
 serde_urlencoded = "0.7"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio-util = { version = "0.7", default-features = false, features = ["io"] }
