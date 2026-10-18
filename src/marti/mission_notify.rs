@@ -46,6 +46,7 @@ pub enum ChangeKind {
     ResourceKeyword,
     Metadata,
     MissionLayer,
+    ExternalData,
 }
 
 impl ChangeKind {
@@ -58,6 +59,7 @@ impl ChangeKind {
             ChangeKind::ResourceKeyword => "t-x-m-c-k-c",
             ChangeKind::Metadata => "t-x-m-c-m",
             ChangeKind::MissionLayer => "t-x-m-c-h",
+            ChangeKind::ExternalData => "t-x-m-c-e",
         }
     }
 }
@@ -279,6 +281,16 @@ impl MissionNotifier {
 
     /// One change as the official `commonUtil.toXml(new MissionChanges(change))`.
     pub fn change_xml(&self, change: &ChangeRecord) -> String {
+        self.change_xml_with(change, None)
+    }
+
+    /// [`Self::change_xml`] with the hydrated `externalData` (JAXB orders it
+    /// by its property, `externalMissionData`: after `creatorUid`).
+    pub fn change_xml_with(
+        &self,
+        change: &ChangeRecord,
+        external: Option<&serde_json::Value>,
+    ) -> String {
         let mut xml = String::from("<MissionChanges><MissionChange>");
         if let Some(Content::Hash(hash)) = &change.content {
             let resource = self
@@ -297,6 +309,24 @@ impl MissionNotifier {
             "<creatorUid>{}</creatorUid>",
             escape(&change.creator_uid)
         ));
+        if let Some(ext) = external {
+            // ExternalMissionData properties: id (uid), name, notes, tool,
+            // urlData, urlDisplay (urlView); nulls left out.
+            xml.push_str("<externalData>");
+            for (key, element) in [
+                ("uid", "uid"),
+                ("name", "name"),
+                ("notes", "notes"),
+                ("tool", "tool"),
+                ("urlData", "urlData"),
+                ("urlView", "urlView"),
+            ] {
+                if let Some(v) = ext.get(key).and_then(|v| v.as_str()) {
+                    xml.push_str(&format!("<{element}>{}</{element}>", escape(v)));
+                }
+            }
+            xml.push_str("</externalData>");
+        }
         xml.push_str("<isFederatedChange>false</isFederatedChange>");
         xml.push_str(&format!(
             "<missionGuid>{}</missionGuid>",

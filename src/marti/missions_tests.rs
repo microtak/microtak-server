@@ -2085,3 +2085,222 @@ async fn paged_missions_and_count() {
         "tool is ignored"
     );
 }
+
+/// External mission data (`setExternalMissionData`,
+/// `deleteExternalMissionData`, `notifyExternalMissionDataChanged`): one
+/// global id (`findByIdNoMission`), an ADD/REMOVE_CONTENT change carrying
+/// it (hydrated with the current URLs, `?token=` appended for a change
+/// notice), a `t-x-m-c-e` to the live subscribers; squashed per
+/// (uid, token, name, tool, notes, creator) without a presence check.
+#[tokio::test]
+async fn external_mission_data() {
+    let (h, mut rx) = harness_with_hub();
+    let (ops, _) = h.create("Ops", "jz", "").await;
+    h.create("Other", "jz", "").await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/subscription?uid=ANDROID-B",
+        "bee",
+        &[],
+        "",
+    )
+    .await;
+    drain(&mut rx);
+    let body = r#"{"uid":"ext-1","name":"Feed","tool":"public","urlData":"https://d","urlView":"https://v","notes":"n"}"#;
+
+    let missing = h
+        .call(
+            "POST",
+            "/Marti/api/missions/Ops/externaldata?creatorUid=ANDROID-jz",
+            "jz",
+            &[],
+            r#"{"name":"x"}"#,
+        )
+        .await;
+    assert_eq!(missing.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        missing.json()["message"],
+        "Invalid Request: ExternalMissionData id must be included"
+    );
+
+    let reply = h
+        .call(
+            "POST",
+            "/Marti/api/missions/Ops/externaldata?creatorUid=ANDROID-jz",
+            "jz",
+            &[],
+            body,
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.text());
+    assert_eq!(
+        reply.json()["type"],
+        "com.bbn.marti.sync.model.ExternalMissionData"
+    );
+    let expected = json!({ "uid": "ext-1", "name": "Feed", "tool": "public", "urlData": "https://d", "urlView": "https://v", "notes": "n" });
+    assert_eq!(reply.data().clone(), expected);
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops", "jz").await.data()[0]["externalData"],
+        json!([expected])
+    );
+
+    let sent = drain(&mut rx);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(cot_type(&sent[0].xml), "t-x-m-c-e");
+    assert!(
+        sent[0].xml.contains("<creatorUid>ANDROID-jz</creatorUid><externalData><uid>ext-1</uid><name>Feed</name><notes>n</notes><tool>public</tool><urlData>https://d</urlData><urlView>https://v</urlView></externalData><isFederatedChange>false</isFederatedChange>"),
+        "{}",
+        sent[0].xml
+    );
+
+    let notice = h
+        .call(
+            "POST",
+            "/Marti/api/missions/Ops/externaldata/ext-1/change?creatorUid=ANDROID-jz&notes=updated",
+            "jz",
+            &[],
+            "tok123",
+        )
+        .await;
+    assert_eq!(notice.status, StatusCode::OK);
+    assert_eq!(cot_type(&drain(&mut rx)[0].xml), "t-x-m-c-e");
+    let changes = h
+        .get("/Marti/api/missions/Ops/changes?squashed=false", "jz")
+        .await;
+    let ext: Vec<Value> = changes
+        .data()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get("externalData").is_some())
+        .cloned()
+        .collect();
+    assert_eq!(ext.len(), 2, "newest first");
+    assert_eq!(ext[0]["type"], "ADD_CONTENT");
+    assert_eq!(ext[0]["externalData"]["urlData"], "https://d?token=tok123");
+    assert_eq!(ext[0]["externalData"]["urlView"], "https://v?token=tok123");
+    assert_eq!(ext[0]["externalData"]["notes"], "updated");
+    assert_eq!(ext[1]["externalData"], expected);
+
+    // The same id posted to another mission moves it there.
+    let guid_route = format!(
+        "/Marti/api/missions/guid/{}/externaldata?creatorUid=ANDROID-jz",
+        h.get("/Marti/api/missions/Other", "jz").await.data()[0]["guid"]
+            .as_str()
+            .unwrap()
+    );
+    assert_eq!(
+        h.call("POST", &guid_route, "jz", &[], body).await.status,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        h.get("/Marti/api/missions/Ops", "jz").await.data()[0]["externalData"],
+        json!([])
+    );
+    assert_eq!(
+        h.get("/Marti/api/missions/Other", "jz").await.data()[0]["externalData"],
+        json!([expected])
+    );
+
+    let gone = h
+        .call(
+            "DELETE",
+            "/Marti/api/missions/Ops/externaldata/nope?notes=x&creatorUid=ANDROID-jz",
+            "jz",
+            &[],
+            "",
+        )
+        .await;
+    assert_eq!(gone.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        gone.json()["message"],
+        "Not Found: externalMissionDataId nope not found"
+    );
+    // Found by id, whichever mission holds it.
+    let deleted = h
+        .call(
+            "DELETE",
+            "/Marti/api/missions/Ops/externaldata/ext-1?notes=bye&creatorUid=ANDROID-jz",
+            "jz",
+            &[],
+            "",
+        )
+        .await;
+    assert_eq!(deleted.status, StatusCode::OK);
+    assert_eq!(
+        h.get("/Marti/api/missions/Other", "jz").await.data()[0]["externalData"],
+        json!([])
+    );
+    let changes = h
+        .get("/Marti/api/missions/Ops/changes?squashed=false", "jz")
+        .await;
+    let removed = changes
+        .data()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["type"] == "REMOVE_CONTENT")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        removed["externalData"],
+        json!({ "uid": "ext-1", "name": "Feed", "tool": "public", "notes": "bye" }),
+        "no URLs once deleted"
+    );
+
+    // Squashed: adds and removes each grouped, no presence check.
+    h.call(
+        "POST",
+        "/Marti/api/missions/Ops/externaldata?creatorUid=ANDROID-jz",
+        "jz",
+        &[],
+        body,
+    )
+    .await;
+    h.call(
+        "POST",
+        "/Marti/api/missions/Ops/externaldata?creatorUid=ANDROID-jz",
+        "jz",
+        &[],
+        body,
+    )
+    .await;
+    let squashed = h.get("/Marti/api/missions/Ops/changes", "jz").await;
+    let ext: Vec<String> = squashed
+        .data()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get("externalData").is_some())
+        .map(|c| {
+            format!(
+                "{} {}",
+                c["type"].as_str().unwrap(),
+                c["externalData"]["notes"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(
+        ext,
+        ["ADD_CONTENT n", "REMOVE_CONTENT bye", "ADD_CONTENT updated"]
+    );
+
+    let _ = ops;
+}
+
+/// `handleMissingJsonBodyException`: an unreadable body is 400 with exactly
+/// "Invalid Request Body".
+#[tokio::test]
+async fn unreadable_bodies_have_the_official_message() {
+    let h = harness();
+    h.create("Ops", "jz", "").await;
+    for (method, uri) in [
+        ("POST", "/Marti/api/missions/logs/entries"),
+        ("POST", "/Marti/api/missions/Ops/externaldata?creatorUid=X"),
+    ] {
+        let reply = h.call(method, uri, "jz", &[], "not json").await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(reply.json()["message"], "Invalid Request Body", "{uri}");
+        assert_eq!(reply.json()["code"], 2);
+    }
+}

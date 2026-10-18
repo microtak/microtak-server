@@ -212,6 +212,38 @@ pub enum ChangeType {
     RemoveContent,
 }
 
+/// `ExternalMissionData` (`mission_external_data`): its id is global,
+/// whichever mission holds it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternalDataRecord {
+    pub id: String,
+    pub name: String,
+    pub tool: String,
+    pub url_data: String,
+    pub url_display: String,
+    pub notes: String,
+    pub mission_guid: String,
+}
+
+/// What happens to an external data record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalDataAction {
+    /// `deleteExternalMissionData`.
+    Delete,
+    /// `notifyExternalMissionDataChanged` with the request body's token.
+    Changed { token: String },
+}
+
+/// The `external_data_*` columns of a `mission_change` row.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExternalDataChange {
+    pub uid: String,
+    pub name: String,
+    pub tool: String,
+    pub token: Option<String>,
+    pub notes: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChangeRecord {
     /// Store-wide increasing id; changes are returned newest id first
@@ -224,6 +256,8 @@ pub struct ChangeRecord {
     pub creator_uid: String,
     pub timestamp_ms: i64,
     pub server_time_ms: i64,
+    #[serde(default)]
+    pub external_data: Option<ExternalDataChange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -363,6 +397,25 @@ impl Window {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Event {
+    /// `setExternalMissionData`: the record (created or moved/updated) and
+    /// its ADD_CONTENT change on `guid`.
+    ExternalDataSet {
+        guid: String,
+        record: ExternalDataRecord,
+        creator_uid: String,
+        at_ms: i64,
+        change_id: u64,
+    },
+    /// `deleteExternalMissionData` / `notifyExternalMissionDataChanged`: a
+    /// change on `guid`; `delete` also removes the record.
+    ExternalDataChange {
+        guid: String,
+        change: ExternalDataChange,
+        remove: bool,
+        creator_uid: String,
+        at_ms: i64,
+        change_id: u64,
+    },
     Created {
         mission: Box<MissionRecord>,
         change_id: u64,
@@ -480,10 +533,85 @@ struct State {
     layers: BTreeMap<String, Vec<LayerRecord>>,
     next_change_id: u64,
     next_mission_id: u64,
+    external_data: BTreeMap<String, ExternalDataRecord>,
 }
 
 fn apply(state: &mut State, event: &Event) {
+    let push_change = |state: &mut State,
+                       guid: &str,
+                       change_type: ChangeType,
+                       ext: ExternalDataChange,
+                       creator_uid: String,
+                       at_ms: i64,
+                       change_id: u64| {
+        let mission_name = state
+            .missions
+            .get(guid)
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+        state.changes.push(ChangeRecord {
+            id: change_id,
+            change_type,
+            mission_guid: guid.to_string(),
+            mission_name,
+            content: None,
+            creator_uid,
+            timestamp_ms: at_ms,
+            server_time_ms: at_ms,
+            external_data: Some(ext),
+        });
+        state.next_change_id = state.next_change_id.max(change_id + 1);
+    };
     match event.clone() {
+        Event::ExternalDataSet {
+            guid,
+            record,
+            creator_uid,
+            at_ms,
+            change_id,
+        } => {
+            let ext = ExternalDataChange {
+                uid: record.id.clone(),
+                name: record.name.clone(),
+                tool: record.tool.clone(),
+                token: None,
+                notes: Some(record.notes.clone()),
+            };
+            state.external_data.insert(record.id.clone(), record);
+            push_change(
+                state,
+                &guid,
+                ChangeType::AddContent,
+                ext,
+                creator_uid,
+                at_ms,
+                change_id,
+            );
+        }
+        Event::ExternalDataChange {
+            guid,
+            change,
+            remove,
+            creator_uid,
+            at_ms,
+            change_id,
+        } => {
+            let change_type = if remove {
+                state.external_data.remove(&change.uid);
+                ChangeType::RemoveContent
+            } else {
+                ChangeType::AddContent
+            };
+            push_change(
+                state,
+                &guid,
+                change_type,
+                change,
+                creator_uid,
+                at_ms,
+                change_id,
+            );
+        }
         Event::Created { mission, change_id } => {
             let mission = *mission;
             state.next_mission_id = state.next_mission_id.max(mission.id + 1);
@@ -496,6 +624,7 @@ fn apply(state: &mut State, event: &Event) {
                 creator_uid: mission.creator_uid.clone(),
                 timestamp_ms: mission.create_time_ms,
                 server_time_ms: mission.create_time_ms,
+                external_data: None,
             });
             state.next_change_id = state.next_change_id.max(change_id + 1);
             state.missions.insert(mission.guid.clone(), mission);
@@ -576,6 +705,7 @@ fn apply(state: &mut State, event: &Event) {
                     creator_uid,
                     timestamp_ms: at_ms,
                     server_time_ms: at_ms,
+                    external_data: None,
                 });
             }
             state.next_change_id = state.next_change_id.max(change_id + 1);
@@ -604,6 +734,7 @@ fn apply(state: &mut State, event: &Event) {
                     creator_uid,
                     timestamp_ms: at_ms,
                     server_time_ms: at_ms,
+                    external_data: None,
                 });
             }
             state.next_change_id = state.next_change_id.max(change_id + 1);
@@ -626,6 +757,7 @@ fn apply(state: &mut State, event: &Event) {
                     creator_uid,
                     timestamp_ms: at_ms,
                     server_time_ms: at_ms,
+                    external_data: None,
                 });
             }
             state.next_change_id = state.next_change_id.max(change_id + 1);
@@ -1127,6 +1259,10 @@ impl MissionStore {
                 .max()
                 .unwrap_or(i64::MIN);
             let mut squashed: BTreeMap<(u8, Content, String), ChangeRecord> = BTreeMap::new();
+            // EXTERNAL_DATA_ADDS / _REMOVES: grouped by the external_data
+            // columns and creator, no presence check.
+            let mut external: BTreeMap<(u8, ExternalDataChange, String), ChangeRecord> =
+                BTreeMap::new();
             let mut lifecycle = Vec::new();
             for change in mine {
                 match (&change.change_type, &change.content) {
@@ -1134,6 +1270,20 @@ impl MissionStore {
                         if change.timestamp_ms >= latest_create {
                             lifecycle.push(change.clone());
                         }
+                    }
+                    (kind, None) if change.external_data.is_some() => {
+                        if change.timestamp_ms < mission.create_time_ms {
+                            continue;
+                        }
+                        let key = (
+                            u8::from(*kind == ChangeType::AddContent),
+                            change.external_data.clone().expect("checked"),
+                            change.creator_uid.clone(),
+                        );
+                        let entry = external.entry(key).or_insert_with(|| change.clone());
+                        entry.id = entry.id.max(change.id);
+                        entry.timestamp_ms = entry.timestamp_ms.max(change.timestamp_ms);
+                        entry.server_time_ms = entry.server_time_ms.max(change.server_time_ms);
                     }
                     (kind, Some(content)) => {
                         if change.timestamp_ms < mission.create_time_ms {
@@ -1161,10 +1311,98 @@ impl MissionStore {
             lifecycle
                 .into_iter()
                 .chain(squashed.into_values())
+                .chain(external.into_values())
                 .collect()
         };
         result.sort_by_key(|c| std::cmp::Reverse(c.id));
         Ok(result)
+    }
+
+    // --- external mission data ---------------------------------------------
+
+    /// `findByIdNoMission`.
+    pub fn external_data(&self, id: &str) -> Option<ExternalDataRecord> {
+        self.state.read().unwrap().external_data.get(id).cloned()
+    }
+
+    /// `Mission.externalData`, by id.
+    pub fn external_data_of(&self, guid: &str) -> Vec<ExternalDataRecord> {
+        self.state
+            .read()
+            .unwrap()
+            .external_data
+            .values()
+            .filter(|e| e.mission_guid == guid)
+            .cloned()
+            .collect()
+    }
+
+    /// `setExternalMissionDataAtTime`: create, or update (and move to this
+    /// mission) the record with this id; record the ADD_CONTENT change.
+    pub fn set_external_data(
+        &self,
+        guid: &str,
+        mut record: ExternalDataRecord,
+        creator_uid: &str,
+        now_ms: i64,
+    ) -> Result<ChangeRecord, MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        record.mission_guid = guid.to_string();
+        let change_id = state.next_change_id;
+        self.record(
+            &mut state,
+            Event::ExternalDataSet {
+                guid: guid.into(),
+                record,
+                creator_uid: creator_uid.into(),
+                at_ms: now_ms,
+                change_id,
+            },
+        )?;
+        Ok(state.changes.last().cloned().expect("just recorded"))
+    }
+
+    /// `deleteExternalMissionDataAtTime` (`remove`) or
+    /// `notifyExternalMissionDataChanged`: `None` if no record has this id.
+    pub fn external_data_change(
+        &self,
+        guid: &str,
+        id: &str,
+        action: ExternalDataAction,
+        notes: &str,
+        creator_uid: &str,
+        now_ms: i64,
+    ) -> Result<Option<ChangeRecord>, MissionError> {
+        let (token, remove) = match action {
+            ExternalDataAction::Delete => (None, true),
+            ExternalDataAction::Changed { token } => (Some(token), false),
+        };
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        let Some(record) = state.external_data.get(id).cloned() else {
+            return Ok(None);
+        };
+        let change = ExternalDataChange {
+            uid: record.id,
+            name: record.name,
+            tool: record.tool,
+            token,
+            notes: Some(notes.to_string()),
+        };
+        let change_id = state.next_change_id;
+        self.record(
+            &mut state,
+            Event::ExternalDataChange {
+                guid: guid.into(),
+                change,
+                remove,
+                creator_uid: creator_uid.into(),
+                at_ms: now_ms,
+                change_id,
+            },
+        )?;
+        Ok(state.changes.last().cloned())
     }
 
     // --- subscriptions --------------------------------------------------

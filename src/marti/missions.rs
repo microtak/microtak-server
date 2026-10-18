@@ -105,6 +105,30 @@ pub fn router_with(state: MissionsState) -> Router {
             get(list_missions).delete(delete_mission_by_guid),
         )
         .route("/Marti/api/pagedmissions", get(paged_missions))
+        .route(
+            "/Marti/api/missions/:name/externaldata",
+            post(set_external_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/externaldata",
+            post(set_external_by_guid),
+        )
+        .route(
+            "/Marti/api/missions/:name/externaldata/:id",
+            axum::routing::delete(delete_external_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/externaldata/:id",
+            axum::routing::delete(delete_external_by_guid),
+        )
+        .route(
+            "/Marti/api/missions/:name/externaldata/:id/change",
+            post(notify_external_by_name),
+        )
+        .route(
+            "/Marti/api/missions/guid/:guid/externaldata/:id/change",
+            post(notify_external_by_guid),
+        )
         .route("/Marti/api/missioncount", get(mission_count))
         .route(
             "/Marti/api/missions/all/subscriptions",
@@ -307,6 +331,8 @@ fn pad_millis(ms: i64) -> String {
 pub enum ApiError {
     NotFound(String),
     BadRequest(String),
+    /// `handleMissingJsonBodyException`: "Invalid Request Body".
+    InvalidBody,
     Forbidden(String),
     Gone(String),
     Internal,
@@ -340,6 +366,12 @@ impl IntoResponse for ApiError {
                 "NOT_FOUND",
                 1,
                 format!("Not Found{}", suffix(&m)),
+            ),
+            ApiError::InvalidBody => body(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                2,
+                "Invalid Request Body".into(),
             ),
             ApiError::BadRequest(m) => body(
                 StatusCode::BAD_REQUEST,
@@ -725,7 +757,13 @@ fn mission_json(
     put("createTime", pad_millis(m.create_time_ms).into());
     put("lastEdited", pad_millis(m.last_edited_ms).into());
     put("groups", json!(groups));
-    put("externalData", json!([]));
+    let external: Vec<Value> = state
+        .store
+        .external_data_of(&m.guid)
+        .iter()
+        .map(external_json)
+        .collect();
+    put("externalData", external.into());
     put("feeds", json!([]));
     put("mapLayers", json!([]));
     if let Some(role) = m.default_role {
@@ -794,6 +832,13 @@ fn change_json(state: &MissionsState, c: &ChangeRecord) -> Value {
             out.insert("contentResource".into(), resource);
         }
         None => {}
+    }
+    if let Some(ext) = &c.external_data {
+        let record = state.store.external_data(&ext.uid);
+        out.insert(
+            "externalData".into(),
+            external_change_json(record.as_ref(), ext),
+        );
     }
     Value::Object(out)
 }
@@ -1746,6 +1791,229 @@ async fn remove_content_by_guid(
     remove_content_impl(&state, &caller, mission, &Params::parse(query)?)
 }
 
+// --- external mission data ---------------------------------------------------
+
+/// `ExternalMissionData` JSON (`@JsonInclude(NON_NULL)`).
+fn external_json(e: &crate::missions::ExternalDataRecord) -> Value {
+    json!({ "uid": e.id, "name": e.name, "tool": e.tool, "urlData": e.url_data, "urlView": e.url_display, "notes": e.notes })
+}
+
+/// `hydrate(externalDataUid, …)`: the change's fields, the current record's
+/// URLs (none once it is gone), `?token=` appended for a change notice.
+fn external_change_json(
+    record: Option<&crate::missions::ExternalDataRecord>,
+    c: &crate::missions::ExternalDataChange,
+) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("uid".into(), c.uid.clone().into());
+    out.insert("name".into(), c.name.clone().into());
+    out.insert("tool".into(), c.tool.clone().into());
+    if let Some(r) = record {
+        let token = c
+            .token
+            .as_ref()
+            .map(|t| format!("?token={t}"))
+            .unwrap_or_default();
+        out.insert("urlData".into(), format!("{}{token}", r.url_data).into());
+        out.insert("urlView".into(), format!("{}{token}", r.url_display).into());
+    }
+    if let Some(notes) = &c.notes {
+        out.insert("notes".into(), notes.clone().into());
+    }
+    Value::Object(out)
+}
+
+fn announce_external(
+    state: &MissionsState,
+    mission: &MissionRecord,
+    change: &ChangeRecord,
+    record: Option<&crate::missions::ExternalDataRecord>,
+    creator: &str,
+) {
+    let ext = change
+        .external_data
+        .as_ref()
+        .map(|c| external_change_json(record, c));
+    let xml = state.notifier.change_xml_with(change, ext.as_ref());
+    state
+        .notifier
+        .announce(mission, ChangeKind::ExternalData, creator, Some(&xml));
+}
+
+fn set_external_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    params: &Params,
+    body: &Bytes,
+) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionWrite)?;
+    let creator = params
+        .get("creatorUid")
+        .ok_or_else(|| ApiError::BadRequest(String::new()))?
+        .to_string();
+    let v: Value = serde_json::from_slice(body).map_err(|_| ApiError::InvalidBody)?;
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if s("uid").is_empty() {
+        return Err(ApiError::BadRequest(
+            "ExternalMissionData id must be included".into(),
+        ));
+    }
+    let record = crate::missions::ExternalDataRecord {
+        id: s("uid"),
+        name: s("name"),
+        tool: s("tool"),
+        url_data: s("urlData"),
+        url_display: s("urlView"),
+        notes: s("notes"),
+        mission_guid: mission.guid.clone(),
+    };
+    let change =
+        state
+            .store
+            .set_external_data(&mission.guid, record.clone(), &creator, now_ms())?;
+    announce_external(state, &mission, &change, Some(&record), &creator);
+    let mut response = ok(
+        "com.bbn.marti.sync.model.ExternalMissionData",
+        external_json(&record),
+    )?;
+    *response.status_mut() = StatusCode::CREATED;
+    Ok(response)
+}
+
+/// Delete (`remove`) or change notice: the record by id, whichever mission
+/// holds it; the change is recorded on this mission.
+fn external_change_impl(
+    state: &MissionsState,
+    caller: &Caller,
+    mission: MissionRecord,
+    id: &str,
+    params: &Params,
+    action: crate::missions::ExternalDataAction,
+) -> ApiResult {
+    require(role_for(state, &mission, caller), Permission::MissionWrite)?;
+    let creator = params
+        .get("creatorUid")
+        .ok_or_else(|| ApiError::BadRequest(String::new()))?
+        .to_string();
+    let notes = params
+        .get("notes")
+        .ok_or_else(|| ApiError::BadRequest(String::new()))?
+        .to_string();
+    // Hydrated before the delete, as the official change is.
+    let record = state.store.external_data(id);
+    let change = state
+        .store
+        .external_data_change(&mission.guid, id, action, &notes, &creator, now_ms())?
+        .ok_or_else(|| ApiError::NotFound(format!("externalMissionDataId {id} not found")))?;
+    announce_external(state, &mission, &change, record.as_ref(), &creator);
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn set_external_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    set_external_impl(&state, &caller, mission, &Params::parse(query)?, &body)
+}
+
+async fn set_external_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(guid): Path<String>,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    set_external_impl(&state, &caller, mission, &Params::parse(query)?, &body)
+}
+
+async fn delete_external_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((name, id)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    external_change_impl(
+        &state,
+        &caller,
+        mission,
+        &id,
+        &Params::parse(query)?,
+        crate::missions::ExternalDataAction::Delete,
+    )
+}
+
+async fn delete_external_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((guid, id)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    external_change_impl(
+        &state,
+        &caller,
+        mission,
+        &id,
+        &Params::parse(query)?,
+        crate::missions::ExternalDataAction::Delete,
+    )
+}
+
+async fn notify_external_by_name(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((name, id)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    body: String,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    external_change_impl(
+        &state,
+        &caller,
+        mission,
+        &id,
+        &Params::parse(query)?,
+        crate::missions::ExternalDataAction::Changed { token: body },
+    )
+}
+
+async fn notify_external_by_guid(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((guid, id)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    body: String,
+) -> ApiResult {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Guid(&guid))?;
+    external_change_impl(
+        &state,
+        &caller,
+        mission,
+        &id,
+        &Params::parse(query)?,
+        crate::missions::ExternalDataAction::Changed { token: body },
+    )
+}
+
 /// Announces the mission's `count` newest changes, oldest first.
 fn announce_latest_changes(
     state: &MissionsState,
@@ -1817,8 +2085,7 @@ fn keyword_list(body: &Bytes) -> Result<Vec<String>, ApiError> {
     if body.is_empty() {
         return Ok(Vec::new());
     }
-    serde_json::from_slice::<Vec<String>>(body)
-        .map_err(|_| ApiError::BadRequest("Invalid Request Body".into()))
+    serde_json::from_slice::<Vec<String>>(body).map_err(|_| ApiError::InvalidBody)
 }
 
 fn writable_by_name(
@@ -3106,8 +3373,7 @@ fn set_subscription_roles_impl(
         .get("creatorUid")
         .ok_or_else(|| ApiError::BadRequest("missing creatorUid".into()))?
         .to_string();
-    let subs: Vec<Value> = serde_json::from_slice(body)
-        .map_err(|_| ApiError::BadRequest("Invalid Request Body".into()))?;
+    let subs: Vec<Value> = serde_json::from_slice(body).map_err(|_| ApiError::InvalidBody)?;
     let mut parsed = Vec::new();
     for s in &subs {
         let client_uid = s.get("clientUid").and_then(|v| v.as_str());
@@ -3690,7 +3956,7 @@ async fn uninvite_by_guid(
 // --- log entries ------------------------------------------------------------------------------
 
 fn parse_log_entry(body: &Bytes) -> Result<Value, ApiError> {
-    serde_json::from_slice(body).map_err(|_| ApiError::BadRequest("Invalid Request Body".into()))
+    serde_json::from_slice(body).map_err(|_| ApiError::InvalidBody)
 }
 
 fn json_date(v: Option<&Value>) -> Result<Option<i64>, ApiError> {
@@ -3698,7 +3964,7 @@ fn json_date(v: Option<&Value>) -> Result<Option<i64>, ApiError> {
         None => Ok(None),
         Some(s) => time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
             .map(|t| Some((t.unix_timestamp_nanos() / 1_000_000) as i64))
-            .map_err(|_| ApiError::BadRequest("Invalid Request Body".into())),
+            .map_err(|_| ApiError::InvalidBody),
     }
 }
 
