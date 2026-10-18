@@ -121,6 +121,7 @@ pub struct TlsRelay {
     admission: Admission,
     missions: Option<Arc<dyn crate::transport::hub::StreamingMissions>>,
     tak_protocol: Option<Arc<TakProtocol>>,
+    latest_sa: bool,
 }
 
 /// TAK Protocol negotiation on this listener, as on an official
@@ -154,7 +155,16 @@ impl TlsRelay {
             admission: Admission::default(),
             missions: None,
             tak_protocol: None,
+            latest_sa: false,
         })
+    }
+
+    /// `<buffer><latestSA enable="true"/>` (the official default config):
+    /// a new client first gets the latest SA of every connected client
+    /// whose messages reach it.
+    pub fn with_latest_sa(mut self) -> Self {
+        self.latest_sa = true;
+        self
     }
 
     /// Offer TAK Protocol (protobuf) to every client after connecting.
@@ -208,6 +218,7 @@ impl TlsRelay {
             let groups = Arc::clone(&self.groups);
             let missions = self.missions.clone();
             let tak_protocol = self.tak_protocol.clone();
+            let latest_sa = self.latest_sa;
             tokio::spawn(async move {
                 let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
                     return;
@@ -261,6 +272,7 @@ impl TlsRelay {
                         groups,
                         missions,
                         tak_protocol,
+                        latest_sa,
                     },
                 )
                 .await;
@@ -297,6 +309,7 @@ struct Shared {
     groups: Arc<GroupStore>,
     missions: Option<Arc<dyn crate::transport::hub::StreamingMissions>>,
     tak_protocol: Option<Arc<TakProtocol>>,
+    latest_sa: bool,
 }
 
 async fn handle_client(
@@ -314,6 +327,7 @@ async fn handle_client(
         groups,
         missions,
         tak_protocol,
+        latest_sa,
     } = shared;
     // Whatever ends the session: it leaves its missions' live subscribers
     // (`missionDisconnect` for every mission of the client uid).
@@ -355,6 +369,21 @@ async fn handle_client(
     let mut read_buf = [0u8; 4096];
     let (mut reader, mut writer) = split(stream);
     let mut revocations = registry.revocations();
+
+    // latestSA (`sendLatestReachableSA`, before protocol negotiation): the
+    // latest SA of every connected client whose messages reach this one --
+    // its IN groups meet this device's OUT groups.
+    if latest_sa {
+        let my_out = groups.active_groups(Some(&cn), Direction::Out);
+        for (endpoint, xml) in clients.latest_sas_except(peer) {
+            let their_in = groups.active_groups(endpoint.common_name.as_deref(), Direction::In);
+            if their_in.iter().any(|group| my_out.contains(group))
+                && writer.write_all(xml.as_bytes()).await.is_err()
+            {
+                return;
+            }
+        }
+    }
 
     // TAK Protocol: announce once the session is authenticated
     // (`startProtocolNegotiation`); a `t-x-takp-q` for version 1 switches
@@ -474,8 +503,10 @@ async fn handle_client(
                                             return;
                                         }
                                     }
+                                    let relayed: Arc<str> = crate::cot::strip_marti(&xml).into_owned().into();
                                     if event.is_situational_awareness() {
                                         clients.set_uid(peer, event.uid.clone());
+                                        clients.set_latest_sa(peer, Arc::clone(&relayed));
                                     }
                                     let mut dest: Vec<String> =
                                         event.addressed_uids().unwrap_or_default().into_iter().map(String::from).collect();
@@ -496,10 +527,9 @@ async fn handle_client(
                                     crate::metrics::inc(&crate::metrics::COUNTERS.cot_events_tls);
                                     // Relayed without its `<marti>` element, as the
                                     // official server forwards streamed CoT.
-                                    let xml = crate::cot::strip_marti(&xml).into_owned();
                                     let _ = tx.send(Outbound {
                                         sender: peer,
-                                        xml: xml.into(),
+                                        xml: relayed,
                                         dest_uids,
                                         groups: Arc::new(groups.active_groups(Some(&cn), Direction::In)),
                                         origin: crate::transport::hub::Origin::Client,
@@ -1087,6 +1117,67 @@ mod tests {
             pong.extend(decoder.feed(&buf[..n]).unwrap());
         }
         assert_eq!(pong[0].cot_event.as_ref().unwrap().r#type, "t-x-c-t-r");
+    }
+
+    /// `latestSA` (on in the official default CoreConfig): a client that
+    /// connects first gets the latest SA of every connected client whose
+    /// messages reach it (`sendLatestReachableSA`), before the TAK
+    /// Protocol announcement; a client in a group it can't hear from is
+    /// left out.
+    #[tokio::test]
+    async fn new_clients_get_the_latest_reachable_sa() {
+        let fixture = build_fixture();
+        let groups = Arc::new(GroupStore::in_memory());
+        groups.create("Red", None, 0).unwrap();
+        groups
+            .set_member("Red", "device-red", Some(crate::groups::Membership::Both))
+            .unwrap();
+        let relay = TlsRelay::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.server_config.clone(),
+            RelayHub::new(),
+            fixture.registry.clone(),
+            ConnectedClients::new(),
+        )
+        .await
+        .unwrap()
+        .with_groups(groups)
+        .with_latest_sa()
+        .with_tak_protocol(TakProtocol {
+            server_version: "t".into(),
+            cot_url_base: None,
+        });
+        let addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+
+        let mut a = connect_client(addr, &fixture, "device-a").await;
+        let mut red = connect_client(addr, &fixture, "device-red").await;
+        read_until(&mut a, |b| contains(b, "t-x-takp-v")).await;
+        read_until(&mut red, |b| contains(b, "t-x-takp-v")).await;
+        a.write_all(event_xml("UID-A").as_bytes()).await.unwrap();
+        red.write_all(event_xml("UID-RED").as_bytes())
+            .await
+            .unwrap();
+        {
+            let mut gone = connect_client(addr, &fixture, "device-gone").await;
+            read_until(&mut gone, |b| contains(b, "t-x-takp-v")).await;
+            gone.write_all(event_xml("UID-GONE").as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(StdDuration::from_millis(100)).await;
+        }
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+        let mut b = connect_client(addr, &fixture, "device-b").await;
+        let got = read_until(&mut b, |g| contains(g, "t-x-takp-v")).await;
+        let got = String::from_utf8_lossy(&got).into_owned();
+        let sa = got.find("UID-A").expect("A's SA");
+        assert!(
+            sa < got.find("t-x-takp-v").unwrap(),
+            "before the announcement: {got}"
+        );
+        assert!(!got.contains("UID-RED"), "Red can't reach device-b: {got}");
+        assert!(!got.contains("UID-GONE"), "only connected clients: {got}");
     }
 
     /// node-cot's `CoT.ping()`, as CloudTAK (node-tak) sends it every 5 s.

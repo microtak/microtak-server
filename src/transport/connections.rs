@@ -43,6 +43,9 @@ pub struct ConnectedClients {
     /// (from 1, per process).
     numbers: Arc<RwLock<HashMap<SocketAddr, u64>>>,
     next_number: Arc<std::sync::atomic::AtomicU64>,
+    /// Each connection's latest SA, as relayed (the official
+    /// `Subscription.latestSA`): gone with the connection.
+    latest_sa: Arc<RwLock<HashMap<SocketAddr, Arc<str>>>>,
 }
 
 impl ConnectedClients {
@@ -68,6 +71,39 @@ impl ConnectedClients {
     pub fn unregister(&self, remote_addr: SocketAddr) {
         self.clients.write().unwrap().remove(&remote_addr);
         self.numbers.write().unwrap().remove(&remote_addr);
+        self.latest_sa.write().unwrap().remove(&remote_addr);
+    }
+
+    /// Record a connection's own SA (`trackLatestSA`). A no-op if
+    /// `remote_addr` isn't registered.
+    pub fn set_latest_sa(&self, remote_addr: SocketAddr, xml: Arc<str>) {
+        if self.clients.read().unwrap().contains_key(&remote_addr) {
+            self.latest_sa.write().unwrap().insert(remote_addr, xml);
+        }
+    }
+
+    /// Every other connected client's latest SA, oldest connection first.
+    pub fn latest_sas_except(&self, remote_addr: SocketAddr) -> Vec<(ClientEndpoint, Arc<str>)> {
+        let clients = self.clients.read().unwrap();
+        let numbers = self.numbers.read().unwrap();
+        let mut sas: Vec<_> = self
+            .latest_sa
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(addr, _)| **addr != remote_addr)
+            .filter_map(|(addr, xml)| {
+                Some((
+                    numbers.get(addr).copied().unwrap_or(0),
+                    clients.get(addr)?.clone(),
+                    Arc::clone(xml),
+                ))
+            })
+            .collect();
+        sas.sort_by_key(|(number, _, _)| *number);
+        sas.into_iter()
+            .map(|(_, endpoint, xml)| (endpoint, xml))
+            .collect()
     }
 
     /// The official subscription uid of a connection: `tls:<n>` / `tcp:<n>`.
@@ -164,5 +200,33 @@ mod tests {
         let clients = ConnectedClients::new();
         clients.set_uid("127.0.0.1:9".parse().unwrap(), "UID-X".to_string());
         assert!(clients.list().is_empty());
+    }
+
+    #[test]
+    fn latest_sas_are_per_connection_and_leave_with_it() {
+        let clients = ConnectedClients::new();
+        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        clients.register(endpoint("127.0.0.1:1", Transport::Tls));
+        clients.register(endpoint("127.0.0.1:2", Transport::Tls));
+        clients.set_latest_sa(a, "old".into());
+        clients.set_latest_sa(a, "new".into());
+        clients.set_latest_sa(b, "b".into());
+        clients.set_latest_sa("127.0.0.1:9".parse().unwrap(), "gone".into());
+
+        let others: Vec<String> = clients
+            .latest_sas_except(b)
+            .into_iter()
+            .map(|(_, xml)| xml.to_string())
+            .collect();
+        assert_eq!(others, vec!["new"]);
+        assert_eq!(
+            clients
+                .latest_sas_except("127.0.0.1:3".parse().unwrap())
+                .len(),
+            2
+        );
+        clients.unregister(a);
+        assert!(clients.latest_sas_except(b).is_empty());
     }
 }

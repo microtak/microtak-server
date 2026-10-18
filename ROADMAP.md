@@ -29,6 +29,9 @@ This file lists direction, not dates.
   import.
 - `/Marti/api/contacts/all`, `/Marti/api/subscriptions/all`,
   `/Marti/api/security/isSecure`.
+- The latest situational awareness of every reachable client, sent to an
+  mTLS client right after it connects (`latestSA`, on by default as
+  officially). Plain TCP clients don't take part yet.
 - Persistence and backups, Docker images and Helm chart (amd64 and arm64),
   release binaries.
 - CI: unit, end-to-end and black-box suites (the black-box suite drives the
@@ -49,13 +52,10 @@ All three are admin-only on the official server too.
 
 ## Then
 
-- The latest situational awareness sent to a client right after it
-  connects (`latestSA`), as the official server does.
 - Device profiles and the WebSocket API web clients use.
 - Load testing: a simulator that keeps a configurable number of TAK
   clients (100 by default) connected and active against a deployment, to
   see how MicroTAK holds up under constant use.
-- More tests for `microtak-admin-cli` (currently the least covered part).
 
 ## Later
 

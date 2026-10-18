@@ -541,6 +541,8 @@ impl App {
         .with_groups(Arc::clone(&groups))
         .with_admission(admission)
         .with_missions(mission_notifier)
+        // `<buffer><latestSA enable="true"/>`, the official default.
+        .with_latest_sa()
         // The official default input (`protocol="tls"`) negotiates TAK
         // Protocol.
         .with_tak_protocol(crate::transport::tls::TakProtocol {
