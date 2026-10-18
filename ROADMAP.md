@@ -21,7 +21,9 @@ This file lists direction, not dates.
   and invite-only missions, change notifications on the CoT stream,
   layers, logs, invitations, subscriptions, contacts, mission packages
   (export and import of plain data packages), streamed mission content,
-  `pagedmissions` / `missioncount`, external mission data.
+  `pagedmissions` / `missioncount`, external mission data, map layers,
+  mission copy and send, offline change sets (`changes.json`) on package
+  import.
 - `/Marti/api/contacts/all`, `/Marti/api/subscriptions/all`,
   `/Marti/api/security/isSecure`.
 - Persistence and backups, Docker images and Helm chart (amd64 and arm64),
@@ -32,10 +34,8 @@ This file lists direction, not dates.
 
 ## Next: the rest of the official Mission API
 
-- Mission map layers (`/missions/{name}/maplayers`).
-- Mission copy and send (`/missions/{name}/copy`, `/missions/{name}/send`).
-- Mission KML (`/missions/{name}/kml`).
-- Offline change sets (`changes.json`) when importing a mission package.
+- Mission KML (`/missions/{name}/kml`): the official server's KML builder,
+  icon styles and HAE-to-MSL conversion (geoid data).
 - Mission feeds, together with the data feed API they depend on
   (`/Marti/api/datafeeds`).
 
