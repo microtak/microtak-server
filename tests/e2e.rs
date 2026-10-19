@@ -3297,3 +3297,109 @@ fn hex_sha256(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect()
 }
+
+/// A streaming data feed end to end: the admin creates an `stcp` feed, a
+/// bridge (e.g. an APRS gateway) streams CoT into the feed's own port, and
+/// connected devices get it marked with the feed (`<source
+/// type="dataFeed">`, official `DataFeedFilter`); deleting the feed closes
+/// its port.
+#[tokio::test]
+async fn e2e_a_streaming_data_feed_marks_and_relays_its_events() {
+    let free_port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let app = App::bind(AppConfig {
+        admin_common_name: Some("admin".to_string()),
+        ..test_config()
+    })
+    .await
+    .unwrap();
+    let enrollment_addr = app.enrollment_addr().unwrap();
+    let marti_api_addr = app.marti_api_addr().unwrap();
+    let mtls_addr = app.mtls_addr().unwrap();
+    let ca_cert_pem = app.ca_cert_pem.clone();
+    let bootstrap = std::fs::read_to_string(app.bootstrap_token_path().unwrap()).unwrap();
+    tokio::spawn(app.run());
+    let enroll_url = format!("https://{enrollment_addr}");
+    let api = format!("https://{SERVER_NAME}:{}", marti_api_addr.port());
+
+    let (csr, admin_key) = pki::build_csr("admin").unwrap();
+    let body: serde_json::Value = enrollment_client()
+        .post(format!(
+            "{enroll_url}/Marti/api/tls/signClient/v2?token={}",
+            bootstrap.trim()
+        ))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(csr)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let admin_cert = wrap_pem(body["signedCert"].as_str().unwrap());
+    let admin = mtls_reqwest_client(&ca_cert_pem, &admin_cert, admin_key, marti_api_addr);
+    let (phone_cert, phone_key) = enroll(&enroll_url, "phone").await;
+    let mut phone = connect_mtls(mtls_addr, &ca_cert_pem, &phone_cert, phone_key)
+        .await
+        .unwrap();
+
+    let created = admin
+        .post(format!("{api}/Marti/api/datafeeds"))
+        .json(&serde_json::json!({
+            "name": "aprs bridge", "type": "Streaming", "protocol": "stcp",
+            "port": free_port, "auth": "ANONYMOUS", "tag": ["aprs"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    let feed: serde_json::Value = admin
+        .get(format!("{api}/Marti/api/datafeeds/aprs%20bridge"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let uuid = feed["data"]["uuid"].as_str().unwrap().to_string();
+
+    let feed_addr: SocketAddr = format!("127.0.0.1:{free_port}").parse().unwrap();
+    let mut bridge = None;
+    for _ in 0..50 {
+        match TcpStream::connect(feed_addr).await {
+            Ok(stream) => {
+                bridge = Some(stream);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let mut bridge = bridge.expect("the feed's port opens");
+    let station = r#"<event version="2.0" uid="APRS.DL1ABC" type="a-f-G-U-C" how="h-e" time="2026-10-19T08:00:00Z" start="2026-10-19T08:00:00Z" stale="2026-10-19T09:00:00Z"><point lat="52.5" lon="13.4" hae="0" ce="10" le="10"/><detail><contact callsign="DL1ABC"/></detail></event>"#;
+    bridge.write_all(station.as_bytes()).await.unwrap();
+    let got = read_until_contains(&mut phone, "APRS.DL1ABC").await;
+    assert!(
+        got.contains(&format!(
+            r#"<source type="dataFeed" name="aprs bridge" uid="{uuid}"><tag>aprs</tag></source></detail>"#
+        )),
+        "{got}"
+    );
+
+    let deleted = admin
+        .delete(format!("{api}/Marti/api/datafeeds/aprs%20bridge"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 200);
+    let mut closed = false;
+    for _ in 0..50 {
+        if TcpStream::connect(feed_addr).await.is_err() {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(closed, "deleting the feed closes its port");
+}

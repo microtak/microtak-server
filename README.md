@@ -279,6 +279,14 @@ Data feeds are managed with the official API (`/Marti/api/datafeeds`:
 create, list, update, delete). Officially every user may manage them; in
 MicroTAK only the admin may, unless `datafeeds_admin_only = false`.
 
+A `Streaming` feed with protocol `stcp`/`tcp` (plain TCP) or `tls` (mTLS
+with MicroTAK's CA) and a port gets its own listener, e.g. for a bridge
+that feeds APRS or mesh positions in. Every event arriving there is marked
+with the feed (`<source type="dataFeed" name="…" uid="…">` and its tags in
+`<detail>`, as the official server does) and relayed into the feed's filter
+groups. Creating, changing or deleting a feed opens, moves or closes its
+port; behind a firewall or in Kubernetes, expose the port yourself.
+
 ### TLS certificates
 
 - **Server names**: the server certificate names `server_common_name`

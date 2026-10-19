@@ -252,6 +252,79 @@ pub(crate) fn cot_time(unix_millis: i64) -> String {
 /// The event without its first `/event/detail/marti` element, as the
 /// official server forwards CoT (`StreamingEndpointRewriteFilter` detaches
 /// `MARTI_XPATH` from every streamed event). Unchanged if there is none.
+/// `DataFeedFilter.filter`: mark an event as coming from a data feed --
+/// `<source type="dataFeed" name=".." uid=".."><tag>..</tag></source>`
+/// appended to `<detail>` (created if missing). Unparseable XML is
+/// returned unchanged.
+pub fn add_feed_source(xml: &str, feed_uuid: &str, feed_name: &str, tags: &[String]) -> String {
+    use quick_xml::events::Event as X;
+    let attr = |v: &str| {
+        v.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let text = |v: &str| {
+        v.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let source = if tags.is_empty() {
+        format!(
+            r#"<source type="dataFeed" name="{}" uid="{}"/>"#,
+            attr(feed_name),
+            attr(feed_uuid)
+        )
+    } else {
+        let tags: String = tags
+            .iter()
+            .map(|t| format!("<tag>{}</tag>", text(t)))
+            .collect();
+        format!(
+            r#"<source type="dataFeed" name="{}" uid="{}">{tags}</source>"#,
+            attr(feed_name),
+            attr(feed_uuid)
+        )
+    };
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut depth = 0usize;
+    let mut in_detail = false;
+    loop {
+        let before = reader.buffer_position() as usize;
+        match reader.read_event() {
+            Ok(X::Start(e)) => {
+                depth += 1;
+                if depth == 2 && e.name().as_ref() == b"detail" {
+                    in_detail = true;
+                }
+            }
+            Ok(X::Empty(e)) if depth == 1 && e.name().as_ref() == b"detail" => {
+                let after = reader.buffer_position() as usize;
+                return format!(
+                    "{}<detail>{source}</detail>{}",
+                    &xml[..before],
+                    &xml[after..]
+                );
+            }
+            Ok(X::End(e)) => {
+                if depth == 2 && in_detail && e.name().as_ref() == b"detail" {
+                    return format!("{}{source}{}", &xml[..before], &xml[before..]);
+                }
+                if depth == 1 && e.name().as_ref() == b"event" {
+                    return format!(
+                        "{}<detail>{source}</detail>{}",
+                        &xml[..before],
+                        &xml[before..]
+                    );
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Ok(X::Eof) | Err(_) => return xml.to_string(),
+            _ => {}
+        }
+    }
+}
+
 pub fn strip_marti(xml: &str) -> std::borrow::Cow<'_, str> {
     use quick_xml::events::Event as X;
     let mut reader = quick_xml::Reader::from_str(xml);
@@ -404,6 +477,29 @@ impl Event {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn feed_source_is_appended_to_the_detail() {
+        let tags = vec!["aprs".to_string(), "a&b".to_string()];
+        let with_detail = r#"<event uid="x"><point lat="1" lon="2"/><detail><contact callsign="A"/></detail></event>"#;
+        assert_eq!(
+            add_feed_source(with_detail, "u-1", "aprs bridge", &tags),
+            r#"<event uid="x"><point lat="1" lon="2"/><detail><contact callsign="A"/><source type="dataFeed" name="aprs bridge" uid="u-1"><tag>aprs</tag><tag>a&amp;b</tag></source></detail></event>"#
+        );
+        assert_eq!(
+            add_feed_source(r#"<event uid="x"><detail/></event>"#, "u", "n", &[]),
+            r#"<event uid="x"><detail><source type="dataFeed" name="n" uid="u"/></detail></event>"#
+        );
+        assert_eq!(
+            add_feed_source(r#"<event uid="x"><point/></event>"#, "u", "n", &[]),
+            r#"<event uid="x"><point/><detail><source type="dataFeed" name="n" uid="u"/></detail></event>"#
+        );
+        let nested = r#"<event uid="x"><detail><a><detail/></a></detail></event>"#;
+        assert!(
+            add_feed_source(nested, "u", "n", &[])
+                .ends_with(r#"</a><source type="dataFeed" name="n" uid="u"/></detail></event>"#)
+        );
+    }
 
     const MINIMAL_EVENT: &str = r#"<event version="2.0" uid="TEST-UID-1" type="a-f-G-U-C" how="m-g" time="2026-09-21T12:00:00Z" start="2026-09-21T12:00:00Z" stale="2026-09-21T12:05:00Z"><point lat="53.2500" lon="10.4000" hae="10.0" ce="5.0" le="3.0"/></event>"#;
 

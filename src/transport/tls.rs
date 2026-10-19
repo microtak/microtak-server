@@ -119,6 +119,7 @@ pub struct TlsRelay {
     tak_protocol: Option<Arc<TakProtocol>>,
     latest_sa: bool,
     validate_client_uid: bool,
+    feed: Option<Arc<super::feeds::FeedTag>>,
 }
 
 /// TAK Protocol negotiation on this listener, as on an official
@@ -154,6 +155,7 @@ impl TlsRelay {
             tak_protocol: None,
             latest_sa: false,
             validate_client_uid: false,
+            feed: None,
         })
     }
 
@@ -162,6 +164,13 @@ impl TlsRelay {
     /// whose messages reach it.
     pub fn with_latest_sa(mut self) -> Self {
         self.latest_sa = true;
+        self
+    }
+
+    /// A data feed's input (see `super::feeds`): its events are marked with
+    /// the feed and sent into the feed's groups.
+    pub fn with_feed(mut self, feed: Arc<super::feeds::FeedTag>) -> Self {
+        self.feed = Some(feed);
         self
     }
 
@@ -225,6 +234,7 @@ impl TlsRelay {
             let tak_protocol = self.tak_protocol.clone();
             let latest_sa = self.latest_sa;
             let validate_client_uid = self.validate_client_uid;
+            let feed = self.feed.clone();
             tokio::spawn(async move {
                 let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
                     return;
@@ -280,6 +290,7 @@ impl TlsRelay {
                         tak_protocol,
                         latest_sa,
                         validate_client_uid,
+                        feed,
                     },
                 )
                 .await;
@@ -318,6 +329,7 @@ struct Shared {
     tak_protocol: Option<Arc<TakProtocol>>,
     latest_sa: bool,
     validate_client_uid: bool,
+    feed: Option<Arc<super::feeds::FeedTag>>,
 }
 
 async fn handle_client(
@@ -337,6 +349,7 @@ async fn handle_client(
         tak_protocol,
         latest_sa,
         validate_client_uid,
+        feed,
     } = shared;
     // The connection's client uid (the official subscription's
     // `clientUid`): from its first message with a contact endpoint
@@ -529,7 +542,11 @@ async fn handle_client(
                                         warn!(%peer, cn, uid = %event.uid, reason, "dropping event that impersonates another device");
                                         continue;
                                     }
-                                    let relayed: Arc<str> = crate::cot::strip_marti(&xml).into_owned().into();
+                                    let stripped = crate::cot::strip_marti(&xml);
+                                    let relayed: Arc<str> = match &feed {
+                                        Some(feed) => feed.mark(&stripped).into(),
+                                        None => stripped.into_owned().into(),
+                                    };
                                     if event.is_situational_awareness() && my_uid().as_deref() == Some(event.uid.as_str()) {
                                         clients.set_latest_sa(peer, Arc::clone(&relayed));
                                     }
@@ -556,7 +573,10 @@ async fn handle_client(
                                         sender: peer,
                                         xml: relayed,
                                         dest_uids,
-                                        groups: Arc::new(groups.active_groups(Some(&cn), Direction::In)),
+                                        groups: Arc::new(match &feed {
+                                            Some(feed) if !feed.groups.is_empty() => feed.groups.clone(),
+                                            _ => groups.active_groups(Some(&cn), Direction::In),
+                                        }),
                                         origin: crate::transport::hub::Origin::Client,
                                     });
                                 },

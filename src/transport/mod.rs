@@ -21,6 +21,7 @@
 pub mod admission;
 pub mod codec;
 pub mod connections;
+pub mod feeds;
 pub mod hub;
 pub mod identity;
 pub mod proxy_protocol;

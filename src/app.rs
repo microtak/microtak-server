@@ -278,6 +278,8 @@ pub struct App {
     interface_watch: Option<InterfaceWatch>,
     /// Set when `metrics_addr` is.
     metrics: Option<(tokio::net::TcpListener, metrics::Sources)>,
+    pub datafeeds: Arc<crate::datafeeds::DataFeedStore>,
+    feed_inputs: crate::transport::feeds::FeedInputs,
 }
 
 /// What the background task re-issuing the server cert on address changes
@@ -585,6 +587,16 @@ impl App {
         } else {
             None
         };
+        // Streaming data feeds' own listeners (`transport::feeds`).
+        let feed_inputs = crate::transport::feeds::FeedInputs {
+            bind_ip: config.mtls_addr.ip(),
+            hub: hub.clone(),
+            clients: clients.clone(),
+            groups: Arc::clone(&groups),
+            registry: Arc::clone(&registry),
+            tls_config: Arc::clone(&tls_server_config),
+            admission: admission.clone(),
+        };
         let tls = TlsRelay::bind(
             config.mtls_addr,
             tls_server_config,
@@ -634,6 +646,8 @@ impl App {
             enrollment_cert_watch,
             interface_watch,
             metrics,
+            datafeeds,
+            feed_inputs,
         })
     }
 
@@ -688,8 +702,11 @@ impl App {
             enrollment_cert_watch,
             interface_watch,
             metrics,
+            datafeeds,
+            feed_inputs,
             ..
         } = self;
+        tokio::spawn(crate::transport::feeds::run(datafeeds, feed_inputs));
         if let Some((listener, sources)) = metrics {
             tokio::spawn(async move {
                 if let Err(error) = metrics::serve(listener, sources).await {

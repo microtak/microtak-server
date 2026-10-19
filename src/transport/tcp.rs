@@ -32,6 +32,7 @@ pub struct TcpRelay {
     groups: Arc<GroupStore>,
     admission: Admission,
     latest_sa: bool,
+    feed: Option<Arc<super::feeds::FeedTag>>,
 }
 
 impl TcpRelay {
@@ -48,6 +49,7 @@ impl TcpRelay {
             groups: Arc::new(GroupStore::in_memory()),
             admission: Admission::default(),
             latest_sa: false,
+            feed: None,
         })
     }
 
@@ -63,6 +65,13 @@ impl TcpRelay {
     /// are unauthenticated, so they are always `__ANON__` both ways.
     pub fn with_groups(mut self, groups: Arc<GroupStore>) -> Self {
         self.groups = groups;
+        self
+    }
+
+    /// A data feed's input (see `super::feeds`): its events are marked with
+    /// the feed and sent into the feed's groups.
+    pub fn with_feed(mut self, feed: Arc<super::feeds::FeedTag>) -> Self {
+        self.feed = Some(feed);
         self
     }
 
@@ -86,15 +95,24 @@ impl TcpRelay {
             let rx = self.hub.subscribe();
             let clients = self.clients.clone();
             let groups = Arc::clone(&self.groups);
-            let latest_sa = self.latest_sa;
+            let options = Options {
+                latest_sa: self.latest_sa,
+                feed: self.feed.clone(),
+            };
             tokio::spawn(async move {
                 let Some((peer, _permit)) = admission.admit_stream(&mut stream, peer).await else {
                     return;
                 };
-                handle_client(stream, peer, tx, rx, clients, groups, latest_sa).await;
+                handle_client(stream, peer, tx, rx, clients, groups, options).await;
             });
         }
     }
+}
+
+/// A listener's per-connection options.
+struct Options {
+    latest_sa: bool,
+    feed: Option<Arc<super::feeds::FeedTag>>,
 }
 
 async fn handle_client(
@@ -104,8 +122,9 @@ async fn handle_client(
     mut rx: broadcast::Receiver<Outbound>,
     clients: ConnectedClients,
     groups: Arc<GroupStore>,
-    latest_sa: bool,
+    options: Options,
 ) {
+    let Options { latest_sa, feed } = options;
     info!(%peer, "client connected");
     clients.register(ClientEndpoint {
         remote_addr: peer,
@@ -183,7 +202,11 @@ async fn handle_client(
                                     // broadcast channel (no subscribers at
                                     // all) is not an error for the sender.
                                     crate::metrics::inc(&crate::metrics::COUNTERS.cot_events_tcp);
-                                    let relayed: Arc<str> = crate::cot::strip_marti(&xml).into_owned().into();
+                                    let stripped = crate::cot::strip_marti(&xml);
+                                    let relayed: Arc<str> = match &feed {
+                                        Some(feed) => feed.mark(&stripped).into(),
+                                        None => stripped.into_owned().into(),
+                                    };
                                     if client_uid.is_none()
                                         && event.detail.as_ref().and_then(|d| d.contact.as_ref()).is_some_and(|c| c.endpoint.is_some())
                                     {
@@ -197,7 +220,10 @@ async fn handle_client(
                                         sender: peer,
                                         xml: relayed,
                                         dest_uids,
-                                        groups: Arc::new(groups.active_groups(None, Direction::In)),
+                                        groups: Arc::new(match &feed {
+                                            Some(feed) if !feed.groups.is_empty() => feed.groups.clone(),
+                                            _ => groups.active_groups(None, Direction::In),
+                                        }),
                                         origin: crate::transport::hub::Origin::Client,
                                     });
                                 }
