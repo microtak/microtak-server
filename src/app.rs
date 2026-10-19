@@ -64,6 +64,9 @@ pub struct AppConfig {
     /// the `clientUid` its certificate was enrolled for, or the connection
     /// ends. **On by default** (officially off).
     pub validate_client_uid: bool,
+    /// Only the admin may create, change or delete data feeds (a streaming
+    /// feed opens a port). **On by default**; officially everyone may.
+    pub datafeeds_admin_only: bool,
     /// Common Name for a freshly-generated CA (ignored if a CA already
     /// exists in `data_dir`).
     pub ca_common_name: String,
@@ -192,6 +195,7 @@ impl Default for AppConfig {
             plain_tcp_enabled: false,
             mtls_addr: "0.0.0.0:8089".parse().unwrap(),
             validate_client_uid: true,
+            datafeeds_admin_only: true,
             ca_common_name: "MicroTAK CA".to_string(),
             server_common_name: "microtak-server".to_string(),
             server_names: Vec::new(),
@@ -235,6 +239,8 @@ pub enum AppError {
     OAuthKey(#[from] oauth::JwtSignerError),
     #[error("resource store error: {0}")]
     Resources(#[from] SyncError),
+    #[error("data feed store setup failed: {0}")]
+    DataFeeds(#[from] crate::datafeeds::DataFeedError),
     #[error("device profile store setup failed: {0}")]
     Profiles(#[from] crate::profiles::ProfileError),
     #[error("I/O error: {0}")]
@@ -325,6 +331,9 @@ impl App {
         let profiles = Arc::new(crate::profiles::ProfileStore::load_or_create(
             config.data_dir.join("device-profiles.log"),
             config.data_dir.join("profile-content"),
+        )?);
+        let datafeeds = Arc::new(crate::datafeeds::DataFeedStore::load_or_create(
+            config.data_dir.join("datafeeds.log"),
         )?);
         let users = Arc::new(UserStore::load_or_create(
             config.data_dir.join("users.log"),
@@ -506,6 +515,14 @@ impl App {
             latest_cot: Arc::clone(&latest_cot),
         }))
         .merge(admin::router(admin_state))
+        .merge(crate::marti::datafeeds::router(
+            crate::marti::datafeeds::DataFeedsState {
+                store: Arc::clone(&datafeeds),
+                groups: Arc::clone(&groups),
+                admin_common_name: config.admin_common_name.clone(),
+                admin_only: config.datafeeds_admin_only,
+            },
+        ))
         .merge(crate::marti::profiles::router(
             crate::marti::profiles::ProfilesState {
                 store: profiles,

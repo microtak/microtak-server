@@ -33,6 +33,9 @@ pub struct Config {
     /// `clientUid` its certificate was enrolled for (default `true`;
     /// officially `false`).
     pub validate_client_uid: bool,
+    /// Only the admin manages data feeds (default `true`; officially
+    /// everyone may).
+    pub datafeeds_admin_only: bool,
     pub ca_common_name: String,
     pub server_common_name: String,
     /// Extra IPs/DNS names for the server certificate -- see
@@ -102,6 +105,7 @@ impl Default for Config {
             plain_tcp_enabled: defaults.plain_tcp_enabled,
             mtls_port: defaults.mtls_addr.port(),
             validate_client_uid: defaults.validate_client_uid,
+            datafeeds_admin_only: defaults.datafeeds_admin_only,
             ca_common_name: defaults.ca_common_name,
             server_common_name: defaults.server_common_name,
             server_names: defaults.server_names,
@@ -206,6 +210,7 @@ impl Config {
             plain_tcp_enabled: self.plain_tcp_enabled,
             mtls_addr: SocketAddr::new(bind_ip, self.mtls_port),
             validate_client_uid: self.validate_client_uid,
+            datafeeds_admin_only: self.datafeeds_admin_only,
             ca_common_name: self.ca_common_name.clone(),
             server_common_name: self.server_common_name.clone(),
             server_names: self.server_names.clone(),

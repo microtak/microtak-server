@@ -273,6 +273,12 @@ files with `PUT …/{name}/file?filename=…`, set type, groups and `active` wit
 `PUT …/{name}/directories/{dir,dir}`, and devices fetch files or folders
 with `GET /Marti/api/device/profile/tool/{tool}/file?relativePath=/…`.
 
+### Data feeds
+
+Data feeds are managed with the official API (`/Marti/api/datafeeds`:
+create, list, update, delete). Officially every user may manage them; in
+MicroTAK only the admin may, unless `datafeeds_admin_only = false`.
+
 ### TLS certificates
 
 - **Server names**: the server certificate names `server_common_name`

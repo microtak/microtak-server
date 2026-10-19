@@ -15,6 +15,7 @@ pub mod clientip;
 pub mod config;
 pub mod content_store;
 pub mod cot;
+pub mod datafeeds;
 pub mod enrollment_tokens;
 pub mod eventlog;
 pub mod groups;

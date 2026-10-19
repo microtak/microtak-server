@@ -59,6 +59,7 @@ pub mod admin;
 pub mod client_endpoints;
 pub mod contacts;
 pub mod content;
+pub mod datafeeds;
 pub mod discovery;
 pub mod enrollment;
 pub mod envelope;
