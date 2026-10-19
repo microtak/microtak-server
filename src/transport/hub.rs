@@ -50,6 +50,9 @@ pub struct Outbound {
     /// Who produced it: a client's event, or the server's own message
     /// (mission notifications).
     pub origin: Origin,
+    /// The TAK Protocol frame, encoded once by the first protobuf receiver
+    /// and shared by the rest (`None` inside: it can't be sent as one).
+    pub proto: Arc<std::sync::OnceLock<Option<Arc<[u8]>>>>,
 }
 
 /// Where an [`Outbound`] came from.
@@ -79,6 +82,7 @@ impl Outbound {
             dest_uids: Some(uids.into()),
             groups: Arc::new(Default::default()),
             origin: Origin::Server { skip_uid: None },
+            proto: Default::default(),
         }
     }
 
@@ -96,6 +100,7 @@ impl Outbound {
             origin: Origin::Server {
                 skip_uid: skip_uid.map(Into::into),
             },
+            proto: Default::default(),
         }
     }
 
@@ -195,6 +200,7 @@ mod tests {
             }),
             groups: Arc::new(std::collections::BTreeSet::from(["__ANON__".to_string()])),
             origin: Origin::Client,
+            proto: Default::default(),
         }
     }
 

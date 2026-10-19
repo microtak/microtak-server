@@ -189,6 +189,8 @@ enum GroupEvent {
 pub struct GroupStore {
     state: RwLock<State>,
     log: Option<EventLog<GroupEvent>>,
+    /// Bumped on every change, so relays can cache group lookups.
+    version: std::sync::atomic::AtomicU64,
 }
 
 fn fresh_state() -> State {
@@ -223,6 +225,7 @@ impl GroupStore {
     pub fn in_memory() -> Self {
         Self {
             state: RwLock::new(fresh_state()),
+            version: Default::default(),
             log: None,
         }
     }
@@ -232,6 +235,7 @@ impl GroupStore {
         let log = EventLog::open_and_replay(path, &mut state, apply_event)?;
         Ok(Self {
             state: RwLock::new(state),
+            version: Default::default(),
             log: Some(log),
         })
     }
@@ -241,7 +245,14 @@ impl GroupStore {
             log.append(&event)?;
         }
         apply_event(state, &event);
+        self.version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// Changes so far: equal versions mean equal answers.
+    pub fn version(&self) -> u64 {
+        self.version.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn create(
@@ -524,6 +535,21 @@ mod tests {
 
     /// Official anonymous assignment: no memberships -> `__ANON__` both
     /// ways, so a deployment without groups behaves as before.
+    #[test]
+    fn every_change_bumps_the_version() {
+        let store = GroupStore::in_memory();
+        let v0 = store.version();
+        store.create("Red", None, 0).unwrap();
+        let v1 = store.version();
+        assert!(v1 > v0);
+        store
+            .set_member("Red", "alpha", Some(Membership::Both))
+            .unwrap();
+        assert!(store.version() > v1);
+        let _ = store.active_groups(Some("alpha"), Direction::Out);
+        assert_eq!(store.version(), store.version(), "reads don't change it");
+    }
+
     #[test]
     fn identities_without_memberships_are_anonymous_both_ways() {
         let store = GroupStore::in_memory();

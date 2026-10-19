@@ -441,6 +441,7 @@ async fn handle_client(
         }
     };
 
+    let mut out_groups: Option<(u64, std::collections::BTreeSet<String>)> = None;
     loop {
         tokio::select! {
             // Revoking this certificate or blocking this identity cuts the
@@ -578,6 +579,7 @@ async fn handle_client(
                                             _ => groups.active_groups(Some(&cn), Direction::In),
                                         }),
                                         origin: crate::transport::hub::Origin::Client,
+                                        proto: Default::default(),
                                     });
                                 },
                                 DecodedItem::Skipped { error, .. } => {
@@ -608,13 +610,26 @@ async fn handle_client(
                         // sender's IN groups meet this device's active OUT
                         // groups -- looked up per message, so membership
                         // and channel changes apply without reconnecting.
-                        if !msg.reaches(&groups.active_groups(Some(&cn), Direction::Out)) {
+                        // Cached until the group store changes.
+                        let version = groups.version();
+                        if out_groups.as_ref().is_none_or(|(v, _)| *v != version) {
+                            out_groups = Some((version, groups.active_groups(Some(&cn), Direction::Out)));
+                        }
+                        if !msg.reaches(&out_groups.as_ref().expect("just set").1) {
                             continue;
                         }
                         // A message the protobuf encoder can't send (over
                         // 64 KiB with no file URL) is dropped, as officially.
-                        let Some(bytes) = encode(protobuf, &msg.xml) else {
-                            continue;
+                        let bytes: std::borrow::Cow<'_, [u8]> = if protobuf {
+                            let shared = msg.proto.get_or_init(|| {
+                                encode(true, &msg.xml).map(Into::into)
+                            });
+                            match shared {
+                                Some(frame) => std::borrow::Cow::Borrowed(&frame[..]),
+                                None => continue,
+                            }
+                        } else {
+                            std::borrow::Cow::Borrowed(msg.xml.as_bytes())
                         };
                         if let Err(error) = writer.write_all(&bytes).await {
                             warn!(%peer, %error, "write error, disconnecting client");

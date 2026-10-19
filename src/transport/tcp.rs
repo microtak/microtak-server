@@ -225,6 +225,7 @@ async fn handle_client(
                                             _ => groups.active_groups(None, Direction::In),
                                         }),
                                         origin: crate::transport::hub::Origin::Client,
+                                        proto: Default::default(),
                                     });
                                 }
                                 DecodedItem::Skipped { error, .. } => {
