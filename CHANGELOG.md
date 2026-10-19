@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.15.0](https://github.com/microtak/microtak-server/compare/v0.14.0...v0.15.0) (2026-10-19)
+
+
+### Features
+
+* **datafeeds:** data feed management API ([c321a5d](https://github.com/microtak/microtak-server/commit/c321a5ddc5ec27bc795fa48f3832fd1e041d1924))
+* **datafeeds:** listeners for streaming data feeds ([00ab538](https://github.com/microtak/microtak-server/commit/00ab5384d49554440733731ea0aca9e15702d2a2))
+* **missions:** mission feeds ([7bcb893](https://github.com/microtak/microtak-server/commit/7bcb89307f8b4c3451b52759739840457c80a1a6))
+* **profiles:** profile directories ([3227c2e](https://github.com/microtak/microtak-server/commit/3227c2e65ba1cfccc700db20d67a6474e8acffd6))
+
+
+### Bug Fixes
+
+* **marti:** routine client disconnects logged at debug, not warn ([f028438](https://github.com/microtak/microtak-server/commit/f028438eaacffb55cb7c34847ed128f4f7642e55))
+* **sync:** PUT /sync/metadata/{hash}/{tool|MIMEType} ([96aa077](https://github.com/microtak/microtak-server/commit/96aa077edc61a871068d115c92f55fbd86d1caab))
+* **transport:** drop connections to vanished clients after 60 s ([1c99d60](https://github.com/microtak/microtak-server/commit/1c99d60b6f97f9b3afd342ef6385ec1e465ba5f9))
+
+
+### Performance
+
+* **transport:** encode each message for TAK Protocol once, cache group lookups ([c160e7d](https://github.com/microtak/microtak-server/commit/c160e7de41df0bd64b8a16a34a631efe44fe0e45))
+
 ## [0.14.0](https://github.com/microtak/microtak-server/compare/v0.13.0...v0.14.0) (2026-10-18)
 
 
