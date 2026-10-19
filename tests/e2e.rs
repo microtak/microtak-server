@@ -3148,3 +3148,152 @@ async fn e2e_device_profiles_reach_the_enrolling_phone() {
         .unwrap();
     assert_eq!(listing.status(), 403, "the admin API is the admin's");
 }
+
+/// A geotagged photo into a mission, exactly as real clients send it --
+/// replayed from their source code, not from MicroTAK's:
+/// - CloudTAK / node-tak v12.31.1: `Mission.get`, `Mission.create`
+///   (`lib/api/mission.ts` l.887, l.918-963: body keys as query, no body),
+///   `Mission.setKeywords` (l.970-990, `MissionAuthorization: Bearer`),
+///   `Files.upload` (`lib/api/files.ts` l.184-206: raw body, lat/lon as
+///   query), `Mission.attachContents` by guid (l.508-521);
+/// - ATAK-CIV `commoncommo/core/impl/missionpackagemanager.cpp`
+///   l.1107-1180: `GET /Marti/sync/missionquery?hash=` before uploading and
+///   `PUT /Marti/api/sync/metadata/{hash}/tool` (text/plain) after;
+/// - OmniTAK-Android `data/TakRestApiClient.kt` l.158-168: attach by mission
+///   name without a token.
+#[tokio::test]
+async fn e2e_clients_put_a_geotagged_photo_into_a_mission() {
+    let (client, base, ..) = sync_client("cloudtak-user").await;
+    let photo: &[u8] = b"\xff\xd8\xff\xe0 not really a jpeg, but bytes are bytes";
+    let hash = hex_sha256(photo);
+    let mission = format!("{base}/Marti/api/missions/Germany-Cities");
+
+    let get = client.get(&mission).send().await.unwrap();
+    assert_eq!(get.status(), 404, "node-tak checks first");
+    let created = client
+        .post(format!(
+            "{mission}?description=Test+data+from+Wikimedia+Commons&creatorUid=ANDROID-CloudTAK-1"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let created: serde_json::Value = created.json().await.unwrap();
+    let guid = created["data"][0]["guid"].as_str().unwrap().to_string();
+    let token = created["data"][0]["token"].as_str().unwrap().to_string();
+    let keywords = client
+        .put(format!("{mission}/keywords"))
+        .header("MissionAuthorization", format!("Bearer {token}"))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"["test-data","wikimedia-commons"]"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keywords.status(), 200);
+
+    let query = format!("{base}/Marti/sync/missionquery?hash={hash}");
+    assert_eq!(
+        client.get(&query).send().await.unwrap().status(),
+        404,
+        "ATAK's CHECK: not there yet"
+    );
+    let uploaded = client
+        .post(format!(
+            "{base}/Marti/sync/upload?name=M%C3%BCnchen+-+Neues+Rathaus.jpg&keywords=Wikimedia+Commons%2CCity%3A+M%C3%BCnchen&creatorUid=ANDROID-CloudTAK-1&longitude=11.5755&latitude=48.1374"
+        ))
+        .header(CONTENT_TYPE, "image/jpeg")
+        .body(photo.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), 200);
+    let meta: serde_json::Value = uploaded.json().await.unwrap();
+    assert_eq!(meta["Hash"], hash);
+    // Officially too: a raw upload gets a random uid (UploadServlet l.296),
+    // and missionquery looks the hash up as a uid -- ATAK's CHECK is for
+    // mission packages (uid = hash), so this file still isn't "there".
+    assert_eq!(client.get(&query).send().await.unwrap().status(), 404);
+
+    let attached = client
+        .put(format!("{base}/Marti/api/missions/guid/{guid}/contents"))
+        .header("MissionAuthorization", format!("Bearer {token}"))
+        .header(CONTENT_TYPE, "application/json")
+        .body(format!(r#"{{"hashes":["{hash}"]}}"#))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(attached.status(), 200);
+
+    // ATAK marks a package sent to contacts as private.
+    let tool = client
+        .put(format!("{base}/Marti/api/sync/metadata/{hash}/tool"))
+        .header(CONTENT_TYPE, "text/plain")
+        .body("private")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tool.status(), 200);
+    let private: serde_json::Value = client
+        .get(format!("{base}/Marti/sync/search?tool=private&hash={hash}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(private["resultCount"], 1, "{private}");
+    let other = client
+        .put(format!("{base}/Marti/api/sync/metadata/{hash}/name"))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), 400, "only tool and MIMEType");
+    let missing = client
+        .put(format!(
+            "{base}/Marti/api/sync/metadata/{}/tool",
+            "0".repeat(64)
+        ))
+        .body("public")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+
+    let again = client
+        .put(format!("{mission}/contents"))
+        .header(CONTENT_TYPE, "application/json")
+        .body(format!(r#"{{"hashes":["{hash}"]}}"#))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200, "OmniTAK attaches by name");
+
+    let got: serde_json::Value = client
+        .get(&mission)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let contents = got["data"][0]["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 1, "no duplicate: {got}");
+    let data = &contents[0]["data"];
+    assert_eq!(data["hash"], hash);
+    assert_eq!(data["name"], "München - Neues Rathaus.jpg");
+    assert_eq!(data["latitude"], 48.1374);
+    assert_eq!(data["longitude"], 11.5755);
+    assert_eq!(
+        got["data"][0]["keywords"],
+        serde_json::json!(["test-data", "wikimedia-commons"])
+    );
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}

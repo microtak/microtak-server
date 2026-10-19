@@ -86,6 +86,7 @@ pub fn router(state: SyncState) -> Router {
             "/Marti/api/sync/metadata/:hash/expiration",
             put(set_expiration),
         )
+        .route("/Marti/api/sync/metadata/:hash/:field", put(set_metadata))
         // Bodies are streamed to disk; the configured upload limit applies.
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state)
@@ -825,6 +826,56 @@ async fn set_keywords(
         return StatusCode::NOT_FOUND.into_response();
     }
     match state.resources.set_keywords(&hash, keywords) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// The official `MartiSafeString` (`validation.properties`), at most 255
+/// characters.
+fn marti_safe(value: &str) -> bool {
+    value.chars().count() <= 255
+        && value.chars().all(|c| {
+            c.is_alphanumeric()
+                || c == '_'
+                || c.is_whitespace()
+                || ".()!=@#$&^*-+[]{}:,/|\\".contains(c)
+        })
+}
+
+/// `MetadataApi.setMetadata`: `tool` or `MIMEType` (any case) of the
+/// caller's resources with this hash; 400 for other fields or unsafe
+/// values, 404 when there are none.
+async fn set_metadata(
+    State(state): State<SyncState>,
+    Extension(identity): Extension<PeerIdentity>,
+    Path((hash, field)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> Response {
+    let value = String::from_utf8_lossy(&body).into_owned();
+    if hash.is_empty()
+        || field.is_empty()
+        || !marti_safe(&hash)
+        || !marti_safe(&field)
+        || !marti_safe(&value)
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let field = field.to_lowercase();
+    if field != "tool" && field != "mimetype" {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let groups = viewer_groups(&state, &identity);
+    let keys: Vec<i64> = state
+        .resources
+        .by_hash(&hash, groups.as_ref())
+        .iter()
+        .map(|r| r.primary_key)
+        .collect();
+    if keys.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match state.resources.set_field(&keys, &field, &value) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }

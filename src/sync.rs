@@ -102,6 +102,12 @@ enum SyncEvent {
         keys: Vec<i64>,
         expiration: Option<i64>,
     },
+    /// `MetadataApi.setMetadata`: `tool` or `mimetype` on these rows.
+    FieldSetKeys {
+        keys: Vec<i64>,
+        field: String,
+        value: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -136,6 +142,19 @@ fn apply(state: &mut SyncState, event: &SyncEvent) {
                 .filter(|r| keys.contains(&r.primary_key))
             {
                 r.submission_user = user.clone();
+            }
+        }
+        SyncEvent::FieldSetKeys { keys, field, value } => {
+            for r in state
+                .resources
+                .iter_mut()
+                .filter(|r| keys.contains(&r.primary_key))
+            {
+                match field.as_str() {
+                    "tool" => r.tool = Some(value.clone()),
+                    "mimetype" => r.mime_type = Some(value.clone()),
+                    _ => {}
+                }
             }
         }
         SyncEvent::ExpirationSetKeys { keys, expiration } => {
@@ -328,6 +347,19 @@ impl ResourceStore {
             SyncEvent::ExpirationSet {
                 hash: hash.to_ascii_lowercase(),
                 expiration,
+            },
+        )
+    }
+
+    /// Set `tool` or `mimetype` (lowercase field name) on these rows.
+    pub fn set_field(&self, keys: &[i64], field: &str, value: &str) -> Result<(), SyncError> {
+        let mut state = self.state.write().unwrap();
+        self.record(
+            &mut state,
+            SyncEvent::FieldSetKeys {
+                keys: keys.to_vec(),
+                field: field.to_string(),
+                value: value.to_string(),
             },
         )
     }
