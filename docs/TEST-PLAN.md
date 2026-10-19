@@ -347,3 +347,14 @@ The official `ProfileAPI` / `ProfileAdminAPI` (`com.bbn.marti.device.profile`, T
 | TC-PROFILE-07 | Profile directories: valid directories are the `profiles/` subfolders; attach (add, all must exist, else 500), list (`id`/`path`), clear; files by `relativePath`: one file as itself (content type, `Last-Modified`), a folder as a `multiFile` package with its hierarchy, 304 with `If-Modified-Since`, 404 when not found or no directories for the caller, 400 for `..`, 500 for a symlink out of the folder; enrollment port with Basic auth | [COMPAT] | `admins_attach_directories_*`, `devices_get_directory_files_*`, `a_symlink_out_of_the_profiles_folder_is_refused`, `the_enrollment_port_serves_directory_files_*`, `profiles::directories_*` |
 | TC-PROFILE-06 | Admin-only except the device calls (`security-context.xml`) | [COMPAT] | `only_the_device_calls_are_open_to_non_admins`, `e2e_device_profiles_reach_the_enrolling_phone` |
 
+## 26. Data feeds and mission feeds (2026-10-19)
+
+Official `SubmissionApi` (data feed CRUD), `DataFeedApi` (list), `DataFeedFilter` (marking), `MissionApi` feed endpoints and `MissionChangeRepository.MISSION_FEEDS`. Deviations, owner's decisions: managing feeds is admin-only unless `datafeeds_admin_only = false` (officially everyone); `POST /missions/{name}/feed` works (officially ambiguous to Spring, always 500).
+
+| ID | Case | Type | Test |
+|---|---|---|---|
+| TC-FEED-01 | Create/list/get/update/delete in the official shapes, defaults, validation messages and group visibility (filter groups on create, updater's groups after update) | [COMPAT] | `marti::datafeeds::tests::*`, `datafeeds::tests::*` |
+| TC-FEED-02 | Admin-only management by default, as officially when switched off | [HARDEN] | `only_the_admin_manages_feeds_unless_switched_off` |
+| TC-FEED-03 | A streaming feed's own port: events marked `<source type="dataFeed" name uid><tag/></source>` in `<detail>`, relayed into the feed's groups; deleting the feed closes the port | [COMPAT] | `cot::tests::feed_source_is_appended_to_the_detail`, `e2e_a_streaming_data_feed_marks_and_relays_its_events` |
+| TC-FEED-04 | Mission feeds: add (filters, polygon closed, CoT types as JSON), list in `feeds` with the data feed's name, CREATE_/DELETE_DATA_FEED changes (never squashed) with the hydrated `missionFeed`, `t-x-m-c` notification, unknown feed removal is a no-op | [COMPAT] | `marti::missions::tests::mission_feeds` |
+

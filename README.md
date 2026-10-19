@@ -287,6 +287,13 @@ with the feed (`<source type="dataFeed" name="…" uid="…">` and its tags in
 groups. Creating, changing or deleting a feed opens, moves or closes its
 port; behind a firewall or in Kubernetes, expose the port yourself.
 
+Missions link feeds with `POST /Marti/api/missions/{name}/feed?creatorUid=…&dataFeedUid=…`
+(optional `filterPolygon` points, `filterCotTypes` as a JSON array,
+`filterCallsign`) and `DELETE …/feed/{uid}`; the mission lists them under
+`feeds`, and subscribers get the change. (On the official server this POST
+can't work: two handlers share its URL pattern, so it always answers 500.
+MicroTAK makes it work.)
+
 ### TLS certificates
 
 - **Server names**: the server certificate names `server_common_name`

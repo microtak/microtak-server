@@ -210,6 +210,10 @@ pub enum ChangeType {
     AddContent,
     #[serde(rename = "REMOVE_CONTENT")]
     RemoveContent,
+    #[serde(rename = "CREATE_DATA_FEED")]
+    CreateDataFeed,
+    #[serde(rename = "DELETE_DATA_FEED")]
+    DeleteDataFeed,
 }
 
 /// `ExternalMissionData` (`mission_external_data`): its id is global,
@@ -223,6 +227,19 @@ pub struct ExternalDataRecord {
     pub url_display: String,
     pub notes: String,
     pub mission_guid: String,
+}
+
+/// A data feed linked to a mission (`mission_feed`), with the filters the
+/// official model keeps: a bounding polygon, CoT types (stored as their
+/// JSON array, `filterCotTypesSerialized`) and a callsign.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionFeedRecord {
+    pub uid: String,
+    pub mission_guid: String,
+    pub data_feed_uid: String,
+    pub filter_polygon: Option<String>,
+    pub filter_cot_types_serialized: Option<String>,
+    pub filter_callsign: Option<String>,
 }
 
 /// A mission map layer (`maplayer`). `props` holds the `MapLayer` bean
@@ -273,6 +290,9 @@ pub struct ChangeRecord {
     /// `mission_change.map_layer_uid`.
     #[serde(default)]
     pub map_layer_uid: Option<String>,
+    /// `mission_change.mission_feed_uid`.
+    #[serde(default)]
+    pub mission_feed_uid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -412,6 +432,22 @@ impl Window {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Event {
+    /// `addFeedToMission` / `removeFeedFromMission` with their
+    /// CREATE_DATA_FEED / DELETE_DATA_FEED change on `guid`.
+    MissionFeedAdded {
+        guid: String,
+        feed: MissionFeedRecord,
+        creator_uid: String,
+        change_id: u64,
+        at_ms: i64,
+    },
+    MissionFeedRemoved {
+        guid: String,
+        uid: String,
+        creator_uid: String,
+        change_id: u64,
+        at_ms: i64,
+    },
     /// `addMapLayerToMission` (with its ADD_CONTENT change) or
     /// `updateMapLayer` (`change_id` none); `defaultLayer` clears the flag
     /// on every other layer (`unsetDefault`).
@@ -564,6 +600,38 @@ struct State {
     next_mission_id: u64,
     external_data: BTreeMap<String, ExternalDataRecord>,
     map_layers: BTreeMap<String, MapLayerRecord>,
+    mission_feeds: BTreeMap<String, MissionFeedRecord>,
+}
+
+/// A data feed change (`saveFeedChangeAtTime`).
+fn push_feed_change(
+    state: &mut State,
+    guid: String,
+    uid: String,
+    creator_uid: String,
+    change_id: u64,
+    at_ms: i64,
+    change_type: ChangeType,
+) {
+    let mission_name = state
+        .missions
+        .get(&guid)
+        .map(|m| m.name.clone())
+        .unwrap_or_default();
+    state.changes.push(ChangeRecord {
+        id: change_id,
+        change_type,
+        mission_guid: guid,
+        mission_name,
+        content: None,
+        creator_uid,
+        timestamp_ms: at_ms,
+        server_time_ms: at_ms,
+        external_data: None,
+        map_layer_uid: None,
+        mission_feed_uid: Some(uid),
+    });
+    state.next_change_id = state.next_change_id.max(change_id + 1);
 }
 
 fn apply(state: &mut State, event: &Event) {
@@ -590,10 +658,48 @@ fn apply(state: &mut State, event: &Event) {
             server_time_ms: at_ms,
             external_data: Some(ext),
             map_layer_uid: None,
+            mission_feed_uid: None,
         });
         state.next_change_id = state.next_change_id.max(change_id + 1);
     };
     match event.clone() {
+        Event::MissionFeedAdded {
+            guid,
+            feed,
+            creator_uid,
+            change_id,
+            at_ms,
+        } => {
+            let uid = feed.uid.clone();
+            state.mission_feeds.insert(uid.clone(), feed);
+            push_feed_change(
+                state,
+                guid,
+                uid,
+                creator_uid,
+                change_id,
+                at_ms,
+                ChangeType::CreateDataFeed,
+            );
+        }
+        Event::MissionFeedRemoved {
+            guid,
+            uid,
+            creator_uid,
+            change_id,
+            at_ms,
+        } => {
+            push_feed_change(
+                state,
+                guid,
+                uid.clone(),
+                creator_uid,
+                change_id,
+                at_ms,
+                ChangeType::DeleteDataFeed,
+            );
+            state.mission_feeds.remove(&uid);
+        }
         Event::MapLayerSaved {
             guid,
             layer,
@@ -625,6 +731,7 @@ fn apply(state: &mut State, event: &Event) {
                     server_time_ms: at_ms,
                     external_data: None,
                     map_layer_uid: Some(uid),
+                    mission_feed_uid: None,
                 });
                 state.next_change_id = state.next_change_id.max(change_id + 1);
             }
@@ -692,6 +799,7 @@ fn apply(state: &mut State, event: &Event) {
                 server_time_ms: mission.create_time_ms,
                 external_data: None,
                 map_layer_uid: None,
+                mission_feed_uid: None,
             });
             state.next_change_id = state.next_change_id.max(change_id + 1);
             state.missions.insert(mission.guid.clone(), mission);
@@ -774,6 +882,7 @@ fn apply(state: &mut State, event: &Event) {
                     server_time_ms: at_ms,
                     external_data: None,
                     map_layer_uid: None,
+                    mission_feed_uid: None,
                 });
             }
             state.next_change_id = state.next_change_id.max(change_id + 1);
@@ -805,6 +914,7 @@ fn apply(state: &mut State, event: &Event) {
                     server_time_ms: server_ms.unwrap_or(at_ms),
                     external_data: None,
                     map_layer_uid: None,
+                    mission_feed_uid: None,
                 });
             }
             state.next_change_id = state.next_change_id.max(change_id + 1);
@@ -830,6 +940,7 @@ fn apply(state: &mut State, event: &Event) {
                     server_time_ms: server_ms.unwrap_or(at_ms),
                     external_data: None,
                     map_layer_uid: None,
+                    mission_feed_uid: None,
                 });
             }
             state.next_change_id = state.next_change_id.max(change_id + 1);
@@ -1376,6 +1487,14 @@ impl MissionStore {
                             lifecycle.push(change.clone());
                         }
                     }
+                    (ChangeType::CreateDataFeed | ChangeType::DeleteDataFeed, None)
+                        if change.mission_feed_uid.is_some() =>
+                    {
+                        // MISSION_FEEDS: every row, never squashed.
+                        if change.timestamp_ms >= mission.create_time_ms {
+                            lifecycle.push(change.clone());
+                        }
+                    }
                     (kind, None) if change.external_data.is_some() => {
                         if change.timestamp_ms < mission.create_time_ms {
                             continue;
@@ -1421,6 +1540,82 @@ impl MissionStore {
         };
         result.sort_by_key(|c| std::cmp::Reverse(c.id));
         Ok(result)
+    }
+
+    // --- mission feeds -------------------------------------------------------
+
+    /// `getMissionFeed` (by uid, any mission).
+    pub fn mission_feed(&self, uid: &str) -> Option<MissionFeedRecord> {
+        self.state.read().unwrap().mission_feeds.get(uid).cloned()
+    }
+
+    /// `Mission.feeds`, in `MissionFeed.compareTo` order (uid first).
+    pub fn mission_feeds_of(&self, guid: &str) -> Vec<MissionFeedRecord> {
+        self.state
+            .read()
+            .unwrap()
+            .mission_feeds
+            .values()
+            .filter(|f| f.mission_guid == guid)
+            .cloned()
+            .collect()
+    }
+
+    /// `addFeedToMission`: `None` if a feed with this uid exists already
+    /// (then nothing is recorded), else the CREATE_DATA_FEED change.
+    pub fn add_mission_feed(
+        &self,
+        guid: &str,
+        mut feed: MissionFeedRecord,
+        creator_uid: &str,
+        now_ms: i64,
+    ) -> Result<Option<ChangeRecord>, MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        if state.mission_feeds.contains_key(&feed.uid) {
+            return Ok(None);
+        }
+        feed.mission_guid = guid.to_string();
+        let change_id = state.next_change_id;
+        self.record(
+            &mut state,
+            Event::MissionFeedAdded {
+                guid: guid.into(),
+                feed,
+                creator_uid: creator_uid.into(),
+                change_id,
+                at_ms: now_ms,
+            },
+        )?;
+        Ok(state.changes.last().cloned())
+    }
+
+    /// `removeFeedFromMission`: `None` if there's no such feed (nothing
+    /// happens), else the DELETE_DATA_FEED change.
+    pub fn remove_mission_feed(
+        &self,
+        guid: &str,
+        uid: &str,
+        creator_uid: &str,
+        now_ms: i64,
+    ) -> Result<Option<ChangeRecord>, MissionError> {
+        let mut state = self.state.write().unwrap();
+        Self::existing(&state, guid)?;
+        if !state.mission_feeds.contains_key(uid) {
+            return Ok(None);
+        }
+        let change_id = state.next_change_id;
+        self.record(
+            &mut state,
+            Event::MissionFeedRemoved {
+                guid: guid.into(),
+                uid: uid.into(),
+                creator_uid: creator_uid.into(),
+                change_id,
+                at_ms: now_ms,
+            },
+        )?;
+        Ok(state.changes.last().cloned())
     }
 
     // --- mission map layers ------------------------------------------------

@@ -2987,3 +2987,136 @@ async fn offline_changes_in_a_mission_package() {
         .await;
     assert_eq!(garbage.status, StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+/// Mission feeds (`addFeedToMission` / `removeFeedFromMission`): a feed with
+/// its filters in the mission's `feeds` (named after its data feed), a
+/// CREATE_DATA_FEED / DELETE_DATA_FEED change with the hydrated
+/// `missionFeed`, and a `t-x-m-c` to the subscribers. Officially the POST is
+/// ambiguous to Spring (500); MicroTAK makes it work (owner's decision).
+#[tokio::test]
+async fn mission_feeds() {
+    let (h, mut rx) = harness_with_hub();
+    let mut aprs = crate::datafeeds::tests_support::feed("aprs", "feed-uuid-1");
+    aprs.name = "aprs".into();
+    h.state.datafeeds.create(aprs).unwrap();
+    h.create("Ops", "jz", "").await;
+    h.call(
+        "PUT",
+        "/Marti/api/missions/Ops/subscription?uid=ANDROID-B",
+        "bee",
+        &[],
+        "",
+    )
+    .await;
+    drain(&mut rx);
+
+    let reply = h
+        .call(
+            "POST",
+            "/Marti/api/missions/Ops/feed?creatorUid=ANDROID-jz&dataFeedUid=feed-uuid-1&filterPolygon=52.0,13.0&filterPolygon=52.0,14.0&filterPolygon=53.0,14.0&filterCotTypes=%5B%22a-f-*%22%5D&filterCallsign=DL1",
+            "jz",
+            &[],
+            "",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let mission = h
+        .call("GET", "/Marti/api/missions/Ops", "jz", &[], "")
+        .await
+        .data()[0]
+        .clone();
+    let feed = &mission["feeds"][0];
+    assert_eq!(feed["dataFeedUid"], "feed-uuid-1");
+    assert_eq!(feed["name"], "aprs");
+    assert_eq!(
+        feed["filterPolygon"], "52.0 13.0,52.0 14.0,53.0 14.0,52.0 13.0",
+        "closed"
+    );
+    assert_eq!(feed["filterCotTypesSerialized"], r#"["a-f-*"]"#);
+    assert_eq!(feed["filterCallsign"], "DL1");
+    let uid = feed["uid"].as_str().unwrap().to_string();
+
+    let sent = drain(&mut rx);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(cot_type(&sent[0].xml), "t-x-m-c");
+    assert!(sent[0].xml.contains("<missionFeed><dataFeedUid>feed-uuid-1</dataFeedUid><filterCallsign>DL1</filterCallsign>"), "{}", sent[0].xml);
+
+    let changes = h
+        .call("GET", "/Marti/api/missions/Ops/changes", "jz", &[], "")
+        .await
+        .data();
+    let created = changes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["type"] == "CREATE_DATA_FEED")
+        .unwrap();
+    assert_eq!(created["missionFeed"]["uid"], uid.as_str());
+
+    let reply = h
+        .call(
+            "POST",
+            "/Marti/api/missions/Ops/feed?creatorUid=X&dataFeedUid=f&filterCotTypes=nope",
+            "jz",
+            &[],
+            "",
+        )
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::BAD_REQUEST,
+        "filterCotTypes must be a JSON array"
+    );
+    let reply = h
+        .call(
+            "POST",
+            "/Marti/api/missions/Ops/feed?creatorUid=X",
+            "jz",
+            &[],
+            "",
+        )
+        .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::BAD_REQUEST,
+        "dataFeedUid is required"
+    );
+
+    let reply = h
+        .call(
+            "DELETE",
+            &format!("/Marti/api/missions/Ops/feed/{uid}?creatorUid=ANDROID-jz"),
+            "jz",
+            &[],
+            "",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let mission = h
+        .call("GET", "/Marti/api/missions/Ops", "jz", &[], "")
+        .await
+        .data()[0]
+        .clone();
+    assert_eq!(mission["feeds"], json!([]));
+    let changes = h
+        .call("GET", "/Marti/api/missions/Ops/changes", "jz", &[], "")
+        .await
+        .data();
+    assert!(
+        changes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["type"] == "DELETE_DATA_FEED" && c["missionFeed"]["uid"] == uid.as_str())
+    );
+    let reply = h
+        .call(
+            "DELETE",
+            "/Marti/api/missions/Ops/feed/unknown?creatorUid=ANDROID-jz",
+            "jz",
+            &[],
+            "",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "an unknown feed is a no-op");
+}

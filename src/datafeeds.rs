@@ -197,6 +197,12 @@ impl DataFeedStore {
     }
 }
 
+/// Test fixtures for other modules.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    pub(crate) use super::tests::feed;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

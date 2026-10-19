@@ -35,6 +35,8 @@ This file lists direction, not dates.
 - Device profiles: the official profile admin API and delivery at
   enrollment, on connect, per tool and by sending, including profile
   directories.
+- Data feeds (`/Marti/api/datafeeds`, admin-only by default) with their
+  own streaming listeners, and mission feeds.
 - Persistence and backups, Docker images and Helm chart (amd64 and arm64),
   release binaries.
 - CI: unit, end-to-end and black-box suites (the black-box suite drives the
@@ -45,8 +47,6 @@ This file lists direction, not dates.
 
 - Mission KML (`/missions/{name}/kml`): the official server's KML builder,
   icon styles and HAE-to-MSL conversion (geoid data).
-- Mission feeds, together with the data feed API they depend on
-  (`/Marti/api/datafeeds`).
 
 Not planned: the official server's own configuration endpoints
 (`/Marti/api/config`, `security/config`, `authentication/config`). They

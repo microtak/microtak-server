@@ -57,6 +57,8 @@ pub struct MissionsState {
     pub clients: ConnectedClients,
     /// File bytes, for mission packages.
     pub content: Arc<crate::content_store::ContentStore>,
+    /// Data feeds, for the names of mission feeds.
+    pub datafeeds: Arc<crate::datafeeds::DataFeedStore>,
 }
 
 impl MissionsState {
@@ -94,6 +96,7 @@ impl MissionsState {
                 )
                 .expect("temp content store"),
             ),
+            datafeeds: Arc::new(crate::datafeeds::DataFeedStore::in_memory()),
         }
     }
 }
@@ -122,6 +125,15 @@ pub fn router_with(state: MissionsState) -> Router {
         .route(
             "/Marti/api/missions/:name/maplayers/:uid",
             axum::routing::delete(|| async { ApiError::Internal }),
+        )
+        // Officially `/missions/{missionName}/feed` and
+        // `/missions/{missionGuid}/feed` are the same pattern, so Spring
+        // answers every POST with 500 ("Ambiguous handler methods"). MicroTAK
+        // makes it work (owner's decision): by name, else by guid.
+        .route("/Marti/api/missions/:name/feed", post(add_mission_feed))
+        .route(
+            "/Marti/api/missions/:name/feed/:uid",
+            axum::routing::delete(remove_mission_feed),
         )
         .route(
             "/Marti/api/missions/:name/externaldata",
@@ -782,7 +794,13 @@ fn mission_json(
         .map(external_json)
         .collect();
     put("externalData", external.into());
-    put("feeds", json!([]));
+    let feeds: Vec<Value> = state
+        .store
+        .mission_feeds_of(&m.guid)
+        .iter()
+        .map(|f| mission_feed_json(state, f))
+        .collect();
+    put("feeds", feeds.into());
     let layers: Vec<Value> = state
         .store
         .map_layers_of(&m.guid)
@@ -864,6 +882,14 @@ fn change_json(state: &MissionsState, c: &ChangeRecord) -> Value {
             None => Value::Object(map_layer_placeholder(uid).into_iter().collect()),
         };
         out.insert("mapLayer".into(), layer);
+    }
+    if let Some(uid) = &c.mission_feed_uid {
+        // findMissionFeed: the current feed, or one with just the uid.
+        let feed = match state.store.mission_feed(uid) {
+            Some(f) => mission_feed_json(state, &f),
+            None => json!({ "uid": uid }),
+        };
+        out.insert("missionFeed".into(), feed);
     }
     if let Some(ext) = &c.external_data {
         let record = state.store.external_data(&ext.uid);
@@ -5029,3 +5055,182 @@ async fn cot_by_guid(
 #[cfg(test)]
 #[path = "missions_tests.rs"]
 mod tests;
+
+// --- mission feeds ----------------------------------------------------------
+
+/// `MissionFeed` as Jackson writes it (`NON_NULL`), its `name` the data
+/// feed's (`findNameForMissionFeed`).
+fn mission_feed_json(state: &MissionsState, f: &crate::missions::MissionFeedRecord) -> Value {
+    let mut v = serde_json::Map::new();
+    v.insert("uid".into(), f.uid.clone().into());
+    v.insert("dataFeedUid".into(), f.data_feed_uid.clone().into());
+    if let Some(feed) = state.datafeeds.by_uuid(&f.data_feed_uid) {
+        v.insert("name".into(), feed.name.into());
+    }
+    for (key, value) in [
+        ("filterPolygon", &f.filter_polygon),
+        ("filterCotTypesSerialized", &f.filter_cot_types_serialized),
+        ("filterCallsign", &f.filter_callsign),
+    ] {
+        if let Some(value) = value {
+            v.insert(key.into(), value.clone().into());
+        }
+    }
+    Value::Object(v)
+}
+
+/// `<missionFeed>` as JAXB writes a `MissionFeed` (properties in name
+/// order, nulls left out).
+fn mission_feed_xml(state: &MissionsState, f: &crate::missions::MissionFeedRecord) -> String {
+    let name = state.datafeeds.by_uuid(&f.data_feed_uid).map(|d| d.name);
+    let mut inner = String::new();
+    for (element, value) in [
+        ("dataFeedUid", Some(f.data_feed_uid.clone())),
+        ("filterCallsign", f.filter_callsign.clone()),
+        (
+            "filterCotTypesSerialized",
+            f.filter_cot_types_serialized.clone(),
+        ),
+        ("filterPolygon", f.filter_polygon.clone()),
+        ("name", name),
+        ("uid", Some(f.uid.clone())),
+    ] {
+        if let Some(value) = value {
+            inner.push_str(&format!("<{element}>{}</{element}>", xml_escape(&value)));
+        }
+    }
+    format!("<missionFeed>{inner}</missionFeed>")
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// `boundingPolygonPointsToString`: at least three valid "x,y" points,
+/// closed, as "x y,x y,..."; anything else is no polygon.
+fn polygon_from_points(points: &[String]) -> Option<String> {
+    if points.len() < 3 {
+        return None;
+    }
+    let mut points: Vec<String> = points.to_vec();
+    for point in &points {
+        let xy: Vec<&str> = point.split(',').collect();
+        if xy.len() != 2 || xy.iter().any(|v| v.trim().parse::<f64>().is_err()) {
+            return None;
+        }
+    }
+    if points[0].replace(' ', "") != points[points.len() - 1].replace(' ', "") {
+        points.push(points[0].clone());
+    }
+    Some(
+        points
+            .iter()
+            .map(|p| p.replace(' ', "").replace(',', " "))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+/// `addFeed`: link a data feed to the mission (MISSION_WRITE), with an
+/// optional polygon, CoT types (a JSON array) and callsign filter; records
+/// CREATE_DATA_FEED and notifies the subscribers.
+async fn add_mission_feed(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<StatusCode, ApiError> {
+    let caller = caller(&state, &identity, &headers);
+    let mission = match existing(&state, &caller, Key::Name(&name)) {
+        Ok(m) => m,
+        Err(by_name) if uuid_parse(&name).is_some() => {
+            existing(&state, &caller, Key::Guid(&name)).map_err(|_| by_name)?
+        }
+        Err(e) => return Err(e),
+    };
+    require(
+        role_for(&state, &mission, &caller),
+        Permission::MissionWrite,
+    )?;
+    let params = Params::parse(query)?;
+    let creator = params
+        .get("creatorUid")
+        .ok_or_else(|| ApiError::BadRequest(String::new()))?
+        .to_string();
+    let data_feed_uid = params
+        .get("dataFeedUid")
+        .ok_or_else(|| ApiError::BadRequest(String::new()))?
+        .to_string();
+    let cot_types: Vec<String> = match params.get("filterCotTypes") {
+        Some(raw) => serde_json::from_str(raw).map_err(|_| {
+            ApiError::BadRequest(
+                "Error parsing parameter filterCotTypesSerialized from the request".into(),
+            )
+        })?,
+        None => Vec::new(),
+    };
+    let feed = crate::missions::MissionFeedRecord {
+        uid: random_uuid(),
+        mission_guid: mission.guid.clone(),
+        data_feed_uid,
+        filter_polygon: polygon_from_points(&params.all("filterPolygon")),
+        filter_cot_types_serialized: Some(serde_json::to_string(&cot_types).unwrap_or_default()),
+        filter_callsign: params.get("filterCallsign").map(str::to_string),
+    };
+    let Some(change) =
+        state
+            .store
+            .add_mission_feed(&mission.guid, feed.clone(), &creator, now_ms())?
+    else {
+        return Ok(StatusCode::OK);
+    };
+    let xml = state
+        .notifier
+        .change_xml_with(&change, None, Some(&mission_feed_xml(&state, &feed)));
+    state
+        .notifier
+        .announce(&mission, ChangeKind::Content, &creator, Some(&xml));
+    Ok(StatusCode::OK)
+}
+
+/// `removeFeed` (by mission name): records DELETE_DATA_FEED and notifies;
+/// an unknown feed is a no-op.
+async fn remove_mission_feed(
+    State(state): State<MissionsState>,
+    Extension(identity): Extension<PeerIdentity>,
+    headers: HeaderMap,
+    Path((name, uid)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Result<StatusCode, ApiError> {
+    let caller = caller(&state, &identity, &headers);
+    let mission = existing(&state, &caller, Key::Name(&name))?;
+    require(
+        role_for(&state, &mission, &caller),
+        Permission::MissionWrite,
+    )?;
+    let params = Params::parse(query)?;
+    let creator = params
+        .get("creatorUid")
+        .ok_or_else(|| ApiError::BadRequest(String::new()))?
+        .to_string();
+    let before = state.store.mission_feed(&uid);
+    let Some(change) = state
+        .store
+        .remove_mission_feed(&mission.guid, &uid, &creator, now_ms())?
+    else {
+        return Ok(StatusCode::OK);
+    };
+    let feed_xml = before
+        .map(|f| mission_feed_xml(&state, &f))
+        .unwrap_or_else(|| format!("<missionFeed><uid>{}</uid></missionFeed>", xml_escape(&uid)));
+    let xml = state
+        .notifier
+        .change_xml_with(&change, None, Some(&feed_xml));
+    state
+        .notifier
+        .announce(&mission, ChangeKind::Content, &creator, Some(&xml));
+    Ok(StatusCode::OK)
+}
