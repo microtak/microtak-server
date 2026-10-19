@@ -25,6 +25,7 @@ data:
     max_connections = {{ .Values.config.limits.maxConnections }}
     max_connections_per_ip = {{ .Values.config.limits.maxConnectionsPerIp }}
     handshake_timeout_seconds = {{ .Values.config.limits.handshakeTimeoutSeconds }}
+    tcp_user_timeout_seconds = {{ .Values.config.limits.tcpUserTimeoutSeconds }}
     http_header_timeout_seconds = {{ .Values.config.limits.httpHeaderTimeoutSeconds }}
     {{- if .Values.metrics.enabled }}
     metrics_port = {{ .Values.metrics.port }}

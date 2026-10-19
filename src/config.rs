@@ -85,6 +85,9 @@ pub struct Config {
     pub max_connections_per_ip: usize,
     /// Seconds a client gets to finish the TLS handshake.
     pub handshake_timeout_seconds: u64,
+    /// Seconds sent data may stay unacknowledged before a connection is
+    /// dropped (`TCP_USER_TIMEOUT`, default 60; 0: the kernel's default).
+    pub tcp_user_timeout_seconds: u64,
     /// Seconds an HTTP listener waits for a request's headers.
     pub http_header_timeout_seconds: u64,
     /// Largest DataSync upload accepted, in MB (default 100).
@@ -125,6 +128,7 @@ impl Default for Config {
             max_connections: defaults.admission.max_connections,
             max_connections_per_ip: defaults.admission.max_connections_per_ip,
             handshake_timeout_seconds: defaults.admission.handshake_timeout.as_secs(),
+            tcp_user_timeout_seconds: defaults.admission.tcp_user_timeout.as_secs(),
             http_header_timeout_seconds: defaults.admission.http_header_timeout.as_secs(),
             max_upload_mb: defaults.max_upload_bytes / (1024 * 1024),
             metrics_port: None,
@@ -237,6 +241,7 @@ impl Config {
                 ),
                 max_connections: self.max_connections.max(1),
                 max_connections_per_ip: self.max_connections_per_ip.max(1),
+                tcp_user_timeout: std::time::Duration::from_secs(self.tcp_user_timeout_seconds),
             },
             max_upload_bytes: self.max_upload_mb.max(1) * 1024 * 1024,
             metrics_addr: self.metrics_port.map(|port| SocketAddr::new(bind_ip, port)),
@@ -351,13 +356,14 @@ mod tests {
         );
 
         let config: Config = toml::from_str(
-            "max_connections = 200\nmax_connections_per_ip = 5\nhandshake_timeout_seconds = 3\nhttp_header_timeout_seconds = 4\n",
+            "max_connections = 200\nmax_connections_per_ip = 5\nhandshake_timeout_seconds = 3\nhttp_header_timeout_seconds = 4\ntcp_user_timeout_seconds = 30\n",
         )
         .unwrap();
         let limits = config.to_app_config().unwrap().admission;
         assert_eq!(limits.max_connections, 200);
         assert_eq!(limits.max_connections_per_ip, 5);
         assert_eq!(limits.handshake_timeout, std::time::Duration::from_secs(3));
+        assert_eq!(limits.tcp_user_timeout, std::time::Duration::from_secs(30));
         assert_eq!(
             limits.http_header_timeout,
             std::time::Duration::from_secs(4)

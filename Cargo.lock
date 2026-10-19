@@ -918,6 +918,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "sha2",
+ "socket2",
  "thiserror 1.0.69",
  "time",
  "tokio",

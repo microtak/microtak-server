@@ -29,6 +29,12 @@ pub struct AdmissionLimits {
     /// from a trusted proxy) -- behind a proxy that hides them, every client
     /// shares the proxy's address.
     pub max_connections_per_ip: usize,
+    /// How long data sent to a client may stay unacknowledged before the
+    /// connection is dropped (Linux `TCP_USER_TIMEOUT`; zero: the kernel's
+    /// default, ~15 minutes). Without it a client that vanished (an IP
+    /// change, a dead link) keeps its connection -- and the server keeps
+    /// writing into it -- until TCP gives up.
+    pub tcp_user_timeout: Duration,
 }
 
 impl Default for AdmissionLimits {
@@ -38,6 +44,7 @@ impl Default for AdmissionLimits {
             http_header_timeout: Duration::from_secs(10),
             max_connections: 1024,
             max_connections_per_ip: 64,
+            tcp_user_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -100,6 +107,7 @@ impl Admission {
         stream: &mut tokio::net::TcpStream,
         peer: SocketAddr,
     ) -> Option<(SocketAddr, Permit)> {
+        set_user_timeout(stream, self.inner.limits.tcp_user_timeout);
         let client = if self.inner.proxy_protocol_from.contains(peer.ip()) {
             match crate::transport::proxy_protocol::read_header(stream, self.handshake_timeout())
                 .await
@@ -175,8 +183,39 @@ impl Drop for Permit {
     }
 }
 
+/// `TCP_USER_TIMEOUT` on an accepted connection (Linux; a no-op elsewhere
+/// or for zero).
+fn set_user_timeout(stream: &tokio::net::TcpStream, timeout: Duration) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if !timeout.is_zero()
+        && let Err(error) = socket2::SockRef::from(stream).set_tcp_user_timeout(Some(timeout))
+    {
+        tracing::debug!(%error, "couldn't set TCP_USER_TIMEOUT");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = (stream, timeout);
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn accepted_streams_get_the_tcp_user_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut stream, peer) = listener.accept().await.unwrap();
+        let admission = Admission::new(AdmissionLimits {
+            tcp_user_timeout: Duration::from_secs(42),
+            ..Default::default()
+        });
+        assert!(admission.admit_stream(&mut stream, peer).await.is_some());
+        assert_eq!(
+            socket2::SockRef::from(&stream).tcp_user_timeout().unwrap(),
+            Some(Duration::from_secs(42))
+        );
+    }
+
     use super::*;
 
     fn limits(total: usize, per_ip: usize) -> AdmissionLimits {

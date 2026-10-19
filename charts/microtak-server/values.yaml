@@ -87,6 +87,9 @@ config:
     maxConnections: 1024
     maxConnectionsPerIp: 64
     handshakeTimeoutSeconds: 10
+    # Drop a connection whose sent data stays unacknowledged this long (a
+    # client that vanished); 0 = the kernel's default (~15 min).
+    tcpUserTimeoutSeconds: 60
     httpHeaderTimeoutSeconds: 10
   backup:
     enabled: false
