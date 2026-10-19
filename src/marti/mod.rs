@@ -204,7 +204,9 @@ impl TlsHttpServer {
                 let io = TokioIo::new(tls_stream);
                 let service = TowerToHyperService::new(router);
                 if let Err(error) = http_builder(&admission).serve_connection(io, service).await {
-                    warn!(%peer, %error, "error serving enrollment connection");
+                    // Clients dropping idle keep-alive connections, the header
+                    // timeout on an idle reused one: routine, not worth a warning.
+                    tracing::debug!(%peer, %error, "error serving enrollment connection");
                 }
             });
         }
@@ -368,7 +370,9 @@ impl MtlsHttpServer {
                 let io = TokioIo::new(tls_stream);
                 let service = TowerToHyperService::new(router);
                 if let Err(error) = http_builder(&admission).serve_connection(io, service).await {
-                    warn!(%peer, %error, "error serving Marti API connection");
+                    // Clients dropping idle keep-alive connections, the header
+                    // timeout on an idle reused one: routine, not worth a warning.
+                    tracing::debug!(%peer, %error, "error serving Marti API connection");
                 }
             });
         }
