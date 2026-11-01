@@ -11,8 +11,8 @@
 //! - a certificate enrolled without a `clientUid` can't match (the official
 //!   comparison throws), so its SAs are dropped.
 //!
-//! Officially off by default (`<latestSA validateClientUid="false">`);
-//! MicroTAK's `validate_client_uid` is on by default.
+//! Off by default (`<latestSA validateClientUid="false">`), as officially;
+//! set MicroTAK's `validate_client_uid = true` for the strict check.
 //!
 //! One rule the official server doesn't have, at the owner's request (no
 //! impersonation, [`impersonation`]): an event reusing the uid another

@@ -30,8 +30,8 @@ pub struct Config {
     pub plain_tcp_enabled: bool,
     pub mtls_port: u16,
     /// The official `validateClientUid`: a device's SA must carry the
-    /// `clientUid` its certificate was enrolled for (default `true`;
-    /// officially `false`).
+    /// `clientUid` its certificate was enrolled for (default `false`, as
+    /// officially). Set `true` for the strict check.
     pub validate_client_uid: bool,
     /// Only the admin manages data feeds (default `true`; officially
     /// everyone may).
@@ -523,14 +523,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_client_uid_is_on_unless_turned_off() {
+    fn validate_client_uid_is_off_unless_turned_on() {
         assert!(
-            Config::default()
+            !Config::default()
                 .to_app_config()
                 .unwrap()
                 .validate_client_uid
         );
-        let config: Config = toml::from_str("validate_client_uid = false\n").unwrap();
-        assert!(!config.to_app_config().unwrap().validate_client_uid);
+        let config: Config = toml::from_str("validate_client_uid = true\n").unwrap();
+        assert!(config.to_app_config().unwrap().validate_client_uid);
     }
 }

@@ -194,7 +194,7 @@ impl Default for AppConfig {
             plain_tcp_addr: "0.0.0.0:8087".parse().unwrap(),
             plain_tcp_enabled: false,
             mtls_addr: "0.0.0.0:8089".parse().unwrap(),
-            validate_client_uid: true,
+            validate_client_uid: false,
             datafeeds_admin_only: true,
             ca_common_name: "MicroTAK CA".to_string(),
             server_common_name: "microtak-server".to_string(),
