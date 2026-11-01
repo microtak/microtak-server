@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.16.0](https://github.com/microtak/microtak-server/compare/v0.15.0...v0.16.0) (2026-11-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **streaming:** validate_client_uid now defaults to false (was true). Deployments that rely on the strict SA-uid check must set it explicitly.
+
+### Features
+
+* **streaming:** default validate_client_uid to off, matching official ([e2aa6eb](https://github.com/microtak/microtak-server/commit/e2aa6ebd1802d78f5873c1a0a46fe0e463fade7f))
+
 ## [0.15.0](https://github.com/microtak/microtak-server/compare/v0.14.0...v0.15.0) (2026-10-19)
 
 
