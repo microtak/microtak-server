@@ -7,11 +7,21 @@
 //! this endpoint regardless of who was actually connected — this registry
 //! exists specifically so MicroTAK's answer is never that.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use super::seen::SeenStore;
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -36,6 +46,25 @@ pub struct ClientEndpoint {
     pub connected_at_unix: i64,
 }
 
+/// One row of `GET /Marti/api/clientEndPoints`: a currently-connected client,
+/// or a previously-seen identity that is offline now. Extends the live
+/// [`ClientEndpoint`] shape with `last_status` + `last_seen_unix`; the
+/// live-only fields are omitted for an offline entry.
+#[derive(Debug, Clone, Serialize)]
+pub struct EndpointView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<SocketAddr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<Transport>,
+    pub common_name: Option<String>,
+    pub uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connected_at_unix: Option<i64>,
+    /// `"connected"` or `"disconnected"`.
+    pub last_status: &'static str,
+    pub last_seen_unix: i64,
+}
+
 #[derive(Clone, Default)]
 pub struct ConnectedClients {
     clients: Arc<RwLock<HashMap<SocketAddr, ClientEndpoint>>>,
@@ -46,6 +75,8 @@ pub struct ConnectedClients {
     /// Each connection's latest SA, as relayed (the official
     /// `Subscription.latestSA`): gone with the connection.
     latest_sa: Arc<RwLock<HashMap<SocketAddr, Arc<str>>>>,
+    /// Durable last-seen (per identity), surviving disconnect and restart.
+    seen: Arc<SeenStore>,
 }
 
 impl ConnectedClients {
@@ -53,11 +84,23 @@ impl ConnectedClients {
         Self::default()
     }
 
+    /// With a persistent last-seen store (see [`SeenStore::load`]).
+    pub fn with_seen(seen: Arc<SeenStore>) -> Self {
+        Self {
+            seen,
+            ..Self::default()
+        }
+    }
+
     pub fn register(&self, endpoint: ClientEndpoint) {
         let number = self
             .next_number
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
+        if let Some(cn) = &endpoint.common_name {
+            self.seen
+                .mark_connected(cn, endpoint.uid.clone(), endpoint.transport, now_unix());
+        }
         self.numbers
             .write()
             .unwrap()
@@ -69,9 +112,55 @@ impl ConnectedClients {
     }
 
     pub fn unregister(&self, remote_addr: SocketAddr) {
-        self.clients.write().unwrap().remove(&remote_addr);
+        let removed = self.clients.write().unwrap().remove(&remote_addr);
         self.numbers.write().unwrap().remove(&remote_addr);
         self.latest_sa.write().unwrap().remove(&remote_addr);
+        if let Some(cn) = removed.and_then(|endpoint| endpoint.common_name) {
+            self.seen.mark_disconnected(&cn, now_unix());
+        }
+    }
+
+    /// All known identities with their last-seen time and whether connected
+    /// right now (the historical view behind `GET /Marti/api/clientEndPoints`):
+    /// currently-connected clients (from the live registry) plus every
+    /// previously-seen identity that is offline now.
+    pub fn endpoint_views(&self) -> Vec<EndpointView> {
+        let now = now_unix();
+        let clients = self.clients.read().unwrap();
+        let mut connected_cns = HashSet::new();
+        let mut views: Vec<EndpointView> = clients
+            .values()
+            .map(|endpoint| {
+                if let Some(cn) = &endpoint.common_name {
+                    connected_cns.insert(cn.clone());
+                }
+                EndpointView {
+                    remote_addr: Some(endpoint.remote_addr),
+                    transport: Some(endpoint.transport),
+                    common_name: endpoint.common_name.clone(),
+                    uid: endpoint.uid.clone(),
+                    connected_at_unix: Some(endpoint.connected_at_unix),
+                    last_status: "connected",
+                    last_seen_unix: now,
+                }
+            })
+            .collect();
+        drop(clients);
+        for record in self.seen.all() {
+            if connected_cns.contains(&record.common_name) {
+                continue;
+            }
+            views.push(EndpointView {
+                remote_addr: None,
+                transport: Some(record.transport),
+                common_name: Some(record.common_name),
+                uid: record.uid,
+                connected_at_unix: None,
+                last_status: "disconnected",
+                last_seen_unix: record.last_seen_unix,
+            });
+        }
+        views
     }
 
     /// Record a connection's own SA (`trackLatestSA`). A no-op if
@@ -127,8 +216,18 @@ impl ConnectedClients {
     /// if `remote_addr` isn't registered (e.g. the connection already
     /// closed) — nothing to update, not an error.
     pub fn set_uid(&self, remote_addr: SocketAddr, uid: String) {
-        if let Some(endpoint) = self.clients.write().unwrap().get_mut(&remote_addr) {
-            endpoint.uid = Some(uid);
+        let common_name = {
+            let mut clients = self.clients.write().unwrap();
+            match clients.get_mut(&remote_addr) {
+                Some(endpoint) => {
+                    endpoint.uid = Some(uid.clone());
+                    endpoint.common_name.clone()
+                }
+                None => None,
+            }
+        };
+        if let Some(cn) = common_name {
+            self.seen.set_uid(&cn, uid);
         }
     }
 

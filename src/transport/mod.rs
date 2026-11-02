@@ -25,6 +25,7 @@ pub mod feeds;
 pub mod hub;
 pub mod identity;
 pub mod proxy_protocol;
+pub mod seen;
 pub mod takproto;
 pub mod tcp;
 pub mod tls;

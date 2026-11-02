@@ -9,7 +9,7 @@ use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 
-use crate::transport::connections::{ClientEndpoint, ConnectedClients};
+use crate::transport::connections::{ConnectedClients, EndpointView};
 
 pub fn router(clients: ConnectedClients) -> Router {
     Router::new()
@@ -17,29 +17,27 @@ pub fn router(clients: ConnectedClients) -> Router {
         .with_state(clients)
 }
 
-async fn list_client_endpoints(
-    State(clients): State<ConnectedClients>,
-) -> Json<Vec<ClientEndpoint>> {
-    Json(clients.list())
+async fn list_client_endpoints(State(clients): State<ConnectedClients>) -> Json<Vec<EndpointView>> {
+    Json(clients.endpoint_views())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::connections::Transport;
+    use crate::transport::connections::{ClientEndpoint, Transport};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
     /// TC-MARTI-09: the endpoint reflects real, live registrations — not a
-    /// static empty list — and stops listing a connection once it's
-    /// unregistered.
+    /// static empty list. Once an identified client disconnects it is kept,
+    /// marked `disconnected`, as a last-seen record (not dropped silently).
     #[tokio::test]
     async fn reflects_live_registrations_not_a_static_list() {
         let clients = ConnectedClients::new();
         let app = router(clients.clone());
 
-        let empty: Vec<ClientEndpoint> = serde_json::from_slice(
+        let empty: Vec<serde_json::Value> = serde_json::from_slice(
             &axum::body::to_bytes(
                 app.clone()
                     .oneshot(
@@ -78,17 +76,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body: Vec<ClientEndpoint> = serde_json::from_slice(
+        let body: Vec<serde_json::Value> = serde_json::from_slice(
             &axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap(),
         )
         .unwrap();
         assert_eq!(body.len(), 1);
-        assert_eq!(body[0].common_name.as_deref(), Some("device-a"));
+        assert_eq!(body[0]["common_name"], "device-a");
+        assert_eq!(body[0]["last_status"], "connected");
 
         clients.unregister("127.0.0.1:1".parse().unwrap());
-        let after: Vec<ClientEndpoint> = serde_json::from_slice(
+        let after: Vec<serde_json::Value> = serde_json::from_slice(
             &axum::body::to_bytes(
                 app.oneshot(
                     Request::builder()
@@ -105,6 +104,10 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(after.is_empty());
+        // The identity is kept as a last-seen record, now disconnected.
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0]["common_name"], "device-a");
+        assert_eq!(after[0]["last_status"], "disconnected");
+        assert!(after[0].get("remote_addr").is_none() || after[0]["remote_addr"].is_null());
     }
 }

@@ -359,7 +359,12 @@ impl App {
         });
         let limiter = Arc::new(AuthLimiter::default());
         let hub = RelayHub::new();
-        let clients = ConnectedClients::new();
+        // Persistent last-seen (per identity), so disconnected devices keep a
+        // "last seen" across restarts; the live registry still owns who is
+        // connected right now. See `transport::seen`.
+        let clients = ConnectedClients::with_seen(std::sync::Arc::new(
+            crate::transport::seen::SeenStore::load(config.data_dir.join("client-seen.json")),
+        ));
 
         // The mTLS listener's own server identity, issued by the same CA a
         // client would enroll against.

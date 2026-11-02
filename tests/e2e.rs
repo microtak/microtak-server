@@ -1543,9 +1543,22 @@ async fn e2e_client_endpoints_reflects_real_connections() {
         .json()
         .await
         .unwrap();
+    // The anonymous plain-TCP connection (no identity) is gone; the mTLS
+    // identity is kept as a last-seen record, now marked disconnected.
+    assert_eq!(
+        after.len(),
+        1,
+        "the identified client should remain as a last-seen record: {after:?}"
+    );
+    assert_eq!(after[0]["common_name"], "endpoints-client", "{after:?}");
+    assert_eq!(after[0]["last_status"], "disconnected", "{after:?}");
     assert!(
-        after.is_empty(),
-        "both connections disconnected, list should be empty again: {after:?}"
+        after[0]["last_seen_unix"].as_i64().unwrap_or(0) > 0,
+        "last_seen should be a real timestamp: {after:?}"
+    );
+    assert!(
+        after[0].get("remote_addr").is_none() || after[0]["remote_addr"].is_null(),
+        "offline entry has no live address: {after:?}"
     );
 }
 
