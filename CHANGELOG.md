@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/microtak/microtak-server/compare/v0.17.0...v0.18.0) (2026-11-02)
+
+
+### Features
+
+* **packaging:** systemd install script with daily self-update ([b9457d5](https://github.com/microtak/microtak-server/commit/b9457d5ee85d8140c1d554f9e90db0af365aef83))
+
 ## [0.17.0](https://github.com/microtak/microtak-server/compare/v0.16.0...v0.17.0) (2026-11-02)
 
 
