@@ -29,7 +29,10 @@ permissions:
 
 jobs:
   build:
-    # Each target builds natively on its own runner (no cross toolchain).
+    # The glibc targets build natively on their own runner. 32-bit ARM
+    # (Raspberry Pi 2, and any Pi on 32-bit Raspberry Pi OS) has no GitHub
+    # runner, so it's cross-built with `cross` as a static musl binary --
+    # no glibc version to match on the target.
     strategy:
       matrix:
         include:
@@ -37,6 +40,9 @@ jobs:
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+          - target: armv7-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            cross: true
     runs-on: ${{ matrix.runner }}
     env:
       TAG: ${{ inputs.tag_name }}
@@ -50,16 +56,35 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build
-        run: cargo build --release --locked --bin microtakd
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
+      - name: Build
+        if: ${{ !matrix.cross }}
+        run: |
+          cargo build --release --locked --bin microtakd
+          echo "BIN_DIR=target/release" >> "$GITHUB_ENV"
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: |
+          cross build --release --locked --target ${{ matrix.target }} --bin microtakd
+          echo "BIN_DIR=target/${{ matrix.target }}/release" >> "$GITHUB_ENV"
+
+      # The .sha256 sits next to the archive so packaging/install.sh can
+      # verify the download before swapping the binary in.
       - name: Package
-        run: tar czf "$ARCHIVE" -C target/release microtakd
+        run: |
+          tar czf "$ARCHIVE" -C "$BIN_DIR" microtakd
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
 
       # `gh` finds draft releases by tag (the REST "get release by tag"
       # endpoint, which some upload actions rely on, doesn't return drafts).
       - name: Upload to the draft release
-        run: gh release upload "$TAG" "$ARCHIVE" --clobber
+        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
 
   publish:
     needs: build
