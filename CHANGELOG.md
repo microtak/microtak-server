@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.1](https://github.com/microtak/microtak-server/compare/v0.18.0...v0.18.1) (2026-11-02)
+
+
+### Bug Fixes
+
+* **packaging:** install.sh without arguments exited silently ([97adb86](https://github.com/microtak/microtak-server/commit/97adb869c6cd039762d6a02bf909e3af33e0a134))
+
 ## [0.18.0](https://github.com/microtak/microtak-server/compare/v0.17.0...v0.18.0) (2026-11-02)
 
 
