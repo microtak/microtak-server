@@ -218,7 +218,11 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 case "${1:-install}" in
-install) shift 2>/dev/null || true; cmd_install "$@" ;;
+# dash aborts the script on `shift` with no arguments, even behind `|| true`.
+install)
+	[ $# -eq 0 ] || shift
+	cmd_install "$@"
+	;;
 --from-file) cmd_install "$@" ;;
 update) cmd_update ;;
 *) die "usage: $0 [install [--from-file PATH] | update]" ;;
