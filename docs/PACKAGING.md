@@ -71,3 +71,12 @@ Already partly done for `microtak-admin-cli`. Extend to `microtak-server` (Phase
 - Packaging `microtak-admin-web` is deliberately left out of this plan until it actually exists and its own deployment shape (likely another systemd service, or container-only) is settled.
 
 **Update 2026-10-17:** multi-arch is done for the non-Nix paths too: the Docker image (`linux/amd64` + `linux/arm64`) and release binaries of all three tools (x86_64 + aarch64 Linux) build natively on GitHub's `ubuntu-24.04-arm` runners (no QEMU, no `cross`), and CI runs the server's tests on both architectures. macOS binaries remain open.
+
+**Update 2026-11-02:** 32-bit ARM. Release binaries gain
+`armv7-unknown-linux-musleabihf` (Raspberry Pi 2, and Pis on 32-bit Raspberry
+Pi OS), cross-built with `cross` in `publish-binaries.yml` as a static musl
+binary since GitHub has no 32-bit ARM runner. Every release archive now has a
+`.sha256` next to it. `packaging/install.sh` covers Phase 0's systemd unit,
+system user, default config and on-disk layout for a bare-metal Debian-family
+install (binary in `/usr/local/bin`, not `/usr/bin`, since it isn't a distro
+package), plus a daily self-update timer with rollback.

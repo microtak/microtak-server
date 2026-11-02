@@ -139,11 +139,13 @@ hardware other TAK servers can't touch.
   content) is stored under `data_dir`; size scales with how much mission
   content you upload, not with client count. Add extra headroom if you
   enable periodic backups.
-- **OS / architecture**: Linux on x86_64 or 64-bit ARM (aarch64, e.g. a
-  Raspberry Pi 3/4/5 or Zero 2 W with a 64-bit OS). The Docker image is
+- **OS / architecture**: Linux on x86_64, 64-bit ARM (aarch64, e.g. a
+  Raspberry Pi 3/4/5 or Zero 2 W with a 64-bit OS) or 32-bit ARMv7 (a
+  Raspberry Pi 2, or any Pi on 32-bit Raspberry Pi OS). The Docker image is
   multi-arch (`linux/amd64`, `linux/arm64`), and each release has
-  `microtakd` binaries for both (`x86_64-` / `aarch64-unknown-linux-gnu`,
-  glibc). Anything else: build from source with a stable Rust toolchain
+  `microtakd` binaries for all three (`x86_64-` / `aarch64-unknown-linux-gnu`,
+  glibc; `armv7-unknown-linux-musleabihf`, static). ARMv6 (Pi Zero/1) isn't
+  covered. Anything else: build from source with a stable Rust toolchain
   (edition 2024).
 - **Network**: MicroTAK needs four ports reachable by your clients (see the
   table below) — no other services or databases required. It has no
@@ -318,6 +320,28 @@ MicroTAK makes it work.)
   [docs/proxy/README.md](docs/proxy/README.md) — the proxy re-encrypts to
   MicroTAK (never plain HTTP to the backend), the mTLS ports stay TCP
   passthrough, and `trusted_proxies` keeps rate limiting per real client.
+
+### Installing on a Raspberry Pi or other Linux host (systemd)
+
+Without Docker, `packaging/install.sh` installs the release binary for the
+host's architecture as a systemd service, plus a daily timer that keeps it
+on the latest release:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/microtak/microtak-server/main/packaging/install.sh
+sudo sh install.sh
+```
+
+It creates the `microtak` system user, writes `/etc/microtak/microtak.toml`
+(named after the host; an existing file is kept), installs
+`/usr/local/bin/microtakd` and enables `microtak-server.service` and
+`microtak-update.timer`. The timer runs `microtak-update update`: if a newer
+release exists it downloads it, checks its `.sha256`, swaps the binary,
+restarts the service, and rolls back to the previous binary if the service
+doesn't come back up. State lives in `/var/lib/microtak-server`; the admin
+bootstrap token is in `data/bootstrap-token` there after the first start.
+`sudo sh install.sh --from-file ./microtakd` installs a binary you built
+yourself instead (the timer then moves it to the next release).
 
 ### Building from source
 
