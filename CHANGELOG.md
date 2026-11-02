@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.0](https://github.com/microtak/microtak-server/compare/v0.16.0...v0.17.0) (2026-11-02)
+
+
+### Features
+
+* **marti:** persistent per-device last-seen in clientEndPoints ([0d6c33a](https://github.com/microtak/microtak-server/commit/0d6c33ad1506257a15b1edd543c638075a83573a))
+
 ## [0.16.0](https://github.com/microtak/microtak-server/compare/v0.15.0...v0.16.0) (2026-11-01)
 
 
